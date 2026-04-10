@@ -37,7 +37,8 @@ SRCS := \
     $(SRCDIR)/wg_noise.c    \
     $(SRCDIR)/wg_cookie.c   \
     $(SRCDIR)/wg_crypto.c   \
-    $(SRCDIR)/wg_crypto_impl.c
+    $(SRCDIR)/wg_crypto_impl.c \
+    $(SRCDIR)/allowedips.c
 
 OBJS := $(patsubst $(SRCDIR)/%.c, $(BUILDDIR)/%.o, $(SRCS))
 
