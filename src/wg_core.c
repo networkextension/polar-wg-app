@@ -40,7 +40,14 @@
 #define WG_AUTHTAG_LEN 16
 #define WG_TIMESTAMP_LEN 12
 #define WG_MAX_LINE 512
-#define REKEY_TIMEOUT_SEC 5
+
+/* Protocol timers (RFC, also see wg_noise.h). All in seconds. */
+#define REKEY_TIMEOUT_SEC      5    /* retransmit pending initiation */
+#define REKEY_AFTER_TIME_SEC   120  /* trigger rekey */
+#define REJECT_AFTER_TIME_SEC  180  /* keypair becomes unusable */
+#define KEEPALIVE_TIMEOUT_SEC  10
+#define MAX_HANDSHAKE_ATTEMPTS 18   /* ~REJECT_AFTER_TIME / REKEY_TIMEOUT */
+
 #define COOKIE_MAC_SIZE 16
 #define COOKIE_NONCE_SIZE 24
 #define COOKIE_COOKIE_SIZE 16
@@ -150,6 +157,7 @@ struct client_config {
     /* Interface / tunnel config */
     char     if_address[64];  /* e.g. "10.88.0.2/24" */
     int      has_if_address;
+    int      persistent_keepalive;  /* seconds; 0 = disabled */
 };
 
 static int b64_value(unsigned char c)
@@ -311,6 +319,8 @@ static int load_config(const char *path, struct client_config *cfg)
             strncpy(cfg->if_address, eq, sizeof(cfg->if_address) - 1);
             cfg->if_address[sizeof(cfg->if_address) - 1] = '\0';
             cfg->has_if_address = 1;
+        } else if (in_peer && strcmp(p, "PersistentKeepalive") == 0) {
+            cfg->persistent_keepalive = atoi(eq);
         }
     }
 
@@ -913,18 +923,175 @@ static void trace_hex(const char *tag, const uint8_t *b, size_t n)
     fprintf(stderr, "\n");
 }
 
+/* ─────────────────────────────────────────────────────────────────────────
+ * Tunnel state machine
+ *
+ * The tunnel loop is driven by select() with a 1 s tick, and a tunnel_ctx
+ * struct that owns the long-running noise/timer state. Each tick we:
+ *
+ *   1. retransmit a pending handshake initiation if it has been
+ *      REKEY_TIMEOUT_SEC seconds since the last attempt;
+ *   2. start a fresh handshake if the current keypair is REKEY_AFTER_TIME
+ *      old and we are not already trying;
+ *   3. send a persistent-keepalive if pk_sec > 0 and we have not sent
+ *      anything to the peer for that long.
+ *
+ * On UDP recv, the handler dispatches by message type: DATA goes through
+ * wg_decap; RESPONSE consumes the handshake and clears hs_pending; COOKIE
+ * is fed to the cookie maker; anything else is logged and dropped.
+ * ───────────────────────────────────────────────────────────────────────── */
+typedef struct {
+    /* I/O */
+    int udp_fd;
+    int utun_fd;
+    struct sockaddr_storage peer;
+    socklen_t               peer_len;
+
+    /* Noise state */
+    struct noise_local  *local;
+    struct noise_remote *remote;
+    struct cookie_maker *cookie;
+
+    /* Handshake state */
+    bool      hs_pending;
+    time_t    hs_sent_at;
+    uint32_t  hs_local_idx;
+    int       hs_attempts;
+
+    /* Keypair lifetime (initiator perspective). keypair_birth is the
+     * wallclock second the most recent successful handshake completed. */
+    time_t    keypair_birth;
+
+    /* Persistent keepalive */
+    int       pk_sec;       /* 0 = disabled */
+    time_t    last_authd_tx;
+
+    /* Stats */
+    uint64_t  tx_pkts, tx_bytes, rx_pkts, rx_bytes;
+} tunnel_ctx;
+
+/* Send a fresh handshake initiation, transition into hs_pending. Used both
+ * for retransmits and for proactive rekey from the tick handler. */
+static int
+tunnel_send_initiation(tunnel_ctx *ctx, time_t now, const char *why)
+{
+    uint32_t s_idx = 0;
+    if (send_initiation(ctx->udp_fd,
+                        (struct sockaddr *)&ctx->peer, ctx->peer_len,
+                        ctx->remote, ctx->cookie, &s_idx) != 0) {
+        fprintf(stderr, "[hs] %s: send_initiation failed\n", why);
+        return -1;
+    }
+    ctx->hs_pending   = true;
+    ctx->hs_sent_at   = now;
+    ctx->hs_local_idx = s_idx;
+    ctx->hs_attempts++;
+    ctx->last_authd_tx = now;
+    fprintf(stderr, "[hs] %s: initiation sent (attempt %d, s_idx=0x%08x)\n",
+            why, ctx->hs_attempts, (unsigned)s_idx);
+    return 0;
+}
+
+/* Per-tick housekeeping: retransmit, rekey, persistent-keepalive. */
+static void
+tunnel_tick(tunnel_ctx *ctx, time_t now)
+{
+    /* 1. Pending handshake retransmit. */
+    if (ctx->hs_pending && (now - ctx->hs_sent_at) >= REKEY_TIMEOUT_SEC) {
+        if (ctx->hs_attempts >= MAX_HANDSHAKE_ATTEMPTS) {
+            fprintf(stderr, "[hs] giving up after %d attempts\n", ctx->hs_attempts);
+            ctx->hs_pending = false;
+            ctx->hs_attempts = 0;
+        } else {
+            (void)tunnel_send_initiation(ctx, now, "retransmit");
+        }
+    }
+
+    /* 2. Proactive rekey when current keypair is REKEY_AFTER_TIME old. */
+    if (!ctx->hs_pending && ctx->keypair_birth &&
+        (now - ctx->keypair_birth) >= REKEY_AFTER_TIME_SEC) {
+        ctx->hs_attempts = 0;
+        (void)tunnel_send_initiation(ctx, now, "rekey");
+    }
+
+    /* 3. Persistent keepalive. */
+    if (ctx->pk_sec > 0 && ctx->last_authd_tx > 0 &&
+        (now - ctx->last_authd_tx) >= ctx->pk_sec) {
+        if (wg_encap(ctx->udp_fd,
+                     (struct sockaddr *)&ctx->peer, ctx->peer_len,
+                     ctx->remote, NULL, 0) == 0) {
+            ctx->last_authd_tx = now;
+            fprintf(stderr, "[pk] sent persistent keepalive\n");
+        }
+    }
+}
+
+/* Consume a WG_PKT_RESPONSE received during the tunnel loop (an in-band
+ * rekey response). Returns 0 on success. */
+static int
+tunnel_consume_response(tunnel_ctx *ctx, const uint8_t *buf, size_t len)
+{
+    struct wg_pkt_response pkt;
+    struct noise_remote *matched = NULL;
+    int ret;
+
+    if (len < sizeof(pkt)) return -1;
+    memcpy(&pkt, buf, sizeof(pkt));
+
+    if (!ctx->hs_pending) {
+        fprintf(stderr, "[hs] unexpected response (not pending)\n");
+        return -1;
+    }
+    if (pkt.r_idx != ctx->hs_local_idx) {
+        fprintf(stderr,
+                "[hs] response r_idx 0x%08x != pending 0x%08x\n",
+                (unsigned)pkt.r_idx, (unsigned)ctx->hs_local_idx);
+        return -1;
+    }
+    ret = noise_consume_response(ctx->local, &matched,
+                                 pkt.s_idx, pkt.r_idx, pkt.ue, pkt.en);
+    if (ret != 0) {
+        fprintf(stderr, "[hs] noise_consume_response failed: %d\n", ret);
+        return -1;
+    }
+    if (matched != ctx->remote) {
+        fprintf(stderr, "[hs] response matched unexpected peer\n");
+        if (matched) noise_remote_put(matched);
+        return -1;
+    }
+    noise_remote_put(matched);
+
+    ctx->hs_pending    = false;
+    ctx->hs_attempts   = 0;
+    ctx->keypair_birth = time(NULL);
+    fprintf(stderr, "[hs] rekey complete, new keypair active\n");
+    return 0;
+}
+
 static int
 run_tunnel(int udp_fd, int utun_fd,
            const struct sockaddr *peer_sa, socklen_t peer_sl,
-           struct noise_local *local, struct noise_remote *remote)
+           struct noise_local *local, struct noise_remote *remote,
+           struct cookie_maker *cookie, int persistent_keepalive)
 {
+    tunnel_ctx ctx;
     uint8_t udp_buf[2048];
-    struct sockaddr_storage peer_current;
-    socklen_t               peer_current_len = peer_sl;
-    memcpy(&peer_current, peer_sa, peer_sl);
     uint8_t inner_buf[2048];
-    uint64_t tx_pkts = 0, tx_bytes = 0, rx_pkts = 0, rx_bytes = 0;
-    time_t last_stats = time(NULL);
+    time_t last_stats;
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.udp_fd        = udp_fd;
+    ctx.utun_fd       = utun_fd;
+    memcpy(&ctx.peer, peer_sa, peer_sl);
+    ctx.peer_len      = peer_sl;
+    ctx.local         = local;
+    ctx.remote        = remote;
+    ctx.cookie        = cookie;
+    ctx.keypair_birth = time(NULL);  /* handshake just succeeded in main */
+    ctx.last_authd_tx = ctx.keypair_birth;
+    ctx.pk_sec        = persistent_keepalive;
+
+    last_stats = ctx.keypair_birth;
 
     signal(SIGINT,  on_quit);
     signal(SIGTERM, on_quit);
@@ -946,14 +1113,16 @@ run_tunnel(int udp_fd, int utun_fd,
         }
     }
 
-    printf("[tunnel] entering event loop (utun_fd=%d, udp_fd=%d, trace_cap=%d)\n",
-           utun_fd, udp_fd, g_trace_cap);
+    printf("[tunnel] entering event loop "
+           "(utun_fd=%d, udp_fd=%d, trace_cap=%d, pk=%ds)\n",
+           utun_fd, udp_fd, g_trace_cap, ctx.pk_sec);
 
     while (!sig_quit) {
         fd_set rfds;
         int maxfd;
         struct timeval tv;
         int rc;
+        time_t now;
 
         FD_ZERO(&rfds);
         FD_SET(udp_fd,  &rfds);
@@ -968,14 +1137,20 @@ run_tunnel(int udp_fd, int utun_fd,
             perror("select");
             return -1;
         }
+
+        now = time(NULL);
+        tunnel_tick(&ctx, now);
+
         if (rc == 0) {
-            time_t now = time(NULL);
             if (now - last_stats >= 10) {
-                printf("[tunnel] tx=%llu pkts/%llu B  rx=%llu pkts/%llu B\n",
-                       (unsigned long long)tx_pkts,
-                       (unsigned long long)tx_bytes,
-                       (unsigned long long)rx_pkts,
-                       (unsigned long long)rx_bytes);
+                int kp_age = ctx.keypair_birth ? (int)(now - ctx.keypair_birth) : -1;
+                printf("[tunnel] tx=%llu pkts/%llu B  rx=%llu pkts/%llu B  "
+                       "kp_age=%ds  hs_pending=%d\n",
+                       (unsigned long long)ctx.tx_pkts,
+                       (unsigned long long)ctx.tx_bytes,
+                       (unsigned long long)ctx.rx_pkts,
+                       (unsigned long long)ctx.rx_bytes,
+                       kp_age, ctx.hs_pending ? 1 : 0);
                 last_stats = now;
             }
             continue;
@@ -992,10 +1167,11 @@ run_tunnel(int udp_fd, int utun_fd,
                     trace_hex("plain", inner_buf, (size_t)n);
                 }
                 if (wg_encap(udp_fd,
-                             (struct sockaddr *)&peer_current, peer_current_len,
+                             (struct sockaddr *)&ctx.peer, ctx.peer_len,
                              remote, inner_buf, (size_t)n) == 0) {
-                    tx_pkts++;
-                    tx_bytes += (uint64_t)n;
+                    ctx.tx_pkts++;
+                    ctx.tx_bytes += (uint64_t)n;
+                    ctx.last_authd_tx = now;
                 } else if (g_trace_tx <= g_trace_cap) {
                     fprintf(stderr, "[tx#%d] wg_encap FAILED\n", g_trace_tx);
                 }
@@ -1018,8 +1194,8 @@ run_tunnel(int udp_fd, int utun_fd,
             /* Roaming: always update the current peer sockaddr to the
              * last-received one. For a single peer without cryptokey
              * routing this is fine; multi-peer would need allowedips. */
-            memcpy(&peer_current, &from_ss, from_sl);
-            peer_current_len = from_sl;
+            memcpy(&ctx.peer, &from_ss, from_sl);
+            ctx.peer_len = from_sl;
 
             if (g_trace_rx < g_trace_cap) {
                 char addr_s[80];
@@ -1043,20 +1219,30 @@ run_tunnel(int udp_fd, int utun_fd,
                             trace_hex("plain", inner_buf, (size_t)inner);
                         }
                         if (utun_write(utun_fd, inner_buf, (size_t)inner) == 0) {
-                            rx_pkts++;
-                            rx_bytes += (uint64_t)inner;
+                            ctx.rx_pkts++;
+                            ctx.rx_bytes += (uint64_t)inner;
                         } else if (g_trace_rx <= g_trace_cap) {
                             fprintf(stderr, "[rx#%d] utun_write FAILED\n", g_trace_rx);
                         }
                     } else if (inner == 0) {
                         if (g_trace_rx <= g_trace_cap)
                             fprintf(stderr, "[rx#%d] keepalive (empty inner)\n", g_trace_rx);
-                        rx_pkts++;
+                        ctx.rx_pkts++;
                     } else if (g_trace_rx <= g_trace_cap) {
                         fprintf(stderr, "[rx#%d] decap FAILED\n", g_trace_rx);
                     }
+                } else if (t == WG_PKT_RESPONSE) {
+                    if (tunnel_consume_response(&ctx, udp_buf, (size_t)n) != 0)
+                        fprintf(stderr, "[rx] handshake response rejected\n");
+                } else if (t == WG_PKT_COOKIE) {
+                    if ((size_t)n >= sizeof(struct wg_pkt_cookie)) {
+                        struct wg_pkt_cookie pkt;
+                        memcpy(&pkt, udp_buf, sizeof(pkt));
+                        if (cookie_maker_consume_payload(cookie, pkt.nonce, pkt.ec) == 0)
+                            fprintf(stderr, "[rx] cookie reply consumed\n");
+                    }
                 } else {
-                    fprintf(stderr, "[rx#%d] non-data pkt type=0x%08x len=%zd (TODO: handle)\n",
+                    fprintf(stderr, "[rx#%d] unknown pkt type=0x%08x len=%zd\n",
                             g_trace_rx, (unsigned)le32toh(t), n);
                 }
             }
@@ -1064,9 +1250,9 @@ run_tunnel(int udp_fd, int utun_fd,
     }
 
     printf("\n[tunnel] shutdown. final: tx=%llu pkts/%llu B  rx=%llu pkts/%llu B\n",
-           (unsigned long long)tx_pkts, (unsigned long long)tx_bytes,
-           (unsigned long long)rx_pkts, (unsigned long long)rx_bytes);
-    return (rx_pkts > 0) ? 0 : 2;  /* non-zero exit if we never saw a reply */
+           (unsigned long long)ctx.tx_pkts, (unsigned long long)ctx.tx_bytes,
+           (unsigned long long)ctx.rx_pkts, (unsigned long long)ctx.rx_bytes);
+    return (ctx.rx_pkts > 0) ? 0 : 2;
 }
 
 /* Kept as a one-shot smoke test callable from main --probe mode. */
@@ -1248,7 +1434,7 @@ int main(int argc, char *argv[])
 
     ret = run_tunnel(udp_fd, utun_fd,
                      (struct sockaddr *)&peer_ss, peer_sl,
-                     local, remote);
+                     local, remote, &cookie, cfg.persistent_keepalive);
 
 out:
     if (utun_fd >= 0)
