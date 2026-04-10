@@ -23,12 +23,22 @@
 #include "macos_stubs/sys/mbuf.h"
 #include "macos_stubs/sys/param.h"
 #include "macos_stubs/sys/rwlock.h"
+#include "macos_stubs/sys/mutex.h"
 #include "allowedips.h"
+#include "wg_cookie.h"
 #include <libkern/OSByteOrder.h>
+#ifndef htole32
 #define htole32(x) OSSwapHostToLittleInt32(x)
+#endif
+#ifndef le32toh
 #define le32toh(x) OSSwapLittleToHostInt32(x)
+#endif
+#ifndef htole64
 #define htole64(x) OSSwapHostToLittleInt64(x)
+#endif
+#ifndef le64toh
 #define le64toh(x) OSSwapLittleToHostInt64(x)
+#endif
 
 /* WireGuard wire format is little-endian. Match FreeBSD if_wg.c:73-76. */
 #define WG_PKT_INITIATION htole32(1)
@@ -49,33 +59,10 @@
 #define KEEPALIVE_TIMEOUT_SEC  10
 #define MAX_HANDSHAKE_ATTEMPTS 18   /* ~REJECT_AFTER_TIME / REKEY_TIMEOUT */
 
-#define COOKIE_MAC_SIZE 16
-#define COOKIE_NONCE_SIZE 24
-#define COOKIE_COOKIE_SIZE 16
-#define COOKIE_ENCRYPTED_SIZE (COOKIE_COOKIE_SIZE + COOKIE_MAC_SIZE)
+/* COOKIE_* sizes come from wg_cookie.h */
 
-struct cookie_macs {
-    uint8_t mac1[COOKIE_MAC_SIZE];
-    uint8_t mac2[COOKIE_MAC_SIZE];
-};
-
-struct cookie_maker {
-    uint8_t cm_mac1_key[32];
-    uint8_t cm_cookie_key[32];
-    struct rwlock cm_lock;
-    bool cm_cookie_valid;
-    uint8_t cm_cookie[COOKIE_COOKIE_SIZE];
-    sbintime_t cm_cookie_birthdate;
-    bool cm_mac1_sent;
-    uint8_t cm_mac1_last[COOKIE_MAC_SIZE];
-};
-
-extern void cookie_maker_init(struct cookie_maker *, const uint8_t key[32]);
-extern void cookie_maker_free(struct cookie_maker *);
-extern void cookie_maker_mac(struct cookie_maker *, struct cookie_macs *, void *, size_t);
-extern int cookie_maker_consume_payload(struct cookie_maker *,
-                                        uint8_t nonce[COOKIE_NONCE_SIZE],
-                                        uint8_t ecookie[COOKIE_ENCRYPTED_SIZE]);
+/* cookie_macs / cookie_maker / cookie_checker definitions and APIs come
+ * from wg_cookie.h above. */
 
 struct noise_local;
 struct noise_remote;
@@ -98,12 +85,28 @@ extern int noise_create_initiation(struct noise_remote *,
                                    uint8_t ue[WG_KEY_LEN],
                                    uint8_t es[WG_KEY_LEN + WG_AUTHTAG_LEN],
                                    uint8_t ets[WG_TIMESTAMP_LEN + WG_AUTHTAG_LEN]);
+extern int noise_consume_initiation(struct noise_local *,
+                                    struct noise_remote **,
+                                    uint32_t s_idx,
+                                    uint8_t ue[WG_KEY_LEN],
+                                    uint8_t es[WG_KEY_LEN + WG_AUTHTAG_LEN],
+                                    uint8_t ets[WG_TIMESTAMP_LEN + WG_AUTHTAG_LEN]);
+extern int noise_create_response(struct noise_remote *,
+                                 uint32_t *s_idx,
+                                 uint32_t *r_idx,
+                                 uint8_t ue[WG_KEY_LEN],
+                                 uint8_t en[WG_AUTHTAG_LEN]);
 extern int noise_consume_response(struct noise_local *,
                                   struct noise_remote **,
                                   uint32_t s_idx,
                                   uint32_t r_idx,
                                   uint8_t ue[WG_KEY_LEN],
                                   uint8_t en[WG_AUTHTAG_LEN]);
+extern int noise_local_keys(struct noise_local *,
+                            uint8_t public[WG_KEY_LEN],
+                            uint8_t private[WG_KEY_LEN]);
+
+#define NOISE_PUBLIC_KEY_LEN WG_KEY_LEN
 
 extern struct noise_keypair *noise_keypair_current(struct noise_remote *);
 extern struct noise_keypair *noise_keypair_lookup(struct noise_local *, uint32_t);
@@ -168,8 +171,10 @@ struct iface_addr {
 };
 
 struct client_config {
-    char endpoint_host[128];
+    char endpoint_host[128];        /* empty if no Endpoint configured */
     uint16_t endpoint_port;
+    int  has_endpoint;
+    uint16_t listen_port;           /* 0 = ephemeral */
     uint8_t private_key[WG_KEY_LEN];
     uint8_t peer_public_key[WG_KEY_LEN];
     /* Interface / tunnel config */
@@ -465,7 +470,16 @@ static int load_config(const char *path, struct client_config *cfg)
                 fclose(f);
                 return -1;
             }
+            cfg->has_endpoint = 1;
             got_endpoint = 1;
+        } else if (in_interface && strcmp(p, "ListenPort") == 0) {
+            int lp = atoi(eq);
+            if (lp < 1 || lp > 65535) {
+                fprintf(stderr, "invalid ListenPort: %s\n", eq);
+                fclose(f);
+                return -1;
+            }
+            cfg->listen_port = (uint16_t)lp;
         } else if (in_interface && strcmp(p, "Address") == 0) {
             if (parse_iface_addrs(eq, cfg) != 0) {
                 fclose(f);
@@ -483,8 +497,18 @@ static int load_config(const char *path, struct client_config *cfg)
 
     fclose(f);
 
-    if (!got_priv || !got_pub || !got_endpoint) {
-        fprintf(stderr, "config missing required fields: Interface.PrivateKey / Peer.PublicKey / Peer.Endpoint\n");
+    /* Endpoint is optional now: a config with no Endpoint and a
+     * ListenPort runs in pure-responder mode (waits for the peer to
+     * initiate). A config with no Endpoint and no ListenPort is
+     * useless and rejected. */
+    if (!got_priv || !got_pub) {
+        fprintf(stderr, "config missing required fields: "
+                        "Interface.PrivateKey / Peer.PublicKey\n");
+        return -1;
+    }
+    if (!got_endpoint && cfg->listen_port == 0) {
+        fprintf(stderr, "config has neither Peer.Endpoint nor "
+                        "Interface.ListenPort — nothing to do\n");
         return -1;
     }
 
@@ -516,12 +540,14 @@ resolve_endpoint(const char *host, uint16_t port,
     return 0;
 }
 
-/* Open an unconnected UDP socket bound to INADDR_ANY:0. We deliberately
- * do NOT connect(): using sendto/recvfrom lets us see the actual source
- * address of every inbound packet and survives server-side roaming.
+/* Open an unconnected UDP socket bound to INADDR_ANY:listen_port.
+ * Pass listen_port = 0 for an ephemeral port (initiator-only mode).
+ * We deliberately do NOT connect(): using sendto/recvfrom lets us see
+ * the actual source address of every inbound packet and supports
+ * peer roaming + responder mode (multiple peers initiating to us).
  * Returns fd, or -1 on failure. */
 static int
-udp_open_unconnected(int family)
+udp_open_unconnected(int family, uint16_t listen_port)
 {
     int fd = socket(family, SOCK_DGRAM, 0);
     int one = 1;
@@ -534,7 +560,7 @@ udp_open_unconnected(int family)
         memset(&sin, 0, sizeof(sin));
         sin.sin_family      = AF_INET;
         sin.sin_addr.s_addr = htonl(INADDR_ANY);
-        sin.sin_port        = 0;
+        sin.sin_port        = htons(listen_port);
         if (bind(fd, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
             perror("bind(udp4)");
             close(fd); return -1;
@@ -544,7 +570,7 @@ udp_open_unconnected(int family)
         memset(&sin6, 0, sizeof(sin6));
         sin6.sin6_family = AF_INET6;
         sin6.sin6_addr   = in6addr_any;
-        sin6.sin6_port   = 0;
+        sin6.sin6_port   = htons(listen_port);
         if (bind(fd, (struct sockaddr *)&sin6, sizeof(sin6)) < 0) {
             perror("bind(udp6)");
             close(fd); return -1;
@@ -1187,9 +1213,10 @@ typedef struct {
     socklen_t               peer_len;
 
     /* Noise state */
-    struct noise_local  *local;
-    struct noise_remote *remote;
-    struct cookie_maker *cookie;
+    struct noise_local   *local;
+    struct noise_remote  *remote;
+    struct cookie_maker  *cookie;
+    struct cookie_checker *cookie_checker;  /* responder side; may be NULL */
 
     /* Handshake state */
     bool      hs_pending;
@@ -1376,8 +1403,10 @@ tunnel_tick(tunnel_ctx *ctx, time_t now)
         }
     }
 
-    /* 2. Proactive rekey when current keypair is REKEY_AFTER_TIME old. */
-    if (!ctx->hs_pending && ctx->keypair_birth &&
+    /* 2. Proactive rekey when current keypair is REKEY_AFTER_TIME old.
+     *    Pure-responder sessions (no peer endpoint configured) don't
+     *    initiate — they wait for the peer to drive rekey. */
+    if (!ctx->hs_pending && ctx->keypair_birth && ctx->peer_len > 0 &&
         (now - ctx->keypair_birth) >= REKEY_AFTER_TIME_SEC) {
         ctx->hs_attempts = 0;
         (void)tunnel_send_initiation(ctx, now, "rekey");
@@ -1393,6 +1422,86 @@ tunnel_tick(tunnel_ctx *ctx, time_t now)
             fprintf(stderr, "[pk] sent persistent keepalive\n");
         }
     }
+}
+
+/* Consume a WG_PKT_INITIATION received during the tunnel loop (the
+ * responder path). Validates mac1 via cookie_checker, runs the noise
+ * handshake to install a new keypair, sends back a WG_PKT_RESPONSE
+ * MAC'd with our cookie_maker, and stamps a fresh keypair_birth so
+ * the timer logic treats this as a brand-new session. Returns 0 on
+ * success, -1 on drop. */
+static int
+tunnel_consume_initiation(tunnel_ctx *ctx,
+                          uint8_t *buf, size_t len,
+                          const struct sockaddr *from, socklen_t from_len)
+{
+    struct wg_pkt_initiation pkt;
+    struct noise_remote *matched = NULL;
+    int ret;
+
+    if (len < sizeof(pkt)) return -1;
+    memcpy(&pkt, buf, sizeof(pkt));
+
+    if (!ctx->cookie_checker) {
+        fprintf(stderr, "[hs] inbound initiation but no cookie_checker "
+                        "(initiator-only mode); dropping\n");
+        return -1;
+    }
+
+    /* Validate mac1 (and mac2 if under load — we always pass false
+     * here since we don't track load). cookie_checker_validate_macs
+     * mutates pkt.m, so we work on the local copy. */
+    ret = cookie_checker_validate_macs(ctx->cookie_checker, &pkt.m,
+                                       buf, sizeof(pkt) - sizeof(pkt.m),
+                                       false /* under_load */,
+                                       (struct sockaddr *)from, NULL);
+    if (ret != 0) {
+        fprintf(stderr, "[hs] initiation mac1 validation failed: %d\n", ret);
+        return -1;
+    }
+
+    if (noise_consume_initiation(ctx->local, &matched,
+                                 pkt.s_idx, pkt.ue, pkt.es, pkt.ets) != 0) {
+        fprintf(stderr, "[hs] noise_consume_initiation failed\n");
+        return -1;
+    }
+    if (matched != ctx->remote) {
+        fprintf(stderr, "[hs] initiation matched unexpected peer\n");
+        if (matched) noise_remote_put(matched);
+        return -1;
+    }
+
+    /* Send back the response. cookie_maker_mac stamps mac1 derived
+     * from the peer's static pubkey. */
+    {
+        struct wg_pkt_response resp;
+        memset(&resp, 0, sizeof(resp));
+        if (noise_create_response(matched, &resp.s_idx, &resp.r_idx,
+                                  resp.ue, resp.en) != 0) {
+            fprintf(stderr, "[hs] noise_create_response failed\n");
+            noise_remote_put(matched);
+            return -1;
+        }
+        resp.t = WG_PKT_RESPONSE;
+        cookie_maker_mac(ctx->cookie, &resp.m, &resp,
+                         sizeof(resp) - sizeof(resp.m));
+        if (sendto(ctx->udp_fd, &resp, sizeof(resp), 0, from, from_len)
+            != (ssize_t)sizeof(resp)) {
+            perror("[hs] sendto response");
+            noise_remote_put(matched);
+            return -1;
+        }
+    }
+    noise_remote_put(matched);
+
+    /* Update peer addr (roaming on initiation) and stamp new keypair. */
+    memcpy(&ctx->peer, from, from_len);
+    ctx->peer_len     = from_len;
+    ctx->keypair_birth = time(NULL);
+    ctx->last_authd_tx = ctx->keypair_birth;
+    ctx->hs_pending   = false;
+    fprintf(stderr, "[hs] responded to incoming initiation, keypair installed\n");
+    return 0;
 }
 
 /* Consume a WG_PKT_RESPONSE received during the tunnel loop (an in-band
@@ -1441,7 +1550,8 @@ static int
 run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
            const struct sockaddr *peer_sa, socklen_t peer_sl,
            struct noise_local *local, struct noise_remote *remote,
-           struct cookie_maker *cookie, int persistent_keepalive,
+           struct cookie_maker *cookie, struct cookie_checker *checker,
+           int persistent_keepalive,
            const struct aips_set *aips,
            const struct client_config *cfg)
 {
@@ -1457,7 +1567,8 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
     ctx.peer_len      = peer_sl;
     ctx.local         = local;
     ctx.remote        = remote;
-    ctx.cookie        = cookie;
+    ctx.cookie         = cookie;
+    ctx.cookie_checker = checker;
     ctx.keypair_birth = time(NULL);  /* handshake just succeeded in main */
     ctx.last_authd_tx = ctx.keypair_birth;
     ctx.pk_sec        = persistent_keepalive;
@@ -1642,6 +1753,12 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
                     } else if (g_trace_rx <= g_trace_cap) {
                         fprintf(stderr, "[rx#%d] decap FAILED\n", g_trace_rx);
                     }
+                } else if (t == WG_PKT_INITIATION) {
+                    if (tunnel_consume_initiation(&ctx, udp_buf, (size_t)n,
+                                                  (struct sockaddr *)&from_ss,
+                                                  from_sl) != 0) {
+                        fprintf(stderr, "[rx] handshake initiation rejected\n");
+                    }
                 } else if (t == WG_PKT_RESPONSE) {
                     if (tunnel_consume_response(&ctx, udp_buf, (size_t)n) != 0)
                         fprintf(stderr, "[rx] handshake response rejected\n");
@@ -1685,6 +1802,8 @@ int main(int argc, char *argv[])
     struct noise_remote *remote = NULL;
     struct cookie_maker cookie;
     int cookie_inited = 0;
+    struct cookie_checker checker;
+    int checker_inited = 0;
     int udp_fd = -1;
     int utun_fd = -1;
     char utun_name[IFNAMSIZ] = {0};
@@ -1742,11 +1861,28 @@ int main(int argc, char *argv[])
     cookie_maker_init(&cookie, cfg.peer_public_key);
     cookie_inited = 1;
 
-    /* Resolve peer endpoint once; we keep an unconnected UDP socket and
-     * sendto this addr from now on. recvfrom will then show us the real
-     * source of every inbound packet, which is essential for debugging
-     * silent drops (and a prerequisite for proper roaming). */
+    /* Cookie checker (responder side): keyed on OUR own static pubkey
+     * so we can validate mac1/mac2 on incoming initiations. Always
+     * initialized — even initiator-only configs may receive an
+     * unsolicited initiation if the peer wants to rekey. */
+    cookie_checker_init(&checker);
+    checker_inited = 1;
     {
+        uint8_t local_pub[NOISE_PUBLIC_KEY_LEN];
+        uint8_t local_priv_unused[NOISE_PUBLIC_KEY_LEN];
+        if (noise_local_keys(local, local_pub, local_priv_unused) == 0) {
+            cookie_checker_update(&checker, local_pub);
+        } else {
+            fprintf(stderr, "noise_local_keys failed; "
+                            "cookie_checker not keyed (incoming initiations will fail)\n");
+        }
+    }
+
+    /* If a peer Endpoint is configured, resolve it now and we will be
+     * able to initiate. Otherwise we run in pure-responder mode and
+     * wait for the peer to talk to us first. */
+    int can_initiate = cfg.has_endpoint;
+    if (can_initiate) {
         struct sockaddr_storage ss;
         socklen_t sl;
         if (resolve_endpoint(cfg.endpoint_host, cfg.endpoint_port, &ss, &sl) != 0)
@@ -1754,15 +1890,24 @@ int main(int argc, char *argv[])
         memcpy(&peer_ss, &ss, sl);
         peer_sl = sl;
     }
-    udp_fd = udp_open_unconnected(peer_ss.ss_family);
+    /* Bind UDP. ListenPort is honored if set; otherwise ephemeral.
+     * Family follows the resolved peer for initiator mode, or AF_INET
+     * by default for responder-only mode. */
+    {
+        int family = can_initiate ? peer_ss.ss_family : AF_INET;
+        udp_fd = udp_open_unconnected(family, cfg.listen_port);
+    }
     if (udp_fd < 0) {
         fprintf(stderr, "failed to open udp socket\n");
         goto out;
     }
-    {
+    if (can_initiate) {
         char addr_s[80];
         fmt_sockaddr((struct sockaddr *)&peer_ss, addr_s, sizeof(addr_s));
         fprintf(stderr, "[udp] peer endpoint resolved to %s\n", addr_s);
+    } else {
+        fprintf(stderr, "[udp] pure-responder mode (no Peer.Endpoint), "
+                        "listening on UDP %u\n", (unsigned)cfg.listen_port);
     }
 
     {
@@ -1773,40 +1918,53 @@ int main(int argc, char *argv[])
             perror("setsockopt SO_RCVTIMEO");
     }
 
-    for (attempt = 1; attempt <= 5; ++attempt) {
-        uint32_t s_idx = 0;
-        int w;
+    if (can_initiate) {
+        for (attempt = 1; attempt <= 5; ++attempt) {
+            uint32_t s_idx = 0;
+            int w;
 
-        printf("[handshake] attempt %d\n", attempt);
+            printf("[handshake] attempt %d\n", attempt);
 
-        if (send_initiation(udp_fd,
-                            (struct sockaddr *)&peer_ss, peer_sl,
-                            remote, &cookie, &s_idx) != 0) {
+            if (send_initiation(udp_fd,
+                                (struct sockaddr *)&peer_ss, peer_sl,
+                                remote, &cookie, &s_idx) != 0) {
+                sleep(REKEY_TIMEOUT_SEC);
+                continue;
+            }
+
+            w = wait_for_response(udp_fd, local, remote, &cookie, s_idx);
+            if (w == 0) {
+                printf("[handshake] success\n");
+                ret = 0;
+                break;
+            }
+
             sleep(REKEY_TIMEOUT_SEC);
-            continue;
         }
 
-        w = wait_for_response(udp_fd, local, remote, &cookie, s_idx);
-        if (w == 0) {
-            printf("[handshake] success\n");
-            ret = 0;
-            break;
+        if (ret != 0) {
+            fprintf(stderr, "[handshake] failed after retries\n");
+            goto out;
         }
-
-        sleep(REKEY_TIMEOUT_SEC);
-    }
-
-    if (ret != 0) {
-        fprintf(stderr, "[handshake] failed after retries\n");
-        goto out;
+    } else {
+        /* Responder-only: skip the initial handshake. The tunnel
+         * loop will pick up the first WG_PKT_INITIATION and respond. */
+        ret = 0;
+        printf("[handshake] skipped (responder mode)\n");
     }
 
     if (!want_tunnel) {
-        /* Probe mode: send a single keepalive and exit. */
-        if (send_keepalive_data(udp_fd,
-                                (struct sockaddr *)&peer_ss, peer_sl,
-                                remote) == 0)
-            printf("[data] keepalive packet sent\n");
+        /* Probe mode: send a single keepalive and exit. Only meaningful
+         * if we just completed a handshake (i.e., we are an initiator
+         * with a configured Endpoint and there's a current keypair). */
+        if (can_initiate) {
+            if (send_keepalive_data(udp_fd,
+                                    (struct sockaddr *)&peer_ss, peer_sl,
+                                    remote) == 0)
+                printf("[data] keepalive packet sent\n");
+        } else {
+            printf("[probe] responder mode — nothing to send, exiting\n");
+        }
         goto out;
     }
 
@@ -1860,7 +2018,8 @@ int main(int argc, char *argv[])
 
         ret = run_tunnel(udp_fd, utun_fd, utun_name,
                          (struct sockaddr *)&peer_ss, peer_sl,
-                         local, remote, &cookie, cfg.persistent_keepalive,
+                         local, remote, &cookie, &checker,
+                         cfg.persistent_keepalive,
                          &aips, &cfg);
 
         aips_destroy(&aips.v4);
@@ -1874,6 +2033,8 @@ out:
         close(udp_fd);
     if (cookie_inited)
         cookie_maker_free(&cookie);
+    if (checker_inited)
+        cookie_checker_free(&checker);
     if (remote)
         noise_remote_put(remote);
     if (local)
