@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
@@ -323,45 +324,109 @@ static int load_config(const char *path, struct client_config *cfg)
     return 0;
 }
 
-static int udp_connect_endpoint(const char *host, uint16_t port)
+/* Resolve host:port into a sockaddr we can sendto() repeatedly. Fills
+ * *out_ss and returns 0 on success, -1 on failure. */
+static int
+resolve_endpoint(const char *host, uint16_t port,
+                 struct sockaddr_storage *out_ss, socklen_t *out_len)
 {
     struct addrinfo hints;
     struct addrinfo *res = NULL;
-    struct addrinfo *it;
     char port_str[8];
-    int fd = -1;
 
     snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
+    hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
 
-    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
+    if (getaddrinfo(host, port_str, &hints, &res) != 0 || res == NULL) {
         fprintf(stderr, "getaddrinfo failed for %s:%s\n", host, port_str);
         return -1;
     }
+    memcpy(out_ss, res->ai_addr, res->ai_addrlen);
+    *out_len = res->ai_addrlen;
+    freeaddrinfo(res);
+    return 0;
+}
 
-    for (it = res; it; it = it->ai_next) {
-        int one = 1;
+/* Open an unconnected UDP socket bound to INADDR_ANY:0. We deliberately
+ * do NOT connect(): using sendto/recvfrom lets us see the actual source
+ * address of every inbound packet and survives server-side roaming.
+ * Returns fd, or -1 on failure. */
+static int
+udp_open_unconnected(int family)
+{
+    int fd = socket(family, SOCK_DGRAM, 0);
+    int one = 1;
+    if (fd < 0) { perror("socket(udp)"); return -1; }
+    (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
-        fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-        if (fd < 0)
-            continue;
-
-        (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
-
-        if (connect(fd, it->ai_addr, it->ai_addrlen) == 0)
-            break;
-
-        close(fd);
-        fd = -1;
+    if (family == AF_INET) {
+        struct sockaddr_in sin;
+        memset(&sin, 0, sizeof(sin));
+        sin.sin_family      = AF_INET;
+        sin.sin_addr.s_addr = htonl(INADDR_ANY);
+        sin.sin_port        = 0;
+        if (bind(fd, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+            perror("bind(udp4)");
+            close(fd); return -1;
+        }
+    } else {
+        struct sockaddr_in6 sin6;
+        memset(&sin6, 0, sizeof(sin6));
+        sin6.sin6_family = AF_INET6;
+        sin6.sin6_addr   = in6addr_any;
+        sin6.sin6_port   = 0;
+        if (bind(fd, (struct sockaddr *)&sin6, sizeof(sin6)) < 0) {
+            perror("bind(udp6)");
+            close(fd); return -1;
+        }
     }
 
-    freeaddrinfo(res);
+    /* Dump the bound address for tcpdump correlation. */
+    {
+        struct sockaddr_storage ss;
+        socklen_t sl = sizeof(ss);
+        if (getsockname(fd, (struct sockaddr *)&ss, &sl) == 0) {
+            char abuf[64]; uint16_t p = 0;
+            if (ss.ss_family == AF_INET) {
+                struct sockaddr_in *s = (struct sockaddr_in *)&ss;
+                inet_ntop(AF_INET, &s->sin_addr, abuf, sizeof(abuf));
+                p = ntohs(s->sin_port);
+            } else {
+                struct sockaddr_in6 *s = (struct sockaddr_in6 *)&ss;
+                inet_ntop(AF_INET6, &s->sin6_addr, abuf, sizeof(abuf));
+                p = ntohs(s->sin6_port);
+            }
+            fprintf(stderr, "[udp] bound local %s:%u (fd=%d)\n", abuf, p, fd);
+        }
+    }
     return fd;
 }
 
+static void
+fmt_sockaddr(const struct sockaddr *sa, char *out, size_t out_len)
+{
+    char abuf[64] = {0};
+    uint16_t port = 0;
+    if (sa->sa_family == AF_INET) {
+        const struct sockaddr_in *s = (const struct sockaddr_in *)sa;
+        inet_ntop(AF_INET, &s->sin_addr, abuf, sizeof(abuf));
+        port = ntohs(s->sin_port);
+    } else if (sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *s = (const struct sockaddr_in6 *)sa;
+        inet_ntop(AF_INET6, &s->sin6_addr, abuf, sizeof(abuf));
+        port = ntohs(s->sin6_port);
+    } else {
+        snprintf(out, out_len, "<af=%d>", sa->sa_family);
+        return;
+    }
+    snprintf(out, out_len, "%s:%u", abuf, port);
+}
+
 static int send_initiation(int udp_fd,
+                           const struct sockaddr *peer_sa, socklen_t peer_sl,
                            struct noise_remote *remote,
                            struct cookie_maker *cookie,
                            uint32_t *out_s_idx)
@@ -380,8 +445,8 @@ static int send_initiation(int udp_fd,
 
     cookie_maker_mac(cookie, &pkt.m, &pkt, sizeof(pkt) - sizeof(pkt.m));
 
-    if (send(udp_fd, &pkt, sizeof(pkt), 0) != (ssize_t)sizeof(pkt)) {
-        perror("send initiation");
+    if (sendto(udp_fd, &pkt, sizeof(pkt), 0, peer_sa, peer_sl) != (ssize_t)sizeof(pkt)) {
+        perror("sendto initiation");
         return -1;
     }
 
@@ -396,12 +461,20 @@ static int wait_for_response(int udp_fd,
                              uint32_t s_idx)
 {
     uint8_t buf[2048];
+    struct sockaddr_storage from_ss;
+    socklen_t from_sl = sizeof(from_ss);
     ssize_t n;
 
-    n = recv(udp_fd, buf, sizeof(buf), 0);
+    n = recvfrom(udp_fd, buf, sizeof(buf), 0,
+                 (struct sockaddr *)&from_ss, &from_sl);
     if (n < 0) {
-        perror("recv");
+        perror("recvfrom");
         return -1;
+    }
+    {
+        char addr_s[80];
+        fmt_sockaddr((struct sockaddr *)&from_ss, addr_s, sizeof(addr_s));
+        fprintf(stderr, "[handshake] recvfrom %s len=%zd\n", addr_s, n);
     }
 
     if (n < 4) {
@@ -476,7 +549,9 @@ static int wait_for_response(int udp_fd,
  * ───────────────────────────────────────────────────────────────────────── */
 
 static int
-wg_encap(int udp_fd, struct noise_remote *remote,
+wg_encap(int udp_fd,
+         const struct sockaddr *peer_sa, socklen_t peer_sl,
+         struct noise_remote *remote,
          const uint8_t *plain, size_t plain_len)
 {
     struct noise_keypair *kp = NULL;
@@ -535,8 +610,8 @@ wg_encap(int udp_fd, struct noise_remote *remote,
     memcpy(out, &hdr, sizeof(hdr));
     memcpy(out + sizeof(hdr), m->m_data, (size_t)m->m_len);
 
-    if (send(udp_fd, out, out_len, 0) != (ssize_t)out_len) {
-        perror("wg_encap: send");
+    if (sendto(udp_fd, out, out_len, 0, peer_sa, peer_sl) != (ssize_t)out_len) {
+        perror("wg_encap: sendto");
         goto out;
     }
     rc = 0;
@@ -802,11 +877,31 @@ utun_configure(const char *ifname, const char *addr_cidr)
 static volatile sig_atomic_t sig_quit = 0;
 static void on_quit(int s) { (void)s; sig_quit = 1; }
 
+/* Trace first N packets in each direction. Set WG_TRACE=N in the env to
+ * raise the cap; 0 disables, default is 12 which is enough to see the
+ * first ping echo round-trip without swamping the terminal. */
+static int g_trace_cap = 12;
+static int g_trace_tx  = 0;
+static int g_trace_rx  = 0;
+
+static void trace_hex(const char *tag, const uint8_t *b, size_t n)
+{
+    fprintf(stderr, "  %s:", tag);
+    size_t max = n < 32 ? n : 32;
+    for (size_t i = 0; i < max; i++) fprintf(stderr, " %02x", b[i]);
+    if (n > max) fprintf(stderr, " ... (%zu bytes)", n);
+    fprintf(stderr, "\n");
+}
+
 static int
 run_tunnel(int udp_fd, int utun_fd,
+           const struct sockaddr *peer_sa, socklen_t peer_sl,
            struct noise_local *local, struct noise_remote *remote)
 {
     uint8_t udp_buf[2048];
+    struct sockaddr_storage peer_current;
+    socklen_t               peer_current_len = peer_sl;
+    memcpy(&peer_current, peer_sa, peer_sl);
     uint8_t inner_buf[2048];
     uint64_t tx_pkts = 0, tx_bytes = 0, rx_pkts = 0, rx_bytes = 0;
     time_t last_stats = time(NULL);
@@ -822,8 +917,17 @@ run_tunnel(int udp_fd, int utun_fd,
         (void)setsockopt(udp_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     }
 
-    printf("[tunnel] entering event loop (utun_fd=%d, udp_fd=%d)\n",
-           utun_fd, udp_fd);
+    /* Env-var trace cap override: WG_TRACE=N (0 = silent, -1 = unlimited). */
+    {
+        const char *env = getenv("WG_TRACE");
+        if (env) {
+            int n = atoi(env);
+            g_trace_cap = (n < 0) ? INT_MAX : n;
+        }
+    }
+
+    printf("[tunnel] entering event loop (utun_fd=%d, udp_fd=%d, trace_cap=%d)\n",
+           utun_fd, udp_fd, g_trace_cap);
 
     while (!sig_quit) {
         fd_set rfds;
@@ -861,16 +965,50 @@ run_tunnel(int udp_fd, int utun_fd,
         if (FD_ISSET(utun_fd, &rfds)) {
             int n = utun_read(utun_fd, inner_buf, sizeof(inner_buf));
             if (n > 0) {
-                if (wg_encap(udp_fd, remote, inner_buf, (size_t)n) == 0) {
+                if (g_trace_tx < g_trace_cap) {
+                    g_trace_tx++;
+                    fprintf(stderr, "[tx#%d] utun_read %d B, inner IP ver=%u\n",
+                            g_trace_tx, n, inner_buf[0] >> 4);
+                    trace_hex("plain", inner_buf, (size_t)n);
+                }
+                if (wg_encap(udp_fd,
+                             (struct sockaddr *)&peer_current, peer_current_len,
+                             remote, inner_buf, (size_t)n) == 0) {
                     tx_pkts++;
                     tx_bytes += (uint64_t)n;
+                } else if (g_trace_tx <= g_trace_cap) {
+                    fprintf(stderr, "[tx#%d] wg_encap FAILED\n", g_trace_tx);
                 }
+            } else if (n < 0 && g_trace_tx < g_trace_cap) {
+                fprintf(stderr, "[tx] utun_read returned %d\n", n);
             }
         }
 
         /* ── udp → utun (decap) ─────────────────────────────────────── */
         if (FD_ISSET(udp_fd, &rfds)) {
-            ssize_t n = recv(udp_fd, udp_buf, sizeof(udp_buf), 0);
+            struct sockaddr_storage from_ss;
+            socklen_t from_sl = sizeof(from_ss);
+            ssize_t n = recvfrom(udp_fd, udp_buf, sizeof(udp_buf), 0,
+                                 (struct sockaddr *)&from_ss, &from_sl);
+            if (n < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK)
+                    perror("[rx] recvfrom");
+                continue;
+            }
+            /* Roaming: always update the current peer sockaddr to the
+             * last-received one. For a single peer without cryptokey
+             * routing this is fine; multi-peer would need allowedips. */
+            memcpy(&peer_current, &from_ss, from_sl);
+            peer_current_len = from_sl;
+
+            if (g_trace_rx < g_trace_cap) {
+                char addr_s[80];
+                fmt_sockaddr((struct sockaddr *)&from_ss, addr_s, sizeof(addr_s));
+                g_trace_rx++;
+                fprintf(stderr, "[rx#%d] recvfrom %s len=%zd\n",
+                        g_trace_rx, addr_s, n);
+                trace_hex("wire", udp_buf, (size_t)n);
+            }
             if (n >= 4) {
                 uint32_t t;
                 memcpy(&t, udp_buf, sizeof(t));
@@ -879,17 +1017,27 @@ run_tunnel(int udp_fd, int utun_fd,
                                          udp_buf, (size_t)n,
                                          inner_buf, sizeof(inner_buf));
                     if (inner > 0) {
+                        if (g_trace_rx <= g_trace_cap) {
+                            fprintf(stderr, "[rx#%d] decap OK: %d inner bytes, ver=%u\n",
+                                    g_trace_rx, inner, inner_buf[0] >> 4);
+                            trace_hex("plain", inner_buf, (size_t)inner);
+                        }
                         if (utun_write(utun_fd, inner_buf, (size_t)inner) == 0) {
                             rx_pkts++;
                             rx_bytes += (uint64_t)inner;
+                        } else if (g_trace_rx <= g_trace_cap) {
+                            fprintf(stderr, "[rx#%d] utun_write FAILED\n", g_trace_rx);
                         }
                     } else if (inner == 0) {
-                        /* keepalive: accounted only as a packet */
+                        if (g_trace_rx <= g_trace_cap)
+                            fprintf(stderr, "[rx#%d] keepalive (empty inner)\n", g_trace_rx);
                         rx_pkts++;
+                    } else if (g_trace_rx <= g_trace_cap) {
+                        fprintf(stderr, "[rx#%d] decap FAILED\n", g_trace_rx);
                     }
                 } else {
-                    fprintf(stderr, "[tunnel] non-data pkt type=0x%08x len=%zd (TODO: handle)\n",
-                            (unsigned)le32toh(t), n);
+                    fprintf(stderr, "[rx#%d] non-data pkt type=0x%08x len=%zd (TODO: handle)\n",
+                            g_trace_rx, (unsigned)le32toh(t), n);
                 }
             }
         }
@@ -898,13 +1046,15 @@ run_tunnel(int udp_fd, int utun_fd,
     printf("\n[tunnel] shutdown. final: tx=%llu pkts/%llu B  rx=%llu pkts/%llu B\n",
            (unsigned long long)tx_pkts, (unsigned long long)tx_bytes,
            (unsigned long long)rx_pkts, (unsigned long long)rx_bytes);
-    return 0;
+    return (rx_pkts > 0) ? 0 : 2;  /* non-zero exit if we never saw a reply */
 }
 
 /* Kept as a one-shot smoke test callable from main --probe mode. */
-static int send_keepalive_data(int udp_fd, struct noise_remote *remote)
+static int send_keepalive_data(int udp_fd,
+                               const struct sockaddr *peer_sa, socklen_t peer_sl,
+                               struct noise_remote *remote)
 {
-    return wg_encap(udp_fd, remote, NULL, 0);
+    return wg_encap(udp_fd, peer_sa, peer_sl, remote, NULL, 0);
 }
 
 int main(int argc, char *argv[])
@@ -919,8 +1069,12 @@ int main(int argc, char *argv[])
     int udp_fd = -1;
     int utun_fd = -1;
     char utun_name[IFNAMSIZ] = {0};
+    struct sockaddr_storage peer_ss;
+    socklen_t               peer_sl = 0;
     int ret = 1;
     int attempt;
+
+    memset(&peer_ss, 0, sizeof(peer_ss));
 
     signal(SIGPIPE, SIG_IGN);
 
@@ -969,11 +1123,27 @@ int main(int argc, char *argv[])
     cookie_maker_init(&cookie, cfg.peer_public_key);
     cookie_inited = 1;
 
-    udp_fd = udp_connect_endpoint(cfg.endpoint_host, cfg.endpoint_port);
+    /* Resolve peer endpoint once; we keep an unconnected UDP socket and
+     * sendto this addr from now on. recvfrom will then show us the real
+     * source of every inbound packet, which is essential for debugging
+     * silent drops (and a prerequisite for proper roaming). */
+    {
+        struct sockaddr_storage ss;
+        socklen_t sl;
+        if (resolve_endpoint(cfg.endpoint_host, cfg.endpoint_port, &ss, &sl) != 0)
+            goto out;
+        memcpy(&peer_ss, &ss, sl);
+        peer_sl = sl;
+    }
+    udp_fd = udp_open_unconnected(peer_ss.ss_family);
     if (udp_fd < 0) {
-        fprintf(stderr, "failed to connect udp endpoint %s:%u\n",
-                cfg.endpoint_host, (unsigned)cfg.endpoint_port);
+        fprintf(stderr, "failed to open udp socket\n");
         goto out;
+    }
+    {
+        char addr_s[80];
+        fmt_sockaddr((struct sockaddr *)&peer_ss, addr_s, sizeof(addr_s));
+        fprintf(stderr, "[udp] peer endpoint resolved to %s\n", addr_s);
     }
 
     {
@@ -990,7 +1160,9 @@ int main(int argc, char *argv[])
 
         printf("[handshake] attempt %d\n", attempt);
 
-        if (send_initiation(udp_fd, remote, &cookie, &s_idx) != 0) {
+        if (send_initiation(udp_fd,
+                            (struct sockaddr *)&peer_ss, peer_sl,
+                            remote, &cookie, &s_idx) != 0) {
             sleep(REKEY_TIMEOUT_SEC);
             continue;
         }
@@ -1012,7 +1184,9 @@ int main(int argc, char *argv[])
 
     if (!want_tunnel) {
         /* Probe mode: send a single keepalive and exit. */
-        if (send_keepalive_data(udp_fd, remote) == 0)
+        if (send_keepalive_data(udp_fd,
+                                (struct sockaddr *)&peer_ss, peer_sl,
+                                remote) == 0)
             printf("[data] keepalive packet sent\n");
         goto out;
     }
@@ -1031,6 +1205,15 @@ int main(int argc, char *argv[])
             fprintf(stderr, "utun_configure failed, continuing unconfigured\n");
         } else {
             printf("[tunnel] %s configured with %s\n", utun_name, cfg.if_address);
+            /* Dump what the kernel actually installed so we can see
+             * if the route is pointing at utunN or at en0. */
+            {
+                char cmd[128];
+                snprintf(cmd, sizeof(cmd), "/sbin/ifconfig %s", utun_name);
+                (void)system(cmd);
+                (void)system("/usr/sbin/netstat -rn -f inet "
+                             "| awk 'NR<=2 || /10\\.88/ {print}'");
+            }
         }
     } else {
         fprintf(stderr, "[tunnel] no Interface.Address in config; "
@@ -1039,9 +1222,13 @@ int main(int argc, char *argv[])
 
     /* Send one keepalive so the server refreshes its endpoint view for
      * this source port before we start sending real traffic. */
-    (void)send_keepalive_data(udp_fd, remote);
+    (void)send_keepalive_data(udp_fd,
+                              (struct sockaddr *)&peer_ss, peer_sl,
+                              remote);
 
-    ret = run_tunnel(udp_fd, utun_fd, local, remote);
+    ret = run_tunnel(udp_fd, utun_fd,
+                     (struct sockaddr *)&peer_ss, peer_sl,
+                     local, remote);
 
 out:
     if (utun_fd >= 0)
