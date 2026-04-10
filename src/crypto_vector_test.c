@@ -36,6 +36,94 @@ static int test_blake2s_abc(void)
     return 0;
 }
 
+/* Two more well-known Blake2s-256 hashes:
+ *   1. Empty string (canonical, see Linux blake2s_testvecs[0])
+ *   2. The pangram "The quick brown fox jumps over the lazy dog"
+ * Both inputs are < 64 bytes so they don't exercise multi-block on
+ * their own — the streaming consistency test below covers that. */
+static int test_blake2s_more_kats(void)
+{
+    static const uint8_t empty_expected[32] = {
+        0x69,0x21,0x7a,0x30,0x79,0x90,0x80,0x94,
+        0xe1,0x11,0x21,0xd0,0x42,0x35,0x4a,0x7c,
+        0x1f,0x55,0xb6,0x48,0x2c,0xa1,0xa5,0x1e,
+        0x1b,0x25,0x0d,0xfd,0x1e,0xd0,0xee,0xf9,
+    };
+    static const char fox_msg[] = "The quick brown fox jumps over the lazy dog";
+    static const uint8_t fox_expected[32] = {
+        0x60,0x6b,0xee,0xec,0x74,0x3c,0xcb,0xef,
+        0xf6,0xcb,0xcd,0xf5,0xd5,0x30,0x2a,0xa8,
+        0x55,0xc2,0x56,0xc2,0x9b,0x88,0xc8,0xed,
+        0x33,0x1e,0xa1,0xa6,0xbf,0x3c,0x88,0x12,
+    };
+    uint8_t out[32];
+    int fails = 0;
+
+    blake2s(out, NULL, NULL, sizeof(out), 0, 0);
+    if (memcmp(out, empty_expected, 32) != 0) {
+        printf("[FAIL] blake2s(empty)\n");
+        printf("  expected: "); print_hex(empty_expected, 32); printf("\n");
+        printf("  actual  : "); print_hex(out,           32); printf("\n");
+        fails++;
+    } else {
+        printf("[PASS] blake2s(empty string) vector\n");
+    }
+
+    blake2s(out, (const uint8_t *)fox_msg, NULL, 32, sizeof(fox_msg) - 1, 0);
+    if (memcmp(out, fox_expected, 32) != 0) {
+        printf("[FAIL] blake2s(\"The quick brown fox...\")\n");
+        printf("  expected: "); print_hex(fox_expected, 32); printf("\n");
+        printf("  actual  : "); print_hex(out,          32); printf("\n");
+        fails++;
+    } else {
+        printf("[PASS] blake2s(\"The quick brown fox...\") vector\n");
+    }
+    return fails;
+}
+
+/* Streaming consistency: hash a multi-block (>64 byte) input via the
+ * one-shot blake2s() helper, then via init/update/final with several
+ * different chunk sizes, and require byte-identical output for every
+ * mode. This is the regression guard for the same class of bug that
+ * crippled poly1305 — partial-block buffering across update calls. */
+static int test_blake2s_streaming_consistency(void)
+{
+    /* 200 bytes is 3+ blocks plus a partial tail (200 = 3*64 + 8). */
+    enum { N = 200 };
+    uint8_t msg[N];
+    uint8_t reference[32];
+    uint8_t out[32];
+    int fails = 0;
+
+    for (size_t i = 0; i < N; i++) msg[i] = (uint8_t)(i * 7 + 11);
+
+    /* Reference: one-shot blake2s. */
+    blake2s(reference, msg, NULL, 32, N, 0);
+
+    static const size_t chunk_sizes[] = {
+        1, 7, 13, 31, 32, 33, 63, 64, 65, 100, 199, 200
+    };
+    for (size_t ci = 0; ci < sizeof(chunk_sizes)/sizeof(chunk_sizes[0]); ci++) {
+        size_t cs = chunk_sizes[ci];
+        struct blake2s_state st;
+        blake2s_init(&st, 32);
+        for (size_t off = 0; off < N; off += cs) {
+            size_t take = (off + cs > N) ? (N - off) : cs;
+            blake2s_update(&st, msg + off, take);
+        }
+        blake2s_final(&st, out);
+        if (memcmp(out, reference, 32) != 0) {
+            printf("[FAIL] blake2s streaming(chunk=%zu) != one-shot\n", cs);
+            printf("  one-shot : "); print_hex(reference, 32); printf("\n");
+            printf("  streaming: "); print_hex(out,       32); printf("\n");
+            fails++;
+        }
+    }
+    if (fails == 0)
+        printf("[PASS] blake2s streaming consistency (200B input, 12 chunkings)\n");
+    return fails;
+}
+
 /* RFC 8439 §2.8.2 Known-Answer Test. This is the authoritative KAT that
  * catches sign/shift bugs a pure roundtrip would miss. */
 static int test_chacha20_poly1305_rfc8439_kat(void)
@@ -288,6 +376,8 @@ int main(void)
     int fails = 0;
 
     fails += test_blake2s_abc();
+    fails += test_blake2s_more_kats();
+    fails += test_blake2s_streaming_consistency();
     fails += test_curve25519_rfc7748();
     fails += test_chacha20_poly1305_rfc8439_kat();
     fails += test_mbuf_matches_buffer_path();
