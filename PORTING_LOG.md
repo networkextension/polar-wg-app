@@ -490,7 +490,7 @@ PING 10.88.0.1 (10.88.0.1): 56 data bytes
 
 ---
 
-## 11. 当前状态（Round 3 完成）
+## 11. 当前状态（M3 完成）
 
 | 层 | 状态 |
 |---|---|
@@ -499,28 +499,52 @@ PING 10.88.0.1 (10.88.0.1): 56 data bytes
 | Data plane encap (wg_encap) | ✅ |
 | Data plane decap (wg_decap) | ✅ |
 | utun integration + routing | ✅ |
-| ping 端到端 | ✅ **3/3 0% loss** |
-| Handshake retransmit timer | ❌ 还没做 |
-| Rekey timer (REKEY_AFTER_TIME = 120s) | ❌ 还没做 |
+| ping 端到端 (短) | ✅ **3/3 0% loss** |
+| Handshake retransmit timer | ✅ M3.1 |
+| Rekey timer (REKEY_AFTER_TIME = 120s) | ✅ M3.2 |
+| Persistent-keepalive | ✅ M3.3 |
+| ping 端到端 (跨 rekey) | ✅ **200/200 0% loss over 200s** |
+| Roaming endpoint update | ✅ |
 | Allowedips (multi-peer) | ❌ |
-| Roaming endpoint update | ✅ run_tunnel 里基于 recvfrom 自动更新 |
-| Persistent-keepalive | ❌ |
+| UAPI (`wg show` / `setconf`) | ❌ |
 
-下一步是 **M3.1 / M3.2** 把定时器装上 —— 当前会话只能撑 ~3 分钟（REJECT_AFTER_TIME），过期后没办法 rekey。
+**会话现在可以无限期跑下去**。M3 的三个 timer 一上线，跨过 120s rekey 边界、跨过 180s reject_after 边界都能保持 0% 丢包。
+
+### M3 验收数据
+
+```
+$ ping -c 200 -i 1 10.88.0.1
+... 200 packets ...
+200 packets transmitted, 200 packets received, 0.0% packet loss
+round-trip min/avg/max/stddev = 0.635/2.800/7.387/1.210 ms
+```
+
+200 秒持续 ping 跨过：
+- 第 25s 之后任何 idle 缺口会触发 persistent-keepalive（client.conf 配 25s）
+- 第 120s 触发 proactive rekey（in-band，使用 select 循环里的 WG_PKT_RESPONSE 处理）
+- 第 180s 是旧 keypair 的 REJECT_AFTER_TIME；如果 rekey 没成，从这一刻起所有 ping 都会超时
+
+实际：**0% loss across the entire 200 seconds**，证明 rekey 在第 120s 完整 handover 成功。RTT min/avg/max = 0.635 / 2.800 / 7.387ms，跨 rekey 没有任何 spike，新 keypair 接管对 latency 是透明的。
 
 ---
 
 ## 12. 下一步
 
-- [x] Curve25519 RFC 7748 §6.1 KAT  ← Round 3 做了
-- [x] mbuf-vs-buffer 全长度 KAT  ← Round 3 做了
-- [x] L2 utun 挂接 + 数据面端到端  ← Round 3 ping 通了
-- [ ] M3.1 Handshake retransmit timer (REKEY_TIMEOUT = 5s)
-- [ ] M3.2 Rekey timer (REKEY_AFTER_TIME = 120s)  ← 不做这个 3 分钟后会话死
-- [ ] M3.3 Persistent-keepalive
+---
+
+## 12. 下一步
+
+- [x] Curve25519 RFC 7748 §6.1 KAT
+- [x] mbuf-vs-buffer 全长度 KAT
+- [x] L2 utun 挂接 + 数据面端到端
+- [x] M3.1 Handshake retransmit timer (REKEY_TIMEOUT = 5s)
+- [x] M3.2 Rekey timer (REKEY_AFTER_TIME = 120s) ← 验证 200s ping 0% loss
+- [x] M3.3 Persistent-keepalive
 - [ ] Blake2s 长消息 KAT
 - [ ] M2 Allowedips trie（多 peer 支持）
 - [ ] UAPI (`wg show` / `wg setconf`)
+- [ ] Responder role（让别人能连进来，不只是出去）
+- [ ] IPv6 inner（utun 的 IPv6 + 解析 inner ipv6 头）
 
 三轮调试的累计教训：
 
