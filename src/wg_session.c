@@ -960,6 +960,8 @@ wg_session_kick(wg_session_t *s)
     return -1;
 }
 
+uint16_t wg_session_listen_port(const wg_session_t *s) { return s ? s->listen_port : 0; }
+
 int wg_session_iface_addr_count(const wg_session_t *s) { return s ? s->n_if_addrs : 0; }
 
 int
@@ -1005,6 +1007,183 @@ wg_session_peer_allowed_get(const wg_session_t *s, int i, int j,
     if (prefix_out) *prefix_out = c->prefix_len;
     if (family_out) *family_out = c->family;
     return 0;
+}
+
+int
+wg_session_peer_endpoint(const wg_session_t *s, int i,
+                         char *addr_out, uint16_t *port_out)
+{
+    if (!s || i < 0 || i >= s->n_peers) return -1;
+    const struct wgs_peer *p = &s->peers[i];
+    if (p->endpoint_len == 0) return -1;
+    if (p->endpoint.ss_family == AF_INET) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)&p->endpoint;
+        if (addr_out) inet_ntop(AF_INET, &sin->sin_addr, addr_out, 80);
+        if (port_out) *port_out = ntohs(sin->sin_port);
+        return 0;
+    }
+    if (p->endpoint.ss_family == AF_INET6) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)&p->endpoint;
+        if (addr_out) inet_ntop(AF_INET6, &sin6->sin6_addr, addr_out, 80);
+        if (port_out) *port_out = ntohs(sin6->sin6_port);
+        return 0;
+    }
+    return -1;
+}
+
+int
+wg_session_peer_keepalive(const wg_session_t *s, int i)
+{
+    if (!s || i < 0 || i >= s->n_peers) return 0;
+    return s->peers[i].pk_sec;
+}
+
+int
+wg_session_peer_transfer(const wg_session_t *s, int i,
+                         uint64_t *rx_out, uint64_t *tx_out)
+{
+    if (!s || i < 0 || i >= s->n_peers) return -1;
+    if (rx_out) *rx_out = s->peers[i].rx_bytes;
+    if (tx_out) *tx_out = s->peers[i].tx_bytes;
+    return 0;
+}
+
+int
+wg_session_peer_handshake_age(const wg_session_t *s, int i)
+{
+    if (!s || i < 0 || i >= s->n_peers) return -1;
+    if (!s->peers[i].keypair_birth) return -1;
+    return (int)(time(NULL) - s->peers[i].keypair_birth);
+}
+
+/* Emit N hex bytes into out (no leading 0x, lowercase). out must have
+ * room for 2*N bytes (no NUL). Used by the UAPI GET formatter. */
+static void
+hex_encode(char *out, const uint8_t *in, size_t n)
+{
+    static const char d[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) {
+        out[2*i]     = d[(in[i] >> 4) & 0xf];
+        out[2*i + 1] = d[ in[i]       & 0xf];
+    }
+}
+
+/* snprintf-style accumulator that keeps running totals even when the
+ * destination buffer is full, so callers can size a buffer by passing
+ * NULL/0 first and reading the returned length. */
+static void
+append_fmt(char **buf, size_t *cap, int *written, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int need = vsnprintf(*cap > 0 ? *buf : NULL,
+                         *cap > 0 ? *cap : 0,
+                         fmt, ap);
+    va_end(ap);
+    if (need < 0) return;
+    *written += need;
+    if ((size_t)need < *cap) {
+        *buf += need;
+        *cap -= (size_t)need;
+    } else if (*cap > 0) {
+        *buf += *cap - 1;  /* leave room for NUL */
+        *cap = 1;
+    }
+}
+
+int
+wg_session_get_uapi(const wg_session_t *s, char *buf, size_t buf_len)
+{
+    if (!s) return 0;
+    char *p = buf;
+    size_t cap = buf_len;
+    int written = 0;
+
+    /* Interface. We deliberately do NOT expose the private key:
+     * NetworkExtension host apps should not have a way to ask the
+     * running extension for its static private key. "none" keeps the
+     * wg(8) parser happy — it treats missing/none private_key as
+     * "peer-only view". */
+    append_fmt(&p, &cap, &written, "private_key=none\n");
+    append_fmt(&p, &cap, &written, "listen_port=%u\n", (unsigned)s->listen_port);
+    append_fmt(&p, &cap, &written, "fwmark=0\n");
+
+    /* Per peer. */
+    for (int i = 0; i < s->n_peers; i++) {
+        const struct wgs_peer *peer = &s->peers[i];
+        char pkhex[65];
+        hex_encode(pkhex, peer->pubkey, WG_KEY_LEN);
+        pkhex[64] = '\0';
+
+        append_fmt(&p, &cap, &written, "public_key=%s\n", pkhex);
+        /* We don't support PSK yet (the config parser doesn't read
+         * PresharedKey), so always emit the all-zero sentinel that
+         * wg(8) treats as "no PSK". */
+        append_fmt(&p, &cap, &written,
+                   "preshared_key=00000000000000000000000000000000"
+                   "00000000000000000000000000000000\n");
+
+        if (peer->endpoint_len > 0) {
+            char addr[80] = {0}; uint16_t port = 0;
+            if (peer->endpoint.ss_family == AF_INET) {
+                const struct sockaddr_in *sin =
+                    (const struct sockaddr_in *)&peer->endpoint;
+                inet_ntop(AF_INET, &sin->sin_addr, addr, sizeof(addr));
+                port = ntohs(sin->sin_port);
+                append_fmt(&p, &cap, &written, "endpoint=%s:%u\n", addr, port);
+            } else if (peer->endpoint.ss_family == AF_INET6) {
+                const struct sockaddr_in6 *sin6 =
+                    (const struct sockaddr_in6 *)&peer->endpoint;
+                inet_ntop(AF_INET6, &sin6->sin6_addr, addr, sizeof(addr));
+                port = ntohs(sin6->sin6_port);
+                /* IPv6 endpoints use bracket notation per RFC 3986. */
+                append_fmt(&p, &cap, &written, "endpoint=[%s]:%u\n", addr, port);
+            }
+        }
+
+        /* last_handshake_time_{sec,nsec}: wg(8) semantics is "wallclock
+         * at which the last handshake completed". We store monotonic
+         * keypair_birth, so we emit the approximated wallclock (now -
+         * age) as sec and nsec=0. 0/0 = never handshook. */
+        if (peer->keypair_birth) {
+            append_fmt(&p, &cap, &written,
+                       "last_handshake_time_sec=%lld\n"
+                       "last_handshake_time_nsec=0\n",
+                       (long long)peer->keypair_birth);
+        } else {
+            append_fmt(&p, &cap, &written,
+                       "last_handshake_time_sec=0\n"
+                       "last_handshake_time_nsec=0\n");
+        }
+
+        append_fmt(&p, &cap, &written,
+                   "tx_bytes=%llu\nrx_bytes=%llu\n",
+                   (unsigned long long)peer->tx_bytes,
+                   (unsigned long long)peer->rx_bytes);
+
+        if (peer->pk_sec > 0) {
+            append_fmt(&p, &cap, &written,
+                       "persistent_keepalive_interval=%d\n", peer->pk_sec);
+        }
+
+        for (int j = 0; j < peer->n_allowed; j++) {
+            const struct wgs_allowed_cidr *c = &peer->allowed[j];
+            char ipbuf[INET6_ADDRSTRLEN];
+            if (!inet_ntop(c->family, c->addr, ipbuf, sizeof(ipbuf))) continue;
+            append_fmt(&p, &cap, &written,
+                       "allowed_ip=%s/%d\n", ipbuf, c->prefix_len);
+        }
+
+        append_fmt(&p, &cap, &written, "protocol_version=1\n");
+    }
+
+    /* Trailer per UAPI spec. */
+    append_fmt(&p, &cap, &written, "errno=0\n\n");
+
+    /* Ensure NUL termination on success. */
+    if (buf_len > 0)
+        buf[buf_len - 1 < (size_t)written ? buf_len - 1 : (size_t)written] = '\0';
+    return written;
 }
 
 int

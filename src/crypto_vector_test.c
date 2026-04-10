@@ -6,6 +6,7 @@
 #include "crypto.h"
 #include "wg_noise.h"
 #include "allowedips.h"
+#include "wg_session.h"
 #include <crypto/curve25519.h>
 #include <sys/mbuf.h>
 
@@ -733,6 +734,108 @@ static int test_aips_v6(void)
     return 0;
 }
 
+/* Exercise wg_session_create + wg_session_get_uapi end-to-end. Parses
+ * a small config, pulls the UAPI GET response out, checks a few
+ * canonical fields, and verifies the "NULL/0 first to size" contract. */
+static void uapi_test_log(void *u, const char *m) { (void)u; (void)m; }
+static void uapi_test_send(void *u, const uint8_t *b, size_t l,
+                           const struct sockaddr *a, socklen_t al)
+{
+    (void)u; (void)b; (void)l; (void)a; (void)al;
+}
+static void uapi_test_deliver(void *u, const uint8_t *b, size_t l)
+{
+    (void)u; (void)b; (void)l;
+}
+
+static int test_wg_session_uapi_get(void)
+{
+    static const char cfg[] =
+        "[Interface]\n"
+        "PrivateKey = yPDHiay/NDkJE9OyUT0J8qhuJXpihZw1aD7Xl4JJEVw=\n"
+        "Address    = 10.88.0.2/24\n"
+        "ListenPort = 51822\n"
+        "\n"
+        "[Peer]\n"
+        "PublicKey  = XXFzbjDln02y/aWfo2RFVZ/foiMC/NEo9QKXDdk9SXk=\n"
+        "AllowedIPs = 10.88.0.0/24, fd00::/64\n"
+        "PersistentKeepalive = 25\n";
+
+    wg_session_callbacks cb = {0};
+    cb.send_udp   = uapi_test_send;
+    cb.deliver_ip = uapi_test_deliver;
+    cb.log_line   = uapi_test_log;
+
+    wg_session_t *s = wg_session_create(cfg, sizeof(cfg) - 1, cb);
+    if (!s) { printf("[FAIL] wg_session_create\n"); return 1; }
+
+    /* Introspection sanity. */
+    if (wg_session_peer_count(s) != 1) {
+        printf("[FAIL] peer_count\n"); wg_session_destroy(s); return 1;
+    }
+    if (wg_session_listen_port(s) != 51822) {
+        printf("[FAIL] listen_port=%u\n", wg_session_listen_port(s));
+        wg_session_destroy(s);
+        return 1;
+    }
+    if (wg_session_peer_allowed_count(s, 0) != 2) {
+        printf("[FAIL] allowed_count\n"); wg_session_destroy(s); return 1;
+    }
+
+    /* Size-first query pattern. */
+    int need = wg_session_get_uapi(s, NULL, 0);
+    if (need < 64) {
+        printf("[FAIL] uapi size %d too small\n", need);
+        wg_session_destroy(s);
+        return 1;
+    }
+
+    char *buf = (char *)malloc((size_t)need + 1);
+    int wrote = wg_session_get_uapi(s, buf, (size_t)need + 1);
+    if (wrote != need) {
+        printf("[FAIL] uapi re-size %d != %d\n", wrote, need);
+        free(buf); wg_session_destroy(s);
+        return 1;
+    }
+
+    /* Canonical field presence checks. */
+    const char *required[] = {
+        "private_key=none\n",
+        "listen_port=51822\n",
+        "fwmark=0\n",
+        "public_key=",
+        "preshared_key=0000",
+        "persistent_keepalive_interval=25\n",
+        "allowed_ip=10.88.0.0/24\n",
+        "allowed_ip=fd00::/64\n",
+        "protocol_version=1\n",
+        "errno=0\n",
+    };
+    for (size_t i = 0; i < sizeof(required)/sizeof(required[0]); i++) {
+        if (!strstr(buf, required[i])) {
+            printf("[FAIL] uapi GET missing required field '%s'\n", required[i]);
+            printf("--- response ---\n%s---\n", buf);
+            free(buf);
+            wg_session_destroy(s);
+            return 1;
+        }
+    }
+
+    /* The response MUST end with "\n\n" per the UAPI spec so the
+     * reader knows where the record ends. */
+    if (need < 2 || buf[need - 2] != '\n' || buf[need - 1] != '\n') {
+        printf("[FAIL] uapi GET does not end with \\n\\n\n");
+        free(buf);
+        wg_session_destroy(s);
+        return 1;
+    }
+
+    free(buf);
+    wg_session_destroy(s);
+    printf("[PASS] wg_session_create + UAPI GET round trip\n");
+    return 0;
+}
+
 static int test_aips_edge_cases(void)
 {
     struct aips_trie t;
@@ -778,6 +881,7 @@ int main(void)
     fails += test_aips_replace_and_remove();
     fails += test_aips_v6();
     fails += test_aips_edge_cases();
+    fails += test_wg_session_uapi_get();
 
     crypto_deinit();
 
