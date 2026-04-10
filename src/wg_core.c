@@ -23,6 +23,7 @@
 #include "macos_stubs/sys/mbuf.h"
 #include "macos_stubs/sys/param.h"
 #include "macos_stubs/sys/rwlock.h"
+#include "allowedips.h"
 #include <libkern/OSByteOrder.h>
 #define htole32(x) OSSwapHostToLittleInt32(x)
 #define le32toh(x) OSSwapLittleToHostInt32(x)
@@ -149,6 +150,14 @@ _Static_assert(sizeof(struct wg_pkt_response)   == 92,  "wg_pkt_response size");
 _Static_assert(sizeof(struct wg_pkt_cookie)     == 64,  "wg_pkt_cookie size");
 _Static_assert(sizeof(struct wg_pkt_data_hdr)   == 16,  "wg_pkt_data_hdr size");
 
+#define WG_MAX_ALLOWED_CIDRS 16
+
+struct allowed_cidr {
+    int     family;     /* AF_INET or AF_INET6 */
+    uint8_t addr[16];   /* network order; only first 4 bytes used for AF_INET */
+    int     prefix_len;
+};
+
 struct client_config {
     char endpoint_host[128];
     uint16_t endpoint_port;
@@ -158,6 +167,9 @@ struct client_config {
     char     if_address[64];  /* e.g. "10.88.0.2/24" */
     int      has_if_address;
     int      persistent_keepalive;  /* seconds; 0 = disabled */
+    /* Allowed-IPs CIDRs from the [Peer] section. */
+    struct allowed_cidr allowed[WG_MAX_ALLOWED_CIDRS];
+    int      n_allowed;
 };
 
 static int b64_value(unsigned char c)
@@ -228,6 +240,72 @@ static char *trim(char *s)
         end--;
     }
     return s;
+}
+
+/* Parse a single CIDR like "10.88.0.0/24" or "fd00::/64" or "10.88.0.2"
+ * (bare addr defaults to /32 for v4, /128 for v6). Fills *out and returns
+ * 0 on success, -1 on bad input. */
+static int parse_cidr(const char *s, struct allowed_cidr *out)
+{
+    char tmp[64];
+    char *slash;
+    int prefix;
+
+    if (strlen(s) >= sizeof(tmp)) return -1;
+    strcpy(tmp, s);
+    slash = strchr(tmp, '/');
+    if (slash) {
+        *slash = '\0';
+        prefix = atoi(slash + 1);
+    } else {
+        prefix = -1;
+    }
+
+    memset(out->addr, 0, sizeof(out->addr));
+    if (inet_pton(AF_INET, tmp, out->addr) == 1) {
+        out->family = AF_INET;
+        out->prefix_len = (prefix < 0) ? 32 : prefix;
+        if (out->prefix_len < 0 || out->prefix_len > 32) return -1;
+        return 0;
+    }
+    if (inet_pton(AF_INET6, tmp, out->addr) == 1) {
+        out->family = AF_INET6;
+        out->prefix_len = (prefix < 0) ? 128 : prefix;
+        if (out->prefix_len < 0 || out->prefix_len > 128) return -1;
+        return 0;
+    }
+    return -1;
+}
+
+/* Parse a comma-separated list of CIDRs like "10.88.0.0/24, 10.99.0.0/16"
+ * into cfg->allowed[]. Returns the number of CIDRs added, or -1 on error. */
+static int parse_allowed_ips(const char *s, struct client_config *cfg)
+{
+    char buf[512];
+    char *p, *save;
+    int added = 0;
+
+    if (strlen(s) >= sizeof(buf)) return -1;
+    strcpy(buf, s);
+
+    for (p = strtok_r(buf, ",", &save); p; p = strtok_r(NULL, ",", &save)) {
+        while (*p == ' ' || *p == '\t') p++;
+        char *end = p + strlen(p) - 1;
+        while (end > p && (*end == ' ' || *end == '\t')) { *end = '\0'; end--; }
+        if (!*p) continue;
+        if (cfg->n_allowed >= WG_MAX_ALLOWED_CIDRS) {
+            fprintf(stderr, "too many AllowedIPs entries (max %d)\n",
+                    WG_MAX_ALLOWED_CIDRS);
+            return -1;
+        }
+        if (parse_cidr(p, &cfg->allowed[cfg->n_allowed]) != 0) {
+            fprintf(stderr, "invalid CIDR in AllowedIPs: %s\n", p);
+            return -1;
+        }
+        cfg->n_allowed++;
+        added++;
+    }
+    return added;
 }
 
 static int split_endpoint(const char *s, char host[128], uint16_t *port)
@@ -321,6 +399,11 @@ static int load_config(const char *path, struct client_config *cfg)
             cfg->has_if_address = 1;
         } else if (in_peer && strcmp(p, "PersistentKeepalive") == 0) {
             cfg->persistent_keepalive = atoi(eq);
+        } else if (in_peer && strcmp(p, "AllowedIPs") == 0) {
+            if (parse_allowed_ips(eq, cfg) < 0) {
+                fclose(f);
+                return -1;
+            }
         }
     }
 
@@ -923,6 +1006,52 @@ static void trace_hex(const char *tag, const uint8_t *b, size_t n)
     fprintf(stderr, "\n");
 }
 
+/* Bundle of two tries (v4 + v6) so we can pass a single pointer around. */
+struct aips_set {
+    struct aips_trie v4;
+    struct aips_trie v6;
+};
+
+/* Build the per-peer allowedips set from the config and a peer pointer. */
+static int
+build_aips_set(struct aips_set *set, const struct client_config *cfg, void *peer)
+{
+    aips_init(&set->v4, 32);
+    aips_init(&set->v6, 128);
+    for (int i = 0; i < cfg->n_allowed; i++) {
+        const struct allowed_cidr *c = &cfg->allowed[i];
+        struct aips_trie *t = (c->family == AF_INET) ? &set->v4 : &set->v6;
+        if (aips_insert(t, c->addr, c->prefix_len, peer) != 0) {
+            fprintf(stderr, "aips_insert failed\n");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Look up the inner src IP of a freshly decrypted packet against the
+ * peer's allowed-ips. Returns the matched peer pointer, or NULL if the
+ * inner src is not allowed. Used as the receive-side anti-spoofing
+ * check (RFC: "the receiver verifies that the source address of the
+ * inner packet matches one of the AllowedIPs of the peer that sent
+ * it"). */
+static void *
+aips_lookup_inner_src(const struct aips_set *set,
+                      const uint8_t *inner, size_t len)
+{
+    if (len < 1) return NULL;
+    int ver = inner[0] >> 4;
+    if (ver == 4) {
+        if (len < 20) return NULL;
+        return aips_lookup(&set->v4, inner + 12);   /* IPv4 src offset 12 */
+    }
+    if (ver == 6) {
+        if (len < 40) return NULL;
+        return aips_lookup(&set->v6, inner + 8);    /* IPv6 src offset 8  */
+    }
+    return NULL;
+}
+
 /* ─────────────────────────────────────────────────────────────────────────
  * Tunnel state machine
  *
@@ -966,8 +1095,14 @@ typedef struct {
     int       pk_sec;       /* 0 = disabled */
     time_t    last_authd_tx;
 
+    /* Allowed-IPs (anti-spoofing on inbound; route selection on
+     * outbound — single peer for now, so the trie always returns
+     * remote, but the structure is in place). */
+    const struct aips_set *aips;
+
     /* Stats */
     uint64_t  tx_pkts, tx_bytes, rx_pkts, rx_bytes;
+    uint64_t  rx_dropped_aips;  /* dropped by anti-spoofing */
 } tunnel_ctx;
 
 /* Send a fresh handshake initiation, transition into hs_pending. Used both
@@ -1072,7 +1207,8 @@ static int
 run_tunnel(int udp_fd, int utun_fd,
            const struct sockaddr *peer_sa, socklen_t peer_sl,
            struct noise_local *local, struct noise_remote *remote,
-           struct cookie_maker *cookie, int persistent_keepalive)
+           struct cookie_maker *cookie, int persistent_keepalive,
+           const struct aips_set *aips)
 {
     tunnel_ctx ctx;
     uint8_t udp_buf[2048];
@@ -1090,6 +1226,7 @@ run_tunnel(int udp_fd, int utun_fd,
     ctx.keypair_birth = time(NULL);  /* handshake just succeeded in main */
     ctx.last_authd_tx = ctx.keypair_birth;
     ctx.pk_sec        = persistent_keepalive;
+    ctx.aips          = aips;
 
     last_stats = ctx.keypair_birth;
 
@@ -1213,6 +1350,24 @@ run_tunnel(int udp_fd, int utun_fd,
                                          udp_buf, (size_t)n,
                                          inner_buf, sizeof(inner_buf));
                     if (inner > 0) {
+                        /* Anti-spoofing: the inner src IP must belong to
+                         * the peer that just authenticated this packet.
+                         * For our single-peer case the trie returns
+                         * `remote` for any allowed CIDR and NULL for
+                         * anything else. Drop the packet on mismatch. */
+                        void *src_peer = aips_lookup_inner_src(
+                            ctx.aips, inner_buf, (size_t)inner);
+                        if (src_peer != (void *)remote) {
+                            ctx.rx_dropped_aips++;
+                            if (g_trace_rx <= g_trace_cap) {
+                                fprintf(stderr, "[rx#%d] DROP: inner src "
+                                                "%u.%u.%u.%u not in allowed-ips\n",
+                                        g_trace_rx,
+                                        inner_buf[12], inner_buf[13],
+                                        inner_buf[14], inner_buf[15]);
+                            }
+                            continue;
+                        }
                         if (g_trace_rx <= g_trace_cap) {
                             fprintf(stderr, "[rx#%d] decap OK: %d inner bytes, ver=%u\n",
                                     g_trace_rx, inner, inner_buf[0] >> 4);
@@ -1249,9 +1404,11 @@ run_tunnel(int udp_fd, int utun_fd,
         }
     }
 
-    printf("\n[tunnel] shutdown. final: tx=%llu pkts/%llu B  rx=%llu pkts/%llu B\n",
+    printf("\n[tunnel] shutdown. final: tx=%llu pkts/%llu B  rx=%llu pkts/%llu B  "
+           "rx_dropped_aips=%llu\n",
            (unsigned long long)ctx.tx_pkts, (unsigned long long)ctx.tx_bytes,
-           (unsigned long long)ctx.rx_pkts, (unsigned long long)ctx.rx_bytes);
+           (unsigned long long)ctx.rx_pkts, (unsigned long long)ctx.rx_bytes,
+           (unsigned long long)ctx.rx_dropped_aips);
     return (ctx.rx_pkts > 0) ? 0 : 2;
 }
 
@@ -1432,9 +1589,27 @@ int main(int argc, char *argv[])
                               (struct sockaddr *)&peer_ss, peer_sl,
                               remote);
 
-    ret = run_tunnel(udp_fd, utun_fd,
-                     (struct sockaddr *)&peer_ss, peer_sl,
-                     local, remote, &cookie, cfg.persistent_keepalive);
+    /* Build the per-peer allowedips set. With single-peer config the
+     * trie just maps every CIDR to `remote`; on inbound, the inner src
+     * IP is looked up against this trie and dropped if it does not
+     * resolve to the same peer. */
+    {
+        struct aips_set aips;
+        if (build_aips_set(&aips, &cfg, remote) != 0) {
+            fprintf(stderr, "build_aips_set failed\n");
+            ret = 1;
+            goto out;
+        }
+        printf("[tunnel] allowed-ips loaded: %d CIDR(s)\n", cfg.n_allowed);
+
+        ret = run_tunnel(udp_fd, utun_fd,
+                         (struct sockaddr *)&peer_ss, peer_sl,
+                         local, remote, &cookie, cfg.persistent_keepalive,
+                         &aips);
+
+        aips_destroy(&aips.v4);
+        aips_destroy(&aips.v6);
+    }
 
 out:
     if (utun_fd >= 0)
