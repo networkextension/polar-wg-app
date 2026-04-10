@@ -990,6 +990,11 @@ utun_configure(const char *ifname, const char *addr_cidr)
 static volatile sig_atomic_t sig_quit = 0;
 static void on_quit(int s) { (void)s; sig_quit = 1; }
 
+/* Set by SIGINFO (Ctrl-T on macOS / BSD). The select loop checks this
+ * flag every iteration and prints a wg-show-style snapshot when set. */
+static volatile sig_atomic_t sig_info = 0;
+static void on_info(int s) { (void)s; sig_info = 1; }
+
 /* Trace first N packets in each direction. Set WG_TRACE=N in the env to
  * raise the cap; 0 disables, default is 12 which is enough to see the
  * first ping echo round-trip without swamping the terminal. */
@@ -1100,10 +1105,134 @@ typedef struct {
      * remote, but the structure is in place). */
     const struct aips_set *aips;
 
+    /* Display fields used by the [wg show] snapshot. Pulled from the
+     * config so the printer doesn't have to walk noise internals. */
+    const uint8_t *peer_pubkey;     /* 32 bytes */
+    const struct allowed_cidr *peer_allowed;
+    int            peer_n_allowed;
+    char           if_name[IFNAMSIZ];
+
     /* Stats */
     uint64_t  tx_pkts, tx_bytes, rx_pkts, rx_bytes;
     uint64_t  rx_dropped_aips;  /* dropped by anti-spoofing */
 } tunnel_ctx;
+
+/* Encode 32 bytes into the standard 44-character WireGuard base64 form.
+ * out must have room for at least 45 chars including NUL. */
+static void
+b64_encode_32(char out[45], const uint8_t in[32])
+{
+    static const char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int oi = 0;
+    /* 32 bytes / 3 = 10 full triplets + 2 leftover bytes */
+    for (int i = 0; i < 30; i += 3) {
+        uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i+1] << 8) | in[i+2];
+        out[oi++] = tbl[(v >> 18) & 0x3f];
+        out[oi++] = tbl[(v >> 12) & 0x3f];
+        out[oi++] = tbl[(v >>  6) & 0x3f];
+        out[oi++] = tbl[ v        & 0x3f];
+    }
+    /* Last 2 bytes: 16 bits → 3 base64 chars + '=' pad */
+    uint32_t v = ((uint32_t)in[30] << 16) | ((uint32_t)in[31] << 8);
+    out[oi++] = tbl[(v >> 18) & 0x3f];
+    out[oi++] = tbl[(v >> 12) & 0x3f];
+    out[oi++] = tbl[(v >>  6) & 0x3f];
+    out[oi++] = '=';
+    out[oi]   = '\0';
+}
+
+/* Format a single CIDR like "10.88.0.0/24" into a caller-supplied buffer. */
+static void
+fmt_cidr(const struct allowed_cidr *c, char *out, size_t out_len)
+{
+    char addr_buf[INET6_ADDRSTRLEN];
+    const char *p = inet_ntop(c->family, c->addr, addr_buf, sizeof(addr_buf));
+    if (!p) p = "?";
+    snprintf(out, out_len, "%s/%d", p, c->prefix_len);
+}
+
+/* Print a wg-show-style status snapshot of a single peer's tunnel state.
+ * Output is meant to look familiar to anyone who has used the wg(8) tool:
+ *
+ *   interface: utun7
+ *     peer pubkey: XXFzbjDln02y/aWfo2RFVZ/foiMC/NEo9QKXDdk9SXk=
+ *     endpoint: 172.16.203.128:51820
+ *     allowed ips: 0.0.0.0/0
+ *     latest handshake: 14 seconds ago
+ *     transfer: 1.4 KiB received, 1.2 KiB sent
+ *     persistent keepalive: every 25 seconds
+ *     anti-spoofing drops: 0
+ *     handshake state: idle (kp_age=14s)
+ */
+static void
+fmt_human_bytes(uint64_t b, char *out, size_t out_len)
+{
+    if (b < 1024)              snprintf(out, out_len, "%llu B",   (unsigned long long)b);
+    else if (b < 1024ull*1024) snprintf(out, out_len, "%.2f KiB", (double)b / 1024.0);
+    else if (b < 1024ull*1024*1024) snprintf(out, out_len, "%.2f MiB", (double)b / (1024.0*1024.0));
+    else                       snprintf(out, out_len, "%.2f GiB", (double)b / (1024.0*1024.0*1024.0));
+}
+
+static void
+fmt_human_age(time_t age_sec, char *out, size_t out_len)
+{
+    if (age_sec < 0)              snprintf(out, out_len, "never");
+    else if (age_sec < 60)        snprintf(out, out_len, "%lld seconds ago", (long long)age_sec);
+    else if (age_sec < 3600)      snprintf(out, out_len, "%lld minutes, %lld seconds ago",
+                                           (long long)(age_sec / 60), (long long)(age_sec % 60));
+    else                          snprintf(out, out_len, "%lld hours, %lld minutes ago",
+                                           (long long)(age_sec / 3600),
+                                           (long long)((age_sec % 3600) / 60));
+}
+
+static void
+print_status_snapshot(const tunnel_ctx *ctx)
+{
+    char pub_b64[45]   = "?";
+    char endpoint[80]  = "(none)";
+    char rx_h[32], tx_h[32];
+    char hs_age[64];
+    time_t now = time(NULL);
+
+    if (ctx->peer_pubkey)
+        b64_encode_32(pub_b64, ctx->peer_pubkey);
+    if (ctx->peer_len)
+        fmt_sockaddr((const struct sockaddr *)&ctx->peer, endpoint, sizeof(endpoint));
+    fmt_human_bytes(ctx->rx_bytes, rx_h, sizeof(rx_h));
+    fmt_human_bytes(ctx->tx_bytes, tx_h, sizeof(tx_h));
+    fmt_human_age(ctx->keypair_birth ? (now - ctx->keypair_birth) : -1,
+                  hs_age, sizeof(hs_age));
+
+    fprintf(stderr, "\n");
+    fprintf(stderr, "interface: %s\n", ctx->if_name[0] ? ctx->if_name : "(unknown)");
+    fprintf(stderr, "  peer pubkey: %s\n", pub_b64);
+    fprintf(stderr, "  endpoint: %s\n", endpoint);
+    if (ctx->peer_n_allowed > 0) {
+        fprintf(stderr, "  allowed ips: ");
+        for (int i = 0; i < ctx->peer_n_allowed; i++) {
+            char buf[64];
+            fmt_cidr(&ctx->peer_allowed[i], buf, sizeof(buf));
+            fprintf(stderr, "%s%s", buf, (i + 1 < ctx->peer_n_allowed) ? ", " : "\n");
+        }
+    } else {
+        fprintf(stderr, "  allowed ips: (none)\n");
+    }
+    fprintf(stderr, "  latest handshake: %s\n", hs_age);
+    fprintf(stderr, "  transfer: %s received, %s sent\n", rx_h, tx_h);
+    fprintf(stderr, "  packets: rx=%llu tx=%llu  rx_dropped_aips=%llu\n",
+            (unsigned long long)ctx->rx_pkts,
+            (unsigned long long)ctx->tx_pkts,
+            (unsigned long long)ctx->rx_dropped_aips);
+    if (ctx->pk_sec > 0)
+        fprintf(stderr, "  persistent keepalive: every %d seconds\n", ctx->pk_sec);
+    fprintf(stderr, "  handshake state: %s",
+            ctx->hs_pending ? "pending" : "idle");
+    if (ctx->hs_pending)
+        fprintf(stderr, " (attempt %d, sent %lds ago)",
+                ctx->hs_attempts, (long)(now - ctx->hs_sent_at));
+    fprintf(stderr, "\n\n");
+}
 
 /* Send a fresh handshake initiation, transition into hs_pending. Used both
  * for retransmits and for proactive rekey from the tick handler. */
@@ -1204,11 +1333,12 @@ tunnel_consume_response(tunnel_ctx *ctx, const uint8_t *buf, size_t len)
 }
 
 static int
-run_tunnel(int udp_fd, int utun_fd,
+run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
            const struct sockaddr *peer_sa, socklen_t peer_sl,
            struct noise_local *local, struct noise_remote *remote,
            struct cookie_maker *cookie, int persistent_keepalive,
-           const struct aips_set *aips)
+           const struct aips_set *aips,
+           const struct client_config *cfg)
 {
     tunnel_ctx ctx;
     uint8_t udp_buf[2048];
@@ -1227,11 +1357,21 @@ run_tunnel(int udp_fd, int utun_fd,
     ctx.last_authd_tx = ctx.keypair_birth;
     ctx.pk_sec        = persistent_keepalive;
     ctx.aips          = aips;
+    ctx.peer_pubkey   = cfg->peer_public_key;
+    ctx.peer_allowed  = cfg->allowed;
+    ctx.peer_n_allowed = cfg->n_allowed;
+    if (utun_name) {
+        strncpy(ctx.if_name, utun_name, sizeof(ctx.if_name) - 1);
+        ctx.if_name[sizeof(ctx.if_name) - 1] = '\0';
+    }
 
     last_stats = ctx.keypair_birth;
 
     signal(SIGINT,  on_quit);
     signal(SIGTERM, on_quit);
+#ifdef SIGINFO
+    signal(SIGINFO, on_info);   /* Ctrl-T on macOS / BSD */
+#endif
 
     /* Clear the 3-second RCVTIMEO left from the handshake probe: select()
      * handles readiness now, and a stale timeout would make recv() return
@@ -1253,6 +1393,12 @@ run_tunnel(int udp_fd, int utun_fd,
     printf("[tunnel] entering event loop "
            "(utun_fd=%d, udp_fd=%d, trace_cap=%d, pk=%ds)\n",
            utun_fd, udp_fd, g_trace_cap, ctx.pk_sec);
+
+    /* Print one wg-show-style snapshot at startup so the operator
+     * sees the parsed config / endpoint / peer pubkey. From here on
+     * snapshots come on demand via SIGINFO (Ctrl-T on macOS). */
+    print_status_snapshot(&ctx);
+    fprintf(stderr, "[tunnel] press Ctrl-T (SIGINFO) for a status snapshot at any time\n");
 
     while (!sig_quit) {
         fd_set rfds;
@@ -1277,6 +1423,11 @@ run_tunnel(int udp_fd, int utun_fd,
 
         now = time(NULL);
         tunnel_tick(&ctx, now);
+
+        if (sig_info) {
+            sig_info = 0;
+            print_status_snapshot(&ctx);
+        }
 
         if (rc == 0) {
             if (now - last_stats >= 10) {
@@ -1602,10 +1753,10 @@ int main(int argc, char *argv[])
         }
         printf("[tunnel] allowed-ips loaded: %d CIDR(s)\n", cfg.n_allowed);
 
-        ret = run_tunnel(udp_fd, utun_fd,
+        ret = run_tunnel(udp_fd, utun_fd, utun_name,
                          (struct sockaddr *)&peer_ss, peer_sl,
                          local, remote, &cookie, cfg.persistent_keepalive,
-                         &aips);
+                         &aips, &cfg);
 
         aips_destroy(&aips.v4);
         aips_destroy(&aips.v6);
