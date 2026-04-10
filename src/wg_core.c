@@ -458,7 +458,7 @@ static int wait_for_response(int udp_fd,
                              struct noise_local *local,
                              struct noise_remote *remote,
                              struct cookie_maker *cookie,
-                             uint32_t s_idx)
+                             uint32_t expected_local_idx)
 {
     uint8_t buf[2048];
     struct sockaddr_storage from_ss;
@@ -515,7 +515,27 @@ static int wait_for_response(int udp_fd,
         int ret;
 
         memcpy(&pkt, buf, sizeof(pkt));
-        ret = noise_consume_response(local, &matched, s_idx, pkt.r_idx, pkt.ue, pkt.en);
+
+        /* Sanity: the response's r_idx must equal OUR initiation's s_idx.
+         * This is the only reason we keep the handle around. Don't pass
+         * it into noise_consume_response — that function wants the
+         * RESPONDER's s_idx (server's local index) and the RESPONDER's
+         * view of OUR index (response's r_idx). Passing our own s_idx in
+         * the responder slot silently stored the wrong remote index in
+         * the keypair, so every subsequent data packet carried our own
+         * index in its r_idx field and got dropped by the server with
+         * NO_KEYPAIR_FOUND. See REVIEW.md for the post-mortem. */
+        if (pkt.r_idx != expected_local_idx) {
+            fprintf(stderr,
+                    "response r_idx 0x%08x != our initiation s_idx 0x%08x\n",
+                    (unsigned)pkt.r_idx, (unsigned)expected_local_idx);
+            return -1;
+        }
+
+        ret = noise_consume_response(local, &matched,
+                                     pkt.s_idx,   /* responder's (server's) local index */
+                                     pkt.r_idx,   /* our local index, echoed back */
+                                     pkt.ue, pkt.en);
         if (ret != 0) {
             fprintf(stderr, "noise_consume_response failed: %d\n", ret);
             return -1;
@@ -609,6 +629,21 @@ wg_encap(int udp_fd,
     }
     memcpy(out, &hdr, sizeof(hdr));
     memcpy(out + sizeof(hdr), m->m_data, (size_t)m->m_len);
+
+    /* One-shot full wire-bytes dump of the first data packet, so it can
+     * be byte-compared against server-side `tcpdump -X`. */
+    {
+        static int dumped = 0;
+        if (!dumped) {
+            dumped = 1;
+            fprintf(stderr, "[wire] first data packet: %zu bytes", out_len);
+            for (size_t i = 0; i < out_len; i++) {
+                if ((i & 15) == 0) fprintf(stderr, "\n  %04zx:", i);
+                fprintf(stderr, " %02x", out[i]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
 
     if (sendto(udp_fd, out, out_len, 0, peer_sa, peer_sl) != (ssize_t)out_len) {
         perror("wg_encap: sendto");

@@ -5,6 +5,7 @@
 
 #include "crypto.h"
 #include <crypto/curve25519.h>
+#include <sys/mbuf.h>
 
 static void print_hex(const uint8_t *buf, size_t len)
 {
@@ -203,6 +204,85 @@ static int test_curve25519_rfc7748(void)
     return 0;
 }
 
+/* This is the test that actually catches data-path divergence. The
+ * WireGuard transport packet goes through chacha20poly1305_encrypt_mbuf
+ * (the mbuf API, wired through crypto_dispatch in wg_crypto_impl.c),
+ * NOT through the buffer API that the RFC 8439 KAT above exercises.
+ *
+ * We encrypt the same plaintext via both paths and require byte-identical
+ * output. We sweep multiple lengths including the exact sizes WireGuard
+ * uses on the wire (16 = keepalive padded, 96 = 84-byte ICMP padded, etc.)
+ * because a length-specific bug in tail handling or AAD accounting would
+ * only fire for certain moduli. */
+static int test_mbuf_matches_buffer_one(size_t plain_len)
+{
+    uint8_t plain[256];
+    uint8_t ref_buf[256 + 16];
+    static const uint8_t key[32] = {
+        0x1c,0x92,0x40,0xa5,0xeb,0x55,0xd3,0x8a,0xf3,0x33,0x88,0x86,0x04,0xf6,0xb5,0xf0,
+        0x47,0x39,0x17,0xc1,0x40,0x2b,0x80,0x09,0x9d,0xca,0x5c,0xbc,0x20,0x70,0x75,0xc0,
+    };
+    const uint64_t nonce = 0x0706050403020100ULL;
+
+    if (plain_len > sizeof(plain)) return 1;
+    for (size_t i = 0; i < plain_len; i++) plain[i] = (uint8_t)(i * 7 + 3);
+
+    /* Buffer path: KAT-verified known-good reference. Empty AAD. */
+    chacha20poly1305_encrypt(ref_buf, plain, plain_len,
+                             NULL, 0, nonce, key);
+
+    /* Mbuf path: the production data-plane route. */
+    struct mbuf *m = m_devget(plain, (int)plain_len);
+    if (!m) {
+        printf("[FAIL] mbuf_vs_buffer(len=%zu): m_devget\n", plain_len);
+        return 1;
+    }
+    if (chacha20poly1305_encrypt_mbuf(m, nonce, key) != 0) {
+        printf("[FAIL] mbuf_vs_buffer(len=%zu): encrypt_mbuf\n", plain_len);
+        m_freem(m);
+        return 1;
+    }
+    if (m->m_len != (int)(plain_len + 16)) {
+        printf("[FAIL] mbuf_vs_buffer(len=%zu): wrong length %d (expected %zu)\n",
+               plain_len, m->m_len, plain_len + 16);
+        m_freem(m);
+        return 1;
+    }
+    int mismatch = memcmp(m->m_data, ref_buf, plain_len + 16);
+    if (mismatch != 0) {
+        printf("[FAIL] mbuf_vs_buffer(len=%zu): outputs differ\n", plain_len);
+        printf("  buffer path : "); print_hex(ref_buf,  plain_len + 16); printf("\n");
+        printf("  mbuf   path : "); print_hex((uint8_t*)m->m_data, plain_len + 16); printf("\n");
+        printf("  ct match: %s  tag match: %s\n",
+               memcmp(m->m_data, ref_buf, plain_len) == 0 ? "YES" : "NO",
+               memcmp((uint8_t*)m->m_data + plain_len, ref_buf + plain_len, 16) == 0 ? "YES" : "NO");
+        m_freem(m);
+        return 1;
+    }
+    m_freem(m);
+    printf("[PASS] chacha20-poly1305 mbuf path == buffer path (len=%zu)\n", plain_len);
+    return 0;
+}
+
+static int test_mbuf_matches_buffer_path(void)
+{
+    /* Sweep the exact sizes WireGuard's transport path uses:
+     *   16  = keepalive (0 bytes padded to 16)
+     *   32  = random non-aligned-ish
+     *   48  = also a keepalive wire size check
+     *   96  = 84-byte ICMP echo padded to 96 (this is the ping we were
+     *         sending that got silently dropped on the server)
+     *   112 = next 16-byte boundary up
+     *   13  = non-aligned tail that also exercises partial-block path
+     */
+    int fails = 0;
+    static const size_t lens[] = { 0, 13, 16, 32, 48, 96, 112, 113 };
+    for (size_t i = 0; i < sizeof(lens)/sizeof(lens[0]); i++) {
+        fails += test_mbuf_matches_buffer_one(lens[i]);
+    }
+    return fails;
+}
+
 int main(void)
 {
     int fails = 0;
@@ -210,6 +290,7 @@ int main(void)
     fails += test_blake2s_abc();
     fails += test_curve25519_rfc7748();
     fails += test_chacha20_poly1305_rfc8439_kat();
+    fails += test_mbuf_matches_buffer_path();
     fails += test_chacha20_poly1305_roundtrip();
     fails += test_xchacha20_poly1305_roundtrip();
 
