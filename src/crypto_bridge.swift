@@ -18,21 +18,23 @@ public func curve25519(out: UnsafeMutablePointer<UInt8>, privateKey: UnsafePoint
         sharedSecret.withUnsafeBytes { ptr in
             out.initialize(from: ptr.bindMemory(to: UInt8.self).baseAddress!, count: 32)
         }
-        return 0
+        return 1
     } catch {
-        return -1
+        return 0
     }
 }
 
 @_cdecl("curve25519_generate_public")
-public func curve25519_generate_public(out: UnsafeMutablePointer<UInt8>, privateKey: UnsafePointer<UInt8>) {
+public func curve25519_generate_public(out: UnsafeMutablePointer<UInt8>, privateKey: UnsafePointer<UInt8>) -> Int32 {
     let privData = Data(bytes: privateKey, count: 32)
     if let priv = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privData) {
         let pub = priv.publicKey
         pub.rawRepresentation.withUnsafeBytes { ptr in
             out.initialize(from: ptr.bindMemory(to: UInt8.self).baseAddress!, count: 32)
         }
+        return 1
     }
+    return 0
 }
 
 @_cdecl("curve25519_generate_secret")

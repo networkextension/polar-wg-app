@@ -1,0 +1,25 @@
+# Build artifacts
+build/
+*.o
+*.a
+
+# Legacy / stray test binaries living next to sources
+src/wg_client_final
+src/wg_macos_tool
+src/crypto_vector_test
+src/libswift_crypto.a
+
+# Secrets — never commit
+*.key
+src/client_private.key
+src/client_public.key
+src/client.conf
+src/client_tool.conf
+src/client_wgset.conf
+src/id_ed25519
+src/id_ed25519.pub
+src/test.ini
+src/server_tcpdump.txt
+
+# macOS cruft
+.DS_Store
