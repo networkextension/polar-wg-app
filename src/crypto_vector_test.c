@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "crypto.h"
+#include <crypto/curve25519.h>
 
 static void print_hex(const uint8_t *buf, size_t len)
 {
@@ -151,11 +152,63 @@ static int test_xchacha20_poly1305_roundtrip(void)
     return 0;
 }
 
+/* RFC 7748 §6.1 X25519 test vector. This catches any regression in the
+ * Swift CryptoKit bridge — we don't blindly trust it. */
+static int test_curve25519_rfc7748(void)
+{
+    static const uint8_t alice_priv[32] = {
+        0x77,0x07,0x6d,0x0a,0x73,0x18,0xa5,0x7d,0x3c,0x16,0xc1,0x72,0x51,0xb2,0x66,0x45,
+        0xdf,0x4c,0x2f,0x87,0xeb,0xc0,0x99,0x2a,0xb1,0x77,0xfb,0xa5,0x1d,0xb9,0x2c,0x2a,
+    };
+    static const uint8_t alice_pub[32] = {
+        0x85,0x20,0xf0,0x09,0x89,0x30,0xa7,0x54,0x74,0x8b,0x7d,0xdc,0xb4,0x3e,0xf7,0x5a,
+        0x0d,0xbf,0x3a,0x0d,0x26,0x38,0x1a,0xf4,0xeb,0xa4,0xa9,0x8e,0xaa,0x9b,0x4e,0x6a,
+    };
+    static const uint8_t bob_pub[32] = {
+        0xde,0x9e,0xdb,0x7d,0x7b,0x7d,0xc1,0xb4,0xd3,0x5b,0x61,0xc2,0xec,0xe4,0x35,0x37,
+        0x3f,0x83,0x43,0xc8,0x5b,0x78,0x67,0x4d,0xad,0xfc,0x7e,0x14,0x6f,0x88,0x2b,0x4f,
+    };
+    static const uint8_t shared[32] = {
+        0x4a,0x5d,0x9d,0x5b,0xa4,0xce,0x2d,0xe1,0x72,0x8e,0x3b,0xf4,0x80,0x35,0x0f,0x25,
+        0xe0,0x7e,0x21,0xc9,0x47,0xd1,0x9e,0x33,0x76,0xf0,0x9b,0x3c,0x1e,0x16,0x17,0x42,
+    };
+    uint8_t derived_pub[32];
+    uint8_t derived_shared[32];
+
+    /* Alice's pubkey derived from her private. */
+    if (curve25519_generate_public(derived_pub, alice_priv) != 1) {
+        printf("[FAIL] curve25519_generate_public returned 0\n");
+        return 1;
+    }
+    if (memcmp(derived_pub, alice_pub, 32) != 0) {
+        printf("[FAIL] curve25519 pubkey derivation mismatch\n");
+        printf("  expected: "); print_hex(alice_pub, 32);   printf("\n");
+        printf("  actual  : "); print_hex(derived_pub, 32); printf("\n");
+        return 1;
+    }
+
+    /* Alice's priv · Bob's pub → shared. */
+    if (curve25519(derived_shared, alice_priv, bob_pub) != 1) {
+        printf("[FAIL] curve25519 DH returned 0\n");
+        return 1;
+    }
+    if (memcmp(derived_shared, shared, 32) != 0) {
+        printf("[FAIL] curve25519 DH shared-secret mismatch\n");
+        printf("  expected: "); print_hex(shared,         32); printf("\n");
+        printf("  actual  : "); print_hex(derived_shared, 32); printf("\n");
+        return 1;
+    }
+
+    printf("[PASS] curve25519 RFC 7748 §6.1 KAT (pubkey + DH)\n");
+    return 0;
+}
+
 int main(void)
 {
     int fails = 0;
 
     fails += test_blake2s_abc();
+    fails += test_curve25519_rfc7748();
     fails += test_chacha20_poly1305_rfc8439_kat();
     fails += test_chacha20_poly1305_roundtrip();
     fails += test_xchacha20_poly1305_roundtrip();

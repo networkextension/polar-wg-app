@@ -45,9 +45,13 @@ OBJS := $(patsubst $(SRCDIR)/%.c, $(BUILDDIR)/%.o, $(SRCS))
 # It intentionally has no corresponding FreeBSD source file.
 
 # ── Primary targets ───────────────────────────────────────────────────────────
-.PHONY: all clean help
+.PHONY: all clean help test
 
-all: $(BUILDDIR)/libwg.a $(BUILDDIR)/libswift_crypto.a $(BUILDDIR)/wg_core
+all: $(BUILDDIR)/libwg.a $(BUILDDIR)/libswift_crypto.a $(BUILDDIR)/wg_core $(BUILDDIR)/crypto_vector_test
+
+test: $(BUILDDIR)/crypto_vector_test
+	@echo "  RUN  $<"
+	@$<
 
 $(BUILDDIR)/libwg.a: $(OBJS)
 	$(AR) $(ARFLAGS) $@ $^
@@ -66,6 +70,16 @@ $(BUILDDIR)/libswift_crypto.a: $(SRCDIR)/crypto_bridge.swift | $(BUILDDIR)
 $(BUILDDIR)/wg_core: $(SRCDIR)/wg_core.c $(BUILDDIR)/libwg.a $(BUILDDIR)/libswift_crypto.a
 	@echo "  CC/LD  $@"
 	$(CC) $(CFLAGS) $(SRCDIR)/wg_core.c \
+	    -L$(BUILDDIR) -lwg -lswift_crypto \
+	    -lpthread \
+	    -framework Foundation -framework CryptoKit \
+	    -L/usr/lib/swift \
+	    -o $@
+
+# ── crypto_vector_test: KAT suite (blake2s / curve25519 / chacha20-poly1305) ─
+$(BUILDDIR)/crypto_vector_test: $(SRCDIR)/crypto_vector_test.c $(BUILDDIR)/libwg.a $(BUILDDIR)/libswift_crypto.a
+	@echo "  CC/LD  $@"
+	$(CC) $(CFLAGS) $(SRCDIR)/crypto_vector_test.c \
 	    -L$(BUILDDIR) -lwg -lswift_crypto \
 	    -lpthread \
 	    -framework Foundation -framework CryptoKit \

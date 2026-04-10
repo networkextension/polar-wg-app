@@ -8,8 +8,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/kern_control.h>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/sys_domain.h>
 #include <sys/time.h>
+#include <sys/uio.h>
+#include <net/if.h>
+#include <net/if_utun.h>
 #include <unistd.h>
 
 #include "macos_stubs/sys/mbuf.h"
@@ -19,6 +26,7 @@
 #define htole32(x) OSSwapHostToLittleInt32(x)
 #define le32toh(x) OSSwapLittleToHostInt32(x)
 #define htole64(x) OSSwapHostToLittleInt64(x)
+#define le64toh(x) OSSwapLittleToHostInt64(x)
 
 /* WireGuard wire format is little-endian. Match FreeBSD if_wg.c:73-76. */
 #define WG_PKT_INITIATION htole32(1)
@@ -89,8 +97,11 @@ extern int noise_consume_response(struct noise_local *,
                                   uint8_t en[WG_AUTHTAG_LEN]);
 
 extern struct noise_keypair *noise_keypair_current(struct noise_remote *);
+extern struct noise_keypair *noise_keypair_lookup(struct noise_local *, uint32_t);
 extern int noise_keypair_nonce_next(struct noise_keypair *, uint64_t *);
 extern int noise_keypair_encrypt(struct noise_keypair *, uint32_t *r_idx, uint64_t nonce, struct mbuf *);
+extern int noise_keypair_decrypt(struct noise_keypair *, uint64_t nonce, struct mbuf *);
+extern int noise_keypair_received_with(struct noise_keypair *);
 extern void noise_keypair_put(struct noise_keypair *);
 
 struct wg_pkt_initiation {
@@ -135,6 +146,9 @@ struct client_config {
     uint16_t endpoint_port;
     uint8_t private_key[WG_KEY_LEN];
     uint8_t peer_public_key[WG_KEY_LEN];
+    /* Interface / tunnel config */
+    char     if_address[64];  /* e.g. "10.88.0.2/24" */
+    int      has_if_address;
 };
 
 static int b64_value(unsigned char c)
@@ -292,6 +306,10 @@ static int load_config(const char *path, struct client_config *cfg)
                 return -1;
             }
             got_endpoint = 1;
+        } else if (in_interface && strcmp(p, "Address") == 0) {
+            strncpy(cfg->if_address, eq, sizeof(cfg->if_address) - 1);
+            cfg->if_address[sizeof(cfg->if_address) - 1] = '\0';
+            cfg->has_if_address = 1;
         }
     }
 
@@ -444,90 +462,479 @@ static int wait_for_response(int udp_fd,
     return 0;
 }
 
-static int send_keepalive_data(int udp_fd, struct noise_remote *remote)
+/* ─────────────────────────────────────────────────────────────────────────
+ * wg_encap / wg_decap: the core transport-packet helpers.
+ *
+ * wg_encap: take a plaintext inner IP packet (len bytes), pad to
+ *   WG_PKT_PADDING, authenticate+encrypt with the current keypair, prepend
+ *   a wg_pkt_data_hdr, and UDP-send. len = 0 gives a keepalive.
+ *
+ * wg_decap: take a raw UDP datagram that must start with WG_PKT_DATA,
+ *   look up the keypair by r_idx, decrypt in-place, strip trailing zero
+ *   padding down to the inner IP packet's real length, and hand back a
+ *   pointer into the caller's buffer.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+static int
+wg_encap(int udp_fd, struct noise_remote *remote,
+         const uint8_t *plain, size_t plain_len)
 {
-    struct noise_keypair *kp;
-    struct mbuf *m;
+    struct noise_keypair *kp = NULL;
+    struct mbuf *m = NULL;
     uint64_t nonce;
     uint32_t r_idx;
     struct wg_pkt_data_hdr hdr;
-    uint8_t out[256];
+    uint8_t out[2048];
+    size_t padded_len;
     size_t out_len;
-    /* Keepalive: 0-byte plaintext padded to WG_PKT_PADDING (16) bytes of zeros.
-     * See FreeBSD if_wg.c:calculate_padding — when plaintext len is 0, padlen
-     * rounds up to 16. noise_keypair_encrypt will then append the 16-byte
-     * Poly1305 tag, giving a 32-byte transport payload. */
-    static const uint8_t zero_pad[WG_PKT_PADDING] = {0};
+    uint8_t scratch[2048];
+    int rc = -1;
+
+    /* Pad the plaintext up to WG_PKT_PADDING alignment. Keepalive (0-byte)
+     * rounds up to exactly 16 zero bytes. See if_wg.c:calculate_padding. */
+    padded_len = (plain_len + (WG_PKT_PADDING - 1)) & ~(size_t)(WG_PKT_PADDING - 1);
+    if (padded_len == 0)
+        padded_len = WG_PKT_PADDING;
+    if (padded_len > sizeof(scratch)) {
+        fprintf(stderr, "wg_encap: plaintext too large (%zu)\n", plain_len);
+        return -1;
+    }
+    memset(scratch, 0, padded_len);
+    if (plain_len)
+        memcpy(scratch, plain, plain_len);
 
     kp = noise_keypair_current(remote);
     if (!kp) {
-        fprintf(stderr, "no current keypair after handshake\n");
+        fprintf(stderr, "wg_encap: no current keypair\n");
         return -1;
     }
-
     if (noise_keypair_nonce_next(kp, &nonce) != 0) {
-        fprintf(stderr, "noise_keypair_nonce_next failed\n");
-        noise_keypair_put(kp);
-        return -1;
+        fprintf(stderr, "wg_encap: nonce_next failed\n");
+        goto out;
     }
 
-    m = m_devget(zero_pad, WG_PKT_PADDING);
+    m = m_devget(scratch, (int)padded_len);
     if (!m) {
-        fprintf(stderr, "m_devget failed\n");
-        noise_keypair_put(kp);
-        return -1;
+        fprintf(stderr, "wg_encap: m_devget failed\n");
+        goto out;
     }
-
     if (noise_keypair_encrypt(kp, &r_idx, nonce, m) != 0) {
-        fprintf(stderr, "noise_keypair_encrypt failed\n");
-        m_freem(m);
-        noise_keypair_put(kp);
-        return -1;
+        fprintf(stderr, "wg_encap: keypair_encrypt failed\n");
+        goto out;
     }
 
     hdr.t = WG_PKT_DATA;
-    hdr.r_idx = r_idx;          /* opaque index, written on the wire verbatim (see if_wg.c:1599) */
+    hdr.r_idx = r_idx;          /* opaque wire index */
     hdr.nonce = htole64(nonce);
 
     out_len = sizeof(hdr) + (size_t)m->m_len;
     if (out_len > sizeof(out)) {
-        fprintf(stderr, "keepalive packet too large\n");
-        m_freem(m);
-        noise_keypair_put(kp);
-        return -1;
+        fprintf(stderr, "wg_encap: frame too large (%zu)\n", out_len);
+        goto out;
     }
-
     memcpy(out, &hdr, sizeof(hdr));
     memcpy(out + sizeof(hdr), m->m_data, (size_t)m->m_len);
 
     if (send(udp_fd, out, out_len, 0) != (ssize_t)out_len) {
-        perror("send keepalive");
-        m_freem(m);
-        noise_keypair_put(kp);
+        perror("wg_encap: send");
+        goto out;
+    }
+    rc = 0;
+out:
+    if (m)  m_freem(m);
+    if (kp) noise_keypair_put(kp);
+    return rc;
+}
+
+/* Inspect an IPv4/IPv6 header and return the *real* packet length, so we
+ * can trim trailing WireGuard zero padding. Returns -1 if the packet is
+ * malformed or too short to parse. */
+static int inner_ip_len(const uint8_t *pkt, size_t cap)
+{
+    if (cap < 1) return -1;
+    uint8_t version = pkt[0] >> 4;
+    if (version == 4) {
+        if (cap < 20) return -1;
+        uint16_t total = ((uint16_t)pkt[2] << 8) | pkt[3]; /* IPv4 total length, network order */
+        if (total < 20 || total > cap) return -1;
+        return (int)total;
+    } else if (version == 6) {
+        if (cap < 40) return -1;
+        uint16_t payload = ((uint16_t)pkt[4] << 8) | pkt[5];
+        size_t total = (size_t)payload + 40;
+        if (total > cap) return -1;
+        return (int)total;
+    }
+    return -1;
+}
+
+/* Parse a received wg_pkt_data: decrypt in-place, figure out inner IP
+ * length, and write the inner packet to the caller's out_pkt buffer.
+ *
+ * Returns the number of inner plaintext bytes written (>= 0 for data,
+ * 0 for keepalive with no inner packet), or -1 on drop. */
+static int
+wg_decap(struct noise_local *local, struct noise_remote *remote,
+         const uint8_t *udp_pkt, size_t udp_len,
+         uint8_t *out_pkt, size_t out_cap)
+{
+    struct wg_pkt_data_hdr hdr;
+    struct noise_keypair *kp = NULL;
+    struct mbuf *m = NULL;
+    uint64_t nonce;
+    int inner_len;
+    int rc = -1;
+
+    if (udp_len < sizeof(hdr) + WG_AUTHTAG_LEN) {
+        fprintf(stderr, "wg_decap: short data packet (%zu)\n", udp_len);
+        return -1;
+    }
+    memcpy(&hdr, udp_pkt, sizeof(hdr));
+    if (hdr.t != WG_PKT_DATA) {
+        fprintf(stderr, "wg_decap: wrong type 0x%08x\n", (unsigned)le32toh(hdr.t));
         return -1;
     }
 
-    m_freem(m);
-    noise_keypair_put(kp);
+    kp = noise_keypair_lookup(local, hdr.r_idx);
+    if (!kp) {
+        fprintf(stderr, "wg_decap: no keypair for r_idx=0x%08x\n",
+                (unsigned)hdr.r_idx);
+        return -1;
+    }
+    nonce = le64toh(hdr.nonce);
+
+    m = m_devget(udp_pkt + sizeof(hdr), (int)(udp_len - sizeof(hdr)));
+    if (!m) {
+        fprintf(stderr, "wg_decap: m_devget failed\n");
+        goto out;
+    }
+    if (noise_keypair_decrypt(kp, nonce, m) != 0) {
+        fprintf(stderr, "wg_decap: decrypt failed (nonce=%llu)\n",
+                (unsigned long long)nonce);
+        goto out;
+    }
+    /* Promote the keypair to current on first successful recv, per
+     * FreeBSD if_wg.c handling of noise_keypair_received_with. */
+    (void)noise_keypair_received_with(kp);
+    (void)remote;
+
+    /* Decrypted plaintext sits in m->m_data, length m->m_len. This
+     * includes zero padding up to WG_PKT_PADDING. m->m_len == 0 means
+     * a valid authenticated keepalive (no inner packet). */
+    if (m->m_len == 0) {
+        rc = 0;
+        goto out;
+    }
+
+    inner_len = inner_ip_len(m->m_data, (size_t)m->m_len);
+    if (inner_len < 0) {
+        fprintf(stderr, "wg_decap: cannot parse inner IP header (len=%d)\n",
+                m->m_len);
+        goto out;
+    }
+    if ((size_t)inner_len > out_cap) {
+        fprintf(stderr, "wg_decap: inner packet too big for out buffer (%d)\n",
+                inner_len);
+        goto out;
+    }
+    memcpy(out_pkt, m->m_data, (size_t)inner_len);
+    rc = inner_len;
+out:
+    if (m)  m_freem(m);
+    if (kp) noise_keypair_put(kp);
+    return rc;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * utun setup. On macOS a tunnel interface is a kernel control socket on
+ * PF_SYSTEM with sc_id from com.apple.net.utun_control. Packets carry a
+ * 4-byte "protocol family" header (AF_INET / AF_INET6) before the IP
+ * payload — we strip it on read and prepend it on write.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+static int
+utun_open(char ifname[IFNAMSIZ])
+{
+    struct ctl_info ci;
+    struct sockaddr_ctl sc;
+    int fd;
+    socklen_t name_len = IFNAMSIZ;
+
+    fd = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
+    if (fd < 0) {
+        perror("socket(PF_SYSTEM)");
+        return -1;
+    }
+    memset(&ci, 0, sizeof(ci));
+    strncpy(ci.ctl_name, UTUN_CONTROL_NAME, sizeof(ci.ctl_name));
+    if (ioctl(fd, CTLIOCGINFO, &ci) < 0) {
+        perror("ioctl CTLIOCGINFO");
+        close(fd);
+        return -1;
+    }
+
+    memset(&sc, 0, sizeof(sc));
+    sc.sc_len      = sizeof(sc);
+    sc.sc_family   = AF_SYSTEM;
+    sc.ss_sysaddr  = AF_SYS_CONTROL;
+    sc.sc_id       = ci.ctl_id;
+    sc.sc_unit     = 0;  /* 0 = kernel picks next free utunN */
+
+    if (connect(fd, (struct sockaddr *)&sc, sizeof(sc)) < 0) {
+        perror("connect(utun)");
+        close(fd);
+        return -1;
+    }
+
+    if (getsockopt(fd, SYSPROTO_CONTROL, UTUN_OPT_IFNAME, ifname, &name_len) < 0) {
+        perror("getsockopt UTUN_OPT_IFNAME");
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+/* Read a plaintext IP packet from utun. Strips the leading 4-byte
+ * AF_INET/AF_INET6 header. Returns IP-packet length, or -1 on error. */
+static int
+utun_read(int fd, uint8_t *out, size_t out_cap)
+{
+    uint8_t buf[4 + 2048];
+    ssize_t n = read(fd, buf, sizeof(buf));
+    if (n < 4) {
+        if (n < 0) perror("utun read");
+        return -1;
+    }
+    size_t ip_len = (size_t)(n - 4);
+    if (ip_len > out_cap) return -1;
+    memcpy(out, buf + 4, ip_len);
+    return (int)ip_len;
+}
+
+/* Write a plaintext IP packet to utun, prepending the 4-byte protocol
+ * family header (big-endian AF_INET or AF_INET6). */
+static int
+utun_write(int fd, const uint8_t *pkt, size_t len)
+{
+    uint8_t hdr[4] = {0};
+    struct iovec iov[2];
+    uint32_t family;
+
+    if (len < 1) return -1;
+    family = ((pkt[0] >> 4) == 6) ? AF_INET6 : AF_INET;
+    /* utun wants family in host byte order of a 32-bit int written in
+     * network byte order. Apple's convention is: four bytes, big-endian
+     * representation of the AF_* constant. */
+    hdr[0] = (uint8_t)((family >> 24) & 0xff);
+    hdr[1] = (uint8_t)((family >> 16) & 0xff);
+    hdr[2] = (uint8_t)((family >>  8) & 0xff);
+    hdr[3] = (uint8_t)( family        & 0xff);
+
+    iov[0].iov_base = hdr;
+    iov[0].iov_len  = 4;
+    iov[1].iov_base = (void *)(uintptr_t)pkt;
+    iov[1].iov_len  = len;
+
+    ssize_t n = writev(fd, iov, 2);
+    if (n < 0) { perror("utun writev"); return -1; }
     return 0;
+}
+
+/* Run ifconfig to bring the utun up with the configured address. We
+ * shell out to /sbin/ifconfig because macOS doesn't expose a clean
+ * userspace API for this that works from C without entitlements. */
+static int
+utun_configure(const char *ifname, const char *addr_cidr)
+{
+    char cmd[256];
+    /* Split "10.88.0.2/24" into address + netmask-slash-whatever. For a
+     * point-to-point utun, macOS wants: ifconfig utunN inet <local> <peer>
+     * The simplest working incantation: use <local> as both local and
+     * peer, then add a route for the /24. */
+    char local[64];
+    int prefix = 32;
+    const char *slash = strchr(addr_cidr, '/');
+    if (slash) {
+        size_t n = (size_t)(slash - addr_cidr);
+        if (n >= sizeof(local)) return -1;
+        memcpy(local, addr_cidr, n);
+        local[n] = '\0';
+        prefix = atoi(slash + 1);
+    } else {
+        strncpy(local, addr_cidr, sizeof(local) - 1);
+        local[sizeof(local) - 1] = '\0';
+    }
+
+    snprintf(cmd, sizeof(cmd),
+             "/sbin/ifconfig %s inet %s %s mtu 1420 up",
+             ifname, local, local);
+    if (system(cmd) != 0) {
+        fprintf(stderr, "utun_configure: '%s' failed\n", cmd);
+        return -1;
+    }
+    /* Add a route for the whole tunnel subnet via this interface. For a
+     * /32 prefix we skip this step. */
+    if (prefix < 32) {
+        uint32_t mask = prefix == 0 ? 0 : (0xFFFFFFFFu << (32 - prefix));
+        struct in_addr a;
+        if (inet_pton(AF_INET, local, &a) != 1)
+            return -1;
+        a.s_addr &= htonl(mask);
+        char net[64];
+        inet_ntop(AF_INET, &a, net, sizeof(net));
+        snprintf(cmd, sizeof(cmd),
+                 "/sbin/route -q add -net %s/%d -interface %s",
+                 net, prefix, ifname);
+        if (system(cmd) != 0)
+            fprintf(stderr, "utun_configure: route add failed (continuing)\n");
+    }
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * run_tunnel: after a successful handshake, enter the select() event
+ * loop and forward packets between utun_fd and udp_fd in both directions.
+ *
+ * Terminates on SIGINT/SIGTERM (sig_quit is set from a handler).
+ * ───────────────────────────────────────────────────────────────────────── */
+
+static volatile sig_atomic_t sig_quit = 0;
+static void on_quit(int s) { (void)s; sig_quit = 1; }
+
+static int
+run_tunnel(int udp_fd, int utun_fd,
+           struct noise_local *local, struct noise_remote *remote)
+{
+    uint8_t udp_buf[2048];
+    uint8_t inner_buf[2048];
+    uint64_t tx_pkts = 0, tx_bytes = 0, rx_pkts = 0, rx_bytes = 0;
+    time_t last_stats = time(NULL);
+
+    signal(SIGINT,  on_quit);
+    signal(SIGTERM, on_quit);
+
+    /* Clear the 3-second RCVTIMEO left from the handshake probe: select()
+     * handles readiness now, and a stale timeout would make recv() return
+     * EAGAIN spuriously after 3 s of idle traffic. */
+    {
+        struct timeval tv = {0};
+        (void)setsockopt(udp_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+
+    printf("[tunnel] entering event loop (utun_fd=%d, udp_fd=%d)\n",
+           utun_fd, udp_fd);
+
+    while (!sig_quit) {
+        fd_set rfds;
+        int maxfd;
+        struct timeval tv;
+        int rc;
+
+        FD_ZERO(&rfds);
+        FD_SET(udp_fd,  &rfds);
+        FD_SET(utun_fd, &rfds);
+        maxfd = (udp_fd > utun_fd) ? udp_fd : utun_fd;
+
+        tv.tv_sec  = 1;
+        tv.tv_usec = 0;
+        rc = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            perror("select");
+            return -1;
+        }
+        if (rc == 0) {
+            time_t now = time(NULL);
+            if (now - last_stats >= 10) {
+                printf("[tunnel] tx=%llu pkts/%llu B  rx=%llu pkts/%llu B\n",
+                       (unsigned long long)tx_pkts,
+                       (unsigned long long)tx_bytes,
+                       (unsigned long long)rx_pkts,
+                       (unsigned long long)rx_bytes);
+                last_stats = now;
+            }
+            continue;
+        }
+
+        /* ── utun → udp (encap) ─────────────────────────────────────── */
+        if (FD_ISSET(utun_fd, &rfds)) {
+            int n = utun_read(utun_fd, inner_buf, sizeof(inner_buf));
+            if (n > 0) {
+                if (wg_encap(udp_fd, remote, inner_buf, (size_t)n) == 0) {
+                    tx_pkts++;
+                    tx_bytes += (uint64_t)n;
+                }
+            }
+        }
+
+        /* ── udp → utun (decap) ─────────────────────────────────────── */
+        if (FD_ISSET(udp_fd, &rfds)) {
+            ssize_t n = recv(udp_fd, udp_buf, sizeof(udp_buf), 0);
+            if (n >= 4) {
+                uint32_t t;
+                memcpy(&t, udp_buf, sizeof(t));
+                if (t == WG_PKT_DATA) {
+                    int inner = wg_decap(local, remote,
+                                         udp_buf, (size_t)n,
+                                         inner_buf, sizeof(inner_buf));
+                    if (inner > 0) {
+                        if (utun_write(utun_fd, inner_buf, (size_t)inner) == 0) {
+                            rx_pkts++;
+                            rx_bytes += (uint64_t)inner;
+                        }
+                    } else if (inner == 0) {
+                        /* keepalive: accounted only as a packet */
+                        rx_pkts++;
+                    }
+                } else {
+                    fprintf(stderr, "[tunnel] non-data pkt type=0x%08x len=%zd (TODO: handle)\n",
+                            (unsigned)le32toh(t), n);
+                }
+            }
+        }
+    }
+
+    printf("\n[tunnel] shutdown. final: tx=%llu pkts/%llu B  rx=%llu pkts/%llu B\n",
+           (unsigned long long)tx_pkts, (unsigned long long)tx_bytes,
+           (unsigned long long)rx_pkts, (unsigned long long)rx_bytes);
+    return 0;
+}
+
+/* Kept as a one-shot smoke test callable from main --probe mode. */
+static int send_keepalive_data(int udp_fd, struct noise_remote *remote)
+{
+    return wg_encap(udp_fd, remote, NULL, 0);
 }
 
 int main(int argc, char *argv[])
 {
     const char *config_path = "test.ini";
+    int want_tunnel = 0;
     struct client_config cfg;
     struct noise_local *local = NULL;
     struct noise_remote *remote = NULL;
     struct cookie_maker cookie;
     int cookie_inited = 0;
     int udp_fd = -1;
+    int utun_fd = -1;
+    char utun_name[IFNAMSIZ] = {0};
     int ret = 1;
     int attempt;
 
     signal(SIGPIPE, SIG_IGN);
 
-    if (argc > 1)
-        config_path = argv[1];
+    /* Usage: wg_core [--tunnel] [config_path]
+     *   without --tunnel: run the one-shot handshake + keepalive probe.
+     *   with    --tunnel: after handshake, open utun, configure it, and
+     *                     enter the bidirectional forwarding loop. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--tunnel") == 0 || strcmp(argv[i], "-t") == 0) {
+            want_tunnel = 1;
+        } else {
+            config_path = argv[i];
+        }
+    }
 
     printf("[info] pkt sizes: initiation=%zu response=%zu\n",
            sizeof(struct wg_pkt_initiation), sizeof(struct wg_pkt_response));
@@ -591,8 +998,6 @@ int main(int argc, char *argv[])
         w = wait_for_response(udp_fd, local, remote, &cookie, s_idx);
         if (w == 0) {
             printf("[handshake] success\n");
-            if (send_keepalive_data(udp_fd, remote) == 0)
-                printf("[data] keepalive packet sent\n");
             ret = 0;
             break;
         }
@@ -600,10 +1005,47 @@ int main(int argc, char *argv[])
         sleep(REKEY_TIMEOUT_SEC);
     }
 
-    if (ret != 0)
+    if (ret != 0) {
         fprintf(stderr, "[handshake] failed after retries\n");
+        goto out;
+    }
+
+    if (!want_tunnel) {
+        /* Probe mode: send a single keepalive and exit. */
+        if (send_keepalive_data(udp_fd, remote) == 0)
+            printf("[data] keepalive packet sent\n");
+        goto out;
+    }
+
+    /* Tunnel mode: bring up utun and enter the forwarding loop. */
+    utun_fd = utun_open(utun_name);
+    if (utun_fd < 0) {
+        fprintf(stderr, "utun_open failed (need root?)\n");
+        ret = 1;
+        goto out;
+    }
+    printf("[tunnel] opened %s (fd=%d)\n", utun_name, utun_fd);
+
+    if (cfg.has_if_address) {
+        if (utun_configure(utun_name, cfg.if_address) != 0) {
+            fprintf(stderr, "utun_configure failed, continuing unconfigured\n");
+        } else {
+            printf("[tunnel] %s configured with %s\n", utun_name, cfg.if_address);
+        }
+    } else {
+        fprintf(stderr, "[tunnel] no Interface.Address in config; "
+                        "configure %s manually if needed\n", utun_name);
+    }
+
+    /* Send one keepalive so the server refreshes its endpoint view for
+     * this source port before we start sending real traffic. */
+    (void)send_keepalive_data(udp_fd, remote);
+
+    ret = run_tunnel(udp_fd, utun_fd, local, remote);
 
 out:
+    if (utun_fd >= 0)
+        close(utun_fd);
     if (udp_fd >= 0)
         close(udp_fd);
     if (cookie_inited)
