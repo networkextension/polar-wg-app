@@ -38,7 +38,8 @@ SRCS := \
     $(SRCDIR)/wg_cookie.c   \
     $(SRCDIR)/wg_crypto.c   \
     $(SRCDIR)/wg_crypto_impl.c \
-    $(SRCDIR)/allowedips.c
+    $(SRCDIR)/allowedips.c  \
+    $(SRCDIR)/wg_session.c
 
 OBJS := $(patsubst $(SRCDIR)/%.c, $(BUILDDIR)/%.o, $(SRCS))
 
@@ -46,13 +47,19 @@ OBJS := $(patsubst $(SRCDIR)/%.c, $(BUILDDIR)/%.o, $(SRCS))
 # It intentionally has no corresponding FreeBSD source file.
 
 # ── Primary targets ───────────────────────────────────────────────────────────
-.PHONY: all clean help test
+.PHONY: all clean help test xcframework
 
 all: $(BUILDDIR)/libwg.a $(BUILDDIR)/libswift_crypto.a $(BUILDDIR)/wg_core $(BUILDDIR)/crypto_vector_test
 
 test: $(BUILDDIR)/crypto_vector_test
 	@echo "  RUN  $<"
 	@$<
+
+# Build the macOS xcframework that Swift NetworkExtension code imports.
+# See scripts/build-xcframework.sh for the full explanation of what
+# this produces and how to consume it from Xcode.
+xcframework:
+	@./scripts/build-xcframework.sh
 
 $(BUILDDIR)/libwg.a: $(OBJS)
 	$(AR) $(ARFLAGS) $@ $^
