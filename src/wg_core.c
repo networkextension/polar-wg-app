@@ -151,11 +151,20 @@ _Static_assert(sizeof(struct wg_pkt_cookie)     == 64,  "wg_pkt_cookie size");
 _Static_assert(sizeof(struct wg_pkt_data_hdr)   == 16,  "wg_pkt_data_hdr size");
 
 #define WG_MAX_ALLOWED_CIDRS 16
+#define WG_MAX_IFACE_ADDRS    4
 
 struct allowed_cidr {
     int     family;     /* AF_INET or AF_INET6 */
     uint8_t addr[16];   /* network order; only first 4 bytes used for AF_INET */
     int     prefix_len;
+};
+
+/* Parsed [Interface] Address. wg-quick supports comma-separated lists
+ * with mixed v4/v6 (e.g. "10.88.0.2/24, fd00::2/64"). */
+struct iface_addr {
+    int  family;            /* AF_INET or AF_INET6 */
+    char addr_str[64];      /* "10.88.0.2" or "fd00::2" — for ifconfig */
+    int  prefix_len;
 };
 
 struct client_config {
@@ -164,8 +173,8 @@ struct client_config {
     uint8_t private_key[WG_KEY_LEN];
     uint8_t peer_public_key[WG_KEY_LEN];
     /* Interface / tunnel config */
-    char     if_address[64];  /* e.g. "10.88.0.2/24" */
-    int      has_if_address;
+    struct iface_addr if_addrs[WG_MAX_IFACE_ADDRS];
+    int      n_if_addrs;
     int      persistent_keepalive;  /* seconds; 0 = disabled */
     /* Allowed-IPs CIDRs from the [Peer] section. */
     struct allowed_cidr allowed[WG_MAX_ALLOWED_CIDRS];
@@ -275,6 +284,70 @@ static int parse_cidr(const char *s, struct allowed_cidr *out)
         return 0;
     }
     return -1;
+}
+
+/* Parse a single Interface Address entry like "10.88.0.2/24" or
+ * "fd00::2/64". Stores into out as an iface_addr (string + prefix_len),
+ * because the production user is /sbin/ifconfig and that wants the
+ * canonical text form. Returns 0 on success, -1 on bad input. */
+static int parse_iface_addr(const char *s, struct iface_addr *out)
+{
+    char tmp[64];
+    char *slash;
+    int prefix;
+    uint8_t bin[16];
+
+    if (strlen(s) >= sizeof(tmp)) return -1;
+    strcpy(tmp, s);
+    slash = strchr(tmp, '/');
+    if (slash) {
+        *slash = '\0';
+        prefix = atoi(slash + 1);
+    } else {
+        prefix = -1;
+    }
+    if (inet_pton(AF_INET, tmp, bin) == 1) {
+        out->family = AF_INET;
+        out->prefix_len = (prefix < 0) ? 32 : prefix;
+        if (out->prefix_len < 0 || out->prefix_len > 32) return -1;
+    } else if (inet_pton(AF_INET6, tmp, bin) == 1) {
+        out->family = AF_INET6;
+        out->prefix_len = (prefix < 0) ? 128 : prefix;
+        if (out->prefix_len < 0 || out->prefix_len > 128) return -1;
+    } else {
+        return -1;
+    }
+    strncpy(out->addr_str, tmp, sizeof(out->addr_str) - 1);
+    out->addr_str[sizeof(out->addr_str) - 1] = '\0';
+    return 0;
+}
+
+/* Parse a comma-separated list of Interface Address entries. */
+static int parse_iface_addrs(const char *s, struct client_config *cfg)
+{
+    char buf[256];
+    char *p, *save;
+
+    if (strlen(s) >= sizeof(buf)) return -1;
+    strcpy(buf, s);
+
+    for (p = strtok_r(buf, ",", &save); p; p = strtok_r(NULL, ",", &save)) {
+        while (*p == ' ' || *p == '\t') p++;
+        char *end = p + strlen(p) - 1;
+        while (end > p && (*end == ' ' || *end == '\t')) { *end = '\0'; end--; }
+        if (!*p) continue;
+        if (cfg->n_if_addrs >= WG_MAX_IFACE_ADDRS) {
+            fprintf(stderr, "too many Interface Address entries (max %d)\n",
+                    WG_MAX_IFACE_ADDRS);
+            return -1;
+        }
+        if (parse_iface_addr(p, &cfg->if_addrs[cfg->n_if_addrs]) != 0) {
+            fprintf(stderr, "invalid Address in [Interface]: %s\n", p);
+            return -1;
+        }
+        cfg->n_if_addrs++;
+    }
+    return 0;
 }
 
 /* Parse a comma-separated list of CIDRs like "10.88.0.0/24, 10.99.0.0/16"
@@ -394,9 +467,10 @@ static int load_config(const char *path, struct client_config *cfg)
             }
             got_endpoint = 1;
         } else if (in_interface && strcmp(p, "Address") == 0) {
-            strncpy(cfg->if_address, eq, sizeof(cfg->if_address) - 1);
-            cfg->if_address[sizeof(cfg->if_address) - 1] = '\0';
-            cfg->has_if_address = 1;
+            if (parse_iface_addrs(eq, cfg) != 0) {
+                fclose(f);
+                return -1;
+            }
         } else if (in_peer && strcmp(p, "PersistentKeepalive") == 0) {
             cfg->persistent_keepalive = atoi(eq);
         } else if (in_peer && strcmp(p, "AllowedIPs") == 0) {
@@ -929,53 +1003,84 @@ utun_write(int fd, const uint8_t *pkt, size_t len)
     return 0;
 }
 
-/* Run ifconfig to bring the utun up with the configured address. We
- * shell out to /sbin/ifconfig because macOS doesn't expose a clean
- * userspace API for this that works from C without entitlements. */
+/* Apply a single IPv4 Address entry to the utun. */
 static int
-utun_configure(const char *ifname, const char *addr_cidr)
+utun_apply_inet4(const char *ifname, const struct iface_addr *a)
 {
     char cmd[256];
-    /* Split "10.88.0.2/24" into address + netmask-slash-whatever. For a
-     * point-to-point utun, macOS wants: ifconfig utunN inet <local> <peer>
-     * The simplest working incantation: use <local> as both local and
-     * peer, then add a route for the /24. */
-    char local[64];
-    int prefix = 32;
-    const char *slash = strchr(addr_cidr, '/');
-    if (slash) {
-        size_t n = (size_t)(slash - addr_cidr);
-        if (n >= sizeof(local)) return -1;
-        memcpy(local, addr_cidr, n);
-        local[n] = '\0';
-        prefix = atoi(slash + 1);
-    } else {
-        strncpy(local, addr_cidr, sizeof(local) - 1);
-        local[sizeof(local) - 1] = '\0';
-    }
 
     snprintf(cmd, sizeof(cmd),
              "/sbin/ifconfig %s inet %s %s mtu 1420 up",
-             ifname, local, local);
+             ifname, a->addr_str, a->addr_str);
     if (system(cmd) != 0) {
         fprintf(stderr, "utun_configure: '%s' failed\n", cmd);
         return -1;
     }
     /* Add a route for the whole tunnel subnet via this interface. For a
      * /32 prefix we skip this step. */
-    if (prefix < 32) {
-        uint32_t mask = prefix == 0 ? 0 : (0xFFFFFFFFu << (32 - prefix));
-        struct in_addr a;
-        if (inet_pton(AF_INET, local, &a) != 1)
+    if (a->prefix_len < 32) {
+        uint32_t mask = a->prefix_len == 0 ? 0
+                                            : (0xFFFFFFFFu << (32 - a->prefix_len));
+        struct in_addr addr;
+        if (inet_pton(AF_INET, a->addr_str, &addr) != 1)
             return -1;
-        a.s_addr &= htonl(mask);
+        addr.s_addr &= htonl(mask);
         char net[64];
-        inet_ntop(AF_INET, &a, net, sizeof(net));
+        inet_ntop(AF_INET, &addr, net, sizeof(net));
         snprintf(cmd, sizeof(cmd),
                  "/sbin/route -q add -net %s/%d -interface %s",
-                 net, prefix, ifname);
+                 net, a->prefix_len, ifname);
         if (system(cmd) != 0)
-            fprintf(stderr, "utun_configure: route add failed (continuing)\n");
+            fprintf(stderr, "utun_configure: v4 route add failed (continuing)\n");
+    }
+    return 0;
+}
+
+/* Apply a single IPv6 Address entry to the utun. macOS utun supports
+ * inet6 aliasing — the link-local fe80:: addr is added by the kernel
+ * automatically when the interface comes up; we add the configured
+ * global address on top. */
+static int
+utun_apply_inet6(const char *ifname, const struct iface_addr *a)
+{
+    char cmd[256];
+
+    snprintf(cmd, sizeof(cmd),
+             "/sbin/ifconfig %s inet6 %s prefixlen %d alias",
+             ifname, a->addr_str, a->prefix_len);
+    if (system(cmd) != 0) {
+        fprintf(stderr, "utun_configure: '%s' failed\n", cmd);
+        return -1;
+    }
+    /* On macOS, adding the inet6 alias also installs the prefix route
+     * automatically (unlike v4 where we have to add it ourselves), so
+     * no separate `route add -inet6` is needed for the common case. */
+    return 0;
+}
+
+/* Bring the utun up and apply all parsed Address entries. */
+static int
+utun_configure(const char *ifname, const struct client_config *cfg)
+{
+    if (cfg->n_if_addrs == 0) {
+        fprintf(stderr, "utun_configure: no Address in [Interface]\n");
+        return -1;
+    }
+    int v4_done = 0;
+    for (int i = 0; i < cfg->n_if_addrs; i++) {
+        const struct iface_addr *a = &cfg->if_addrs[i];
+        if (a->family == AF_INET) {
+            if (utun_apply_inet4(ifname, a) != 0) return -1;
+            v4_done = 1;
+        } else if (a->family == AF_INET6) {
+            if (utun_apply_inet6(ifname, a) != 0) return -1;
+        }
+    }
+    /* If only v6 was configured, the interface still needs `up`. */
+    if (!v4_done) {
+        char cmd[64];
+        snprintf(cmd, sizeof(cmd), "/sbin/ifconfig %s mtu 1420 up", ifname);
+        (void)system(cmd);
     }
     return 0;
 }
@@ -1714,19 +1819,19 @@ int main(int argc, char *argv[])
     }
     printf("[tunnel] opened %s (fd=%d)\n", utun_name, utun_fd);
 
-    if (cfg.has_if_address) {
-        if (utun_configure(utun_name, cfg.if_address) != 0) {
+    if (cfg.n_if_addrs > 0) {
+        if (utun_configure(utun_name, &cfg) != 0) {
             fprintf(stderr, "utun_configure failed, continuing unconfigured\n");
         } else {
-            printf("[tunnel] %s configured with %s\n", utun_name, cfg.if_address);
-            /* Dump what the kernel actually installed so we can see
-             * if the route is pointing at utunN or at en0. */
+            printf("[tunnel] %s configured with %d address(es):", utun_name, cfg.n_if_addrs);
+            for (int i = 0; i < cfg.n_if_addrs; i++)
+                printf(" %s/%d", cfg.if_addrs[i].addr_str, cfg.if_addrs[i].prefix_len);
+            printf("\n");
+            /* Dump what the kernel actually installed for cross-check. */
             {
                 char cmd[128];
                 snprintf(cmd, sizeof(cmd), "/sbin/ifconfig %s", utun_name);
                 (void)system(cmd);
-                (void)system("/usr/sbin/netstat -rn -f inet "
-                             "| awk 'NR<=2 || /10\\.88/ {print}'");
             }
         }
     } else {
