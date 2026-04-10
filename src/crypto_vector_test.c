@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "crypto.h"
+#include "wg_noise.h"
 #include <crypto/curve25519.h>
 #include <sys/mbuf.h>
 
@@ -371,9 +372,223 @@ static int test_mbuf_matches_buffer_path(void)
     return fails;
 }
 
+/* M4.4 — In-process noise + transport loopback.
+ *
+ * Stand up two noise_local instances (initiator + responder) inside the
+ * same process, do a full Noise_IK handshake, then push a real plaintext
+ * through encap on the initiator side and decap it on the responder
+ * side. Verify the recovered plaintext matches byte-for-byte.
+ *
+ * This is the regression guard for the Round 3 r_idx bug: a buggy index
+ * field would have caused noise_keypair_lookup() on the responder to
+ * return NULL and the test would fail with a clear error pointing at
+ * the lookup, instead of "ping just doesn't reply" on a real network.
+ *
+ * It also exercises the responder code path (noise_consume_initiation /
+ * noise_create_response) which the wg_core client never touches in
+ * single-peer initiator mode.
+ */
+static int
+do_loopback_handshake(struct noise_local *init_local,
+                      struct noise_remote *init_remote_peer_view,
+                      struct noise_local *resp_local,
+                      struct noise_remote *resp_remote_peer_view)
+{
+    uint8_t ue[NOISE_PUBLIC_KEY_LEN];
+    uint8_t es[NOISE_PUBLIC_KEY_LEN + NOISE_AUTHTAG_LEN];
+    uint8_t ets[NOISE_TIMESTAMP_LEN + NOISE_AUTHTAG_LEN];
+    uint8_t en[NOISE_AUTHTAG_LEN];
+    uint32_t init_s_idx = 0;
+    uint32_t resp_s_idx = 0;
+    uint32_t resp_r_idx = 0;
+    struct noise_remote *matched = NULL;
+
+    /* Step 1: initiator → wire(initiation). */
+    if (noise_create_initiation(init_remote_peer_view,
+                                &init_s_idx, ue, es, ets) != 0) {
+        printf("[FAIL] loopback: create_initiation\n");
+        return 1;
+    }
+
+    /* Step 2: responder consumes the initiation. */
+    if (noise_consume_initiation(resp_local, &matched,
+                                 init_s_idx, ue, es, ets) != 0) {
+        printf("[FAIL] loopback: consume_initiation\n");
+        return 1;
+    }
+    if (matched != resp_remote_peer_view) {
+        printf("[FAIL] loopback: consume_initiation matched wrong remote\n");
+        if (matched) noise_remote_put(matched);
+        return 1;
+    }
+    noise_remote_put(matched);
+
+    /* Step 3: responder → wire(response). */
+    if (noise_create_response(resp_remote_peer_view,
+                              &resp_s_idx, &resp_r_idx, ue, en) != 0) {
+        printf("[FAIL] loopback: create_response\n");
+        return 1;
+    }
+    if (resp_r_idx != init_s_idx) {
+        printf("[FAIL] loopback: response r_idx 0x%08x != init s_idx 0x%08x\n",
+               (unsigned)resp_r_idx, (unsigned)init_s_idx);
+        return 1;
+    }
+
+    /* Step 4: initiator consumes the response. Note the parameter
+     * order — this is the same trap that the wg_core fix had to learn. */
+    matched = NULL;
+    if (noise_consume_response(init_local, &matched,
+                               resp_s_idx, resp_r_idx, ue, en) != 0) {
+        printf("[FAIL] loopback: consume_response\n");
+        return 1;
+    }
+    if (matched != init_remote_peer_view) {
+        printf("[FAIL] loopback: consume_response matched wrong remote\n");
+        if (matched) noise_remote_put(matched);
+        return 1;
+    }
+    noise_remote_put(matched);
+    return 0;
+}
+
+static int test_noise_loopback(void)
+{
+    struct noise_local *init_local = NULL;
+    struct noise_local *resp_local = NULL;
+    struct noise_remote *init_view_of_resp = NULL;  /* used by initiator */
+    struct noise_remote *resp_view_of_init = NULL;  /* used by responder */
+    uint8_t init_priv[32], init_pub[32];
+    uint8_t resp_priv[32], resp_pub[32];
+    int rc = 1;
+
+    /* Two random keypairs. */
+    curve25519_generate_secret(init_priv);
+    curve25519_generate_secret(resp_priv);
+    if (curve25519_generate_public(init_pub, init_priv) != 1 ||
+        curve25519_generate_public(resp_pub, resp_priv) != 1) {
+        printf("[FAIL] loopback: pubkey derivation\n");
+        return 1;
+    }
+
+    init_local = noise_local_alloc(NULL);
+    resp_local = noise_local_alloc(NULL);
+    if (!init_local || !resp_local) {
+        printf("[FAIL] loopback: noise_local_alloc\n");
+        goto out;
+    }
+    noise_local_private(init_local, init_priv);
+    noise_local_private(resp_local, resp_priv);
+
+    /* Each side needs a noise_remote pointing at the other side's pubkey. */
+    init_view_of_resp = noise_remote_alloc(init_local, NULL, resp_pub);
+    resp_view_of_init = noise_remote_alloc(resp_local, NULL, init_pub);
+    if (!init_view_of_resp || !resp_view_of_init) {
+        printf("[FAIL] loopback: noise_remote_alloc\n");
+        goto out;
+    }
+    if (noise_remote_enable(init_view_of_resp) != 0 ||
+        noise_remote_enable(resp_view_of_init) != 0) {
+        printf("[FAIL] loopback: noise_remote_enable\n");
+        goto out;
+    }
+
+    /* Full handshake in-process. */
+    if (do_loopback_handshake(init_local, init_view_of_resp,
+                              resp_local, resp_view_of_init) != 0)
+        goto out;
+
+    /* Now push a real plaintext through encap on the initiator side
+     * and decap it on the responder side. Plaintext is non-trivial
+     * length to exercise padding (37 bytes pads to 48). */
+    {
+        static const uint8_t plain[37] =
+            "M4.4 noise + transport loopback test\n";
+        struct noise_keypair *init_kp = NULL;
+        struct noise_keypair *resp_kp = NULL;
+        struct mbuf *m_enc = NULL;
+        struct mbuf *m_dec = NULL;
+        uint64_t nonce = 0;
+        uint32_t r_idx = 0;
+        uint8_t scratch[64] = {0};
+        int padded_len = 48;  /* 37 rounded up to 16 boundary */
+
+        memcpy(scratch, plain, sizeof(plain));
+
+        init_kp = noise_keypair_current(init_view_of_resp);
+        if (!init_kp) {
+            printf("[FAIL] loopback: no current keypair on initiator\n");
+            goto enc_out;
+        }
+        if (noise_keypair_nonce_next(init_kp, &nonce) != 0) {
+            printf("[FAIL] loopback: nonce_next\n");
+            goto enc_out;
+        }
+        m_enc = m_devget(scratch, padded_len);
+        if (!m_enc) {
+            printf("[FAIL] loopback: m_devget(enc)\n");
+            goto enc_out;
+        }
+        if (noise_keypair_encrypt(init_kp, &r_idx, nonce, m_enc) != 0) {
+            printf("[FAIL] loopback: noise_keypair_encrypt\n");
+            goto enc_out;
+        }
+        /* m_enc now holds [48 ct][16 tag] = 64 bytes, and r_idx is the
+         * responder's local index for the keypair we should target. */
+
+        /* Responder side: look up its keypair by r_idx and decrypt. */
+        resp_kp = noise_keypair_lookup(resp_local, r_idx);
+        if (!resp_kp) {
+            printf("[FAIL] loopback: noise_keypair_lookup(0x%08x) returned NULL\n",
+                   (unsigned)r_idx);
+            goto enc_out;
+        }
+        m_dec = m_devget(m_enc->m_data, m_enc->m_len);
+        if (!m_dec) {
+            printf("[FAIL] loopback: m_devget(dec)\n");
+            goto enc_out;
+        }
+        if (noise_keypair_decrypt(resp_kp, nonce, m_dec) != 0) {
+            printf("[FAIL] loopback: noise_keypair_decrypt\n");
+            goto enc_out;
+        }
+        /* m_dec is now plaintext (with the original padding intact);
+         * the tag has been stripped via m_adj(-16). */
+        if (m_dec->m_len != padded_len) {
+            printf("[FAIL] loopback: decrypted len %d != %d\n",
+                   m_dec->m_len, padded_len);
+            goto enc_out;
+        }
+        if (memcmp(m_dec->m_data, scratch, padded_len) != 0) {
+            printf("[FAIL] loopback: decrypted plaintext mismatch\n");
+            goto enc_out;
+        }
+        rc = 0;
+        printf("[PASS] noise loopback (handshake + transport, %d-byte plain)\n",
+               (int)sizeof(plain));
+enc_out:
+        if (m_enc) m_freem(m_enc);
+        if (m_dec) m_freem(m_dec);
+        if (init_kp) noise_keypair_put(init_kp);
+        if (resp_kp) noise_keypair_put(resp_kp);
+    }
+
+out:
+    if (init_view_of_resp) noise_remote_put(init_view_of_resp);
+    if (resp_view_of_init) noise_remote_put(resp_view_of_init);
+    if (init_local) noise_local_put(init_local);
+    if (resp_local) noise_local_put(resp_local);
+    return rc;
+}
+
 int main(void)
 {
     int fails = 0;
+
+    if (crypto_init() != 0) {
+        printf("crypto_init failed\n");
+        return 1;
+    }
 
     fails += test_blake2s_abc();
     fails += test_blake2s_more_kats();
@@ -383,6 +598,9 @@ int main(void)
     fails += test_mbuf_matches_buffer_path();
     fails += test_chacha20_poly1305_roundtrip();
     fails += test_xchacha20_poly1305_roundtrip();
+    fails += test_noise_loopback();
+
+    crypto_deinit();
 
     if (fails == 0) {
         printf("\nAll crypto vector tests passed.\n");
