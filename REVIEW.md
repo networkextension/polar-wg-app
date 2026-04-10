@@ -217,3 +217,74 @@ peer: TqbeoU9mcVHNariBBVoRvEySH0I0GWuUJ72Tj5qnam0=
 - **纯 roundtrip 测试 ≠ KAT**。自写 crypto 必须用 RFC 公开向量做 known-answer。后续加更多 KAT：Curve25519 RFC 7748 §6.1、Blake2s 长消息、ChaCha20 §2.4.2 等。
 - **Poly1305 是多次 update 可重入的流式 API**。任何流式 hash / MAC 实现都必须显式区分"部分块缓冲"和"最终化"两个阶段。
 - **WireGuard 握手 `encrypted_static` 正好 16 字节倍数 → 偶然躲过 bug**；但 `encrypted_timestamp` = 12 字节必踩雷。要不是真实 server 对拍，roundtrip 能永远绿灯下去。
+
+---
+
+## 7. 🔥 数据面静默丢包：r_idx 字段方向写反（Round 3）
+
+修完 poly1305 + 接好 utun 数据面之后，握手仍然成功，但 ping 一个回包都收不到。Server 端 tcpdump 显示我们的 data 包全部送达了，但 server 既不回复也不在 dmesg 报错；`wg show wg0 transfer` 的 rx_bytes 增量恰好等于 148（一个 handshake initiation 大小），证实我们的 4 个 data 包**根本没走到 server 端的 decrypt-成功计数行**。
+
+排查路径：
+1. 加了 mbuf-vs-buffer 全长度 KAT（0/13/16/32/48/96/112/113）—— 全 PASS，crypto 完全无锅。
+2. 加了 wg_encap 的 first-packet 完整 hex dump：
+
+   ```
+   [wire] first data packet: 48 bytes
+     0000: 04 00 00 00 5c 93 44 53 00 00 00 00 00 00 00 00
+     ...
+   ```
+3. 字段拆解后立刻意识到 `5c 93 44 53` 是 r_idx 字段。对照 FreeBSD `if_wg.c:1448`：
+   ```c
+   noise_consume_response(sc->sc_local, &remote, resp->s_idx, resp->r_idx, ...);
+   ```
+   而我自己的 `wait_for_response` 写的是：
+   ```c
+   noise_consume_response(local, &matched, s_idx /* 我们自己的 */, pkt.r_idx, ...);
+   ```
+   把第 3 参数写错了。
+
+### Bug 的实际后果
+
+`noise_consume_response` 的 `s_idx` 参数被存进 `r->r_index.i_remote_index`，这个值代表"对端的本地 index"，应该是 server 在 handshake response 里写在 `s_idx` 字段的值（来自 `pkt.s_idx`）。但我传的是**我们自己**的 sender index。
+
+所以 `kp->kp_index.i_remote_index` 里存的是我们自己的 index。每次 `noise_keypair_encrypt` 输出 `*r_idx = kp->kp_index.i_remote_index`，就把"我们自己的 index"塞进了 data 包的 `r_idx` 字段。Server 在自己的索引哈希里查这个值 —— 当然查不到 —— 直接 `kfree_skb_reason(SKB_DROP_REASON_WIREGUARD_NO_KEYPAIR_FOUND)` 静默丢弃。
+
+### 为什么握手没暴露这个 bug
+
+`noise_consume_response` 内部用第 4 参数 `pkt.r_idx`（这个我传对了）查找 noise_remote。这一步根本不引用第 3 参数。所以握手认证全程通过，**只有数据包加密时引用 `kp_index.i_remote_index` 才会引爆 bug**。
+
+握手 path 和数据 path 走的是完全不同的字段，互相不能背书对方的正确性。
+
+### 修复
+
+```c
+- ret = noise_consume_response(local, &matched, s_idx, pkt.r_idx, ...);
++ if (pkt.r_idx != expected_local_idx)   /* sanity */
++     return -1;
++ ret = noise_consume_response(local, &matched, pkt.s_idx, pkt.r_idx, ...);
+```
+
+加了一行 sanity check 因为 `noise_consume_response(s_idx, r_idx)` 的两个参数语义不对称（一个属于 responder 一个属于 initiator），将来很容易再写错。
+
+### 验证
+
+```
+$ ping -c 5 10.88.0.1
+PING 10.88.0.1: 56 data bytes
+64 bytes from 10.88.0.1: icmp_seq=0 time=1.890 ms
+64 bytes from 10.88.0.1: icmp_seq=1 time=10.979 ms
+64 bytes from 10.88.0.1: icmp_seq=2 time=11.568 ms
+
+3 packets transmitted, 3 packets received, 0.0% packet loss
+
+[tunnel] shutdown. final: tx=3 pkts/252 B  rx=3 pkts/252 B
+```
+
+**端到端通了。M1 数据面全部完成。**
+
+### 教训
+
+- **现代 Linux 的 silent drop 不再走 dmesg。** `SKB_DROP_REASON_*` 是新的 framework，dmesg 永远看不到，要靠 `bpftrace tracepoint:skb:kfree_skb`。下次 silent drop 第一反应是 bpftrace 而不是 dmesg。
+- **计数器是真相，dmesg 是噪音。** 这次给出关键定位的不是 dmesg，是 `wg show transfer rx_bytes` 的精确增量（148 = exactly handshake init）。任何子系统调试都先问"它有没有计数器"。
+- **wire dump 应该比 KAT 早做。** mbuf-vs-buffer KAT 写了 25 分钟，wire dump 写了 5 分钟，后者一秒命中 bug。**调 wire protocol 的第一动作是 hex dump 实际字节，再写抽象测试。**
+- **握手通了 ≠ 数据面通了。** Round 2 + Round 3 两个不同的 bug 都是这个模式。一个 bug 在 `encrypted_timestamp` 那条 path 上、一个 bug 在 data path 上、握手都成功但数据都失败。**协议正确性必须 ping 通才算数。**

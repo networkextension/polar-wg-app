@@ -630,21 +630,6 @@ wg_encap(int udp_fd,
     memcpy(out, &hdr, sizeof(hdr));
     memcpy(out + sizeof(hdr), m->m_data, (size_t)m->m_len);
 
-    /* One-shot full wire-bytes dump of the first data packet, so it can
-     * be byte-compared against server-side `tcpdump -X`. */
-    {
-        static int dumped = 0;
-        if (!dumped) {
-            dumped = 1;
-            fprintf(stderr, "[wire] first data packet: %zu bytes", out_len);
-            for (size_t i = 0; i < out_len; i++) {
-                if ((i & 15) == 0) fprintf(stderr, "\n  %04zx:", i);
-                fprintf(stderr, " %02x", out[i]);
-            }
-            fprintf(stderr, "\n");
-        }
-    }
-
     if (sendto(udp_fd, out, out_len, 0, peer_sa, peer_sl) != (ssize_t)out_len) {
         perror("wg_encap: sendto");
         goto out;
