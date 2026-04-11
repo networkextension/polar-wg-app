@@ -23,3 +23,9 @@ src/server_tcpdump.txt
 
 # macOS cruft
 .DS_Store
+
+# Xcode user-specific state (the project.pbxproj is checked in but
+# user-local Xcode breadcrumbs are not)
+**/xcuserdata/
+**/*.xcuserstate
+**/project.xcworkspace/xcuserdata/

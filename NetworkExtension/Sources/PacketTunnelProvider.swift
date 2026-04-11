@@ -61,18 +61,20 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         // 2. Build the C session with callbacks pointing back at self.
         //    We pass an unretained Unmanaged<PacketTunnelProvider> as the
         //    user_ctx so the C side can call back into Swift cheaply.
+        //    The wg_session_callbacks struct is imported by Swift as a
+        //    POD with all four fields required at init time.
         let ctx = Unmanaged.passUnretained(self).toOpaque()
-        var callbacks = wg_session_callbacks()
-        callbacks.user_ctx = ctx
-        callbacks.send_udp = sendUDPCallback
-        callbacks.deliver_ip = deliverIPCallback
-        callbacks.log_line = logCallback
+        let callbacks = wg_session_callbacks(
+            send_udp:   sendUDPCallback,
+            deliver_ip: deliverIPCallback,
+            log_line:   logCallback,
+            user_ctx:   ctx
+        )
 
         let configBytes = configText.utf8CString
-        let handle = configBytes.withUnsafeBufferPointer { buf -> OpaquePointer? in
+        let handle: OpaquePointer? = configBytes.withUnsafeBufferPointer { buf in
             guard let base = buf.baseAddress else { return nil }
             return wg_session_create(base, buf.count - 1, callbacks)
-                .map { OpaquePointer($0) }
         }
         guard let session = handle else {
             completionHandler(ProviderError.sessionCreateFailed)
@@ -179,10 +181,9 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             // keepalive, and allowed-ips updated; private_key,
             // listen_port, replace_peers, peer add/remove are rejected.
             let bytes = Array(body.utf8)
-            let rc = bytes.withUnsafeBufferPointer { buf -> Int32 in
+            let rc: Int32 = bytes.withUnsafeBufferPointer { buf in
                 guard let base = buf.baseAddress else { return -1 }
                 return wg_session_set_uapi(session, base, buf.count)
-                    .map { Int32($0) } ?? -1
             }
             if rc == 0 { return "errno=0\n\n" }
             return "errno=1\n\n"    // EPERM — request rejected
@@ -310,7 +311,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     // take @convention(c) closures that capture state). They recover
     // `self` from the user_ctx pointer the session was created with.
 
-    private func writeDatagram(_ bytes: UnsafePointer<UInt8>, length: Int) {
+    fileprivate func writeDatagram(_ bytes: UnsafePointer<UInt8>, length: Int) {
         let data = Data(bytes: bytes, count: length)
         udpSession?.writeDatagram(data) { err in
             if let err = err {
@@ -320,14 +321,14 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    private func writeInnerPacket(_ bytes: UnsafePointer<UInt8>, length: Int) {
+    fileprivate func writeInnerPacket(_ bytes: UnsafePointer<UInt8>, length: Int) {
         let data = Data(bytes: bytes, count: length)
         let version = (data.first ?? 0) >> 4
         let family = NSNumber(value: version == 6 ? AF_INET6 : AF_INET)
         packetFlow.writePackets([data], withProtocols: [family])
     }
 
-    private func emitLog(_ msg: String) {
+    fileprivate func emitLog(_ msg: String) {
         os_log("%{public}@", log: log, type: .info, msg)
     }
 

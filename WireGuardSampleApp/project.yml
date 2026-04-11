@@ -1,0 +1,110 @@
+# SPDX-License-Identifier: MIT
+#
+# xcodegen spec for the WireGuard sample host app + PacketTunnelProvider
+# extension. Run `xcodegen generate` from this directory to materialize
+# the WireGuardSampleApp.xcodeproj/project.pbxproj that this file is the
+# canonical source for.
+#
+# Bundle IDs:
+#   host app:  com.change.wg
+#   extension: com.change.wg.tunnel
+#
+# Before building, run `make xcframework` from the repo root so that
+# ../build/xcframework/WireGuardCore.xcframework exists. The extension
+# target links it as a static framework (Embed=No).
+
+name: WireGuardSampleApp
+
+options:
+  bundleIdPrefix: com.change.wg
+  # macOS 13 (Ventura) gives us SwiftUI features used in ContentView
+  # like .task, .textSelection, .monospaced, .foregroundStyle. The
+  # underlying WireGuardCore xcframework targets macOS 11 so consumers
+  # building against an older deployment target still link cleanly.
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    PRODUCT_BUNDLE_IDENTIFIER_PREFIX: com.change.wg
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    # Leave DEVELOPMENT_TEAM blank — the user must set their own team
+    # in Xcode → Signing & Capabilities the first time they open the
+    # project. Free Personal teams work for local testing of NE apps.
+    DEVELOPMENT_TEAM: ""
+    ENABLE_HARDENED_RUNTIME: YES
+    SWIFT_STRICT_CONCURRENCY: minimal
+  configs:
+    Debug:
+      SWIFT_OPTIMIZATION_LEVEL: -Onone
+      GCC_OPTIMIZATION_LEVEL: 0
+      ONLY_ACTIVE_ARCH: YES
+    Release:
+      SWIFT_OPTIMIZATION_LEVEL: -O
+      GCC_OPTIMIZATION_LEVEL: s
+
+# Where the prebuilt xcframework lives. Path is relative to this
+# project.yml file. Run `make xcframework` from the repo root before
+# opening the .xcodeproj.
+packages: {}
+
+targets:
+  WireGuardSampleApp:
+    type: application
+    platform: macOS
+    sources:
+      - path: WireGuardSampleApp
+        excludes:
+          - "*.entitlements"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.change.wg
+        INFOPLIST_FILE: WireGuardSampleApp/Info.plist
+        CODE_SIGN_ENTITLEMENTS: WireGuardSampleApp/WireGuardSampleApp.entitlements
+        ENABLE_PREVIEWS: YES
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
+    dependencies:
+      - target: WireGuardTunnelExtension
+        embed: true
+        codeSign: true
+      - sdk: NetworkExtension.framework
+
+  WireGuardTunnelExtension:
+    type: app-extension
+    platform: macOS
+    sources:
+      # The PacketTunnelProvider lives in the canonical NE/Sources path
+      # in the repo so the CLI build can also reference it. We pull it
+      # in via a relative path here so there is no source duplication.
+      - path: ../NetworkExtension/Sources/PacketTunnelProvider.swift
+      - path: WireGuardTunnelExtension
+        excludes:
+          - "*.entitlements"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.change.wg.tunnel
+        INFOPLIST_FILE: WireGuardTunnelExtension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: WireGuardTunnelExtension/WireGuardTunnelExtension.entitlements
+        # Embed the WireGuardCore.xcframework as a static dependency.
+        # The framework is built outside Xcode by `make xcframework` —
+        # see ../scripts/build-xcframework.sh.
+        FRAMEWORK_SEARCH_PATHS:
+          - "$(SRCROOT)/../build/xcframework/WireGuardCore.xcframework/macos-arm64_x86_64"
+        OTHER_LDFLAGS:
+          - "-framework"
+          - "WireGuardCore"
+        # NetworkExtension extension scaffolding.
+        SWIFT_VERSION: "5.9"
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/../../../../Frameworks"
+    dependencies:
+      - sdk: NetworkExtension.framework
+      - sdk: Network.framework
+      - framework: ../build/xcframework/WireGuardCore.xcframework/macos-arm64_x86_64/WireGuardCore.framework
+        embed: false
+        codeSign: false
