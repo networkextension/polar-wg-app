@@ -10,8 +10,12 @@ import SwiftUI
 struct WireGuardSampleApp: App {
     var body: some Scene {
         WindowGroup {
+            #if os(macOS)
             ContentView()
                 .frame(minWidth: 760, minHeight: 520)
+            #else
+            ContentView()
+            #endif
         }
     }
 }

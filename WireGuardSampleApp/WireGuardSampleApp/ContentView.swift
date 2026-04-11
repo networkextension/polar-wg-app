@@ -26,6 +26,12 @@ struct ContentView: View {
 
     @State private var statusText: String = "(tunnel not running)"
     @State private var statusTimer: Timer?
+    @State private var username: String = ""
+    @State private var email: String = ""
+    @State private var password: String = ""
+    @State private var isRegisterMode: Bool = false
+    @State private var isAuthLoading: Bool = false
+    @State private var apiBaseURL: String = UserDefaults.standard.string(forKey: "api_base_url") ?? ""
 
     var body: some View {
         ZStack {
@@ -37,12 +43,17 @@ struct ContentView: View {
             .ignoresSafeArea()
 
             if manager.isLoaded {
-                VStack(spacing: 12) {
-                    header
-                    contentArea
-                    actionsBar
+                if manager.isAuthenticated {
+                    VStack(spacing: 12) {
+                        header
+                        contentArea
+                        actionsBar
+                    }
+                    .padding(16)
+                } else {
+                    loginView
+                        .padding(16)
                 }
-                .padding(16)
             } else {
                 loadingView
                     .padding(16)
@@ -100,14 +111,53 @@ struct ContentView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 10) {
-                Image(systemName: "shield.lefthalf.filled.badge.checkmark")
-                    .font(.title2)
-                    .foregroundStyle(Color.accentColor)
-                Text("WireGuard NE Sample")
-                    .font(.title2.bold())
-                Spacer()
-                statusPill
+            if #available(iOS 16.0, macOS 13.0, tvOS 16.0, *) {
+                ViewThatFits(in: .vertical) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "shield.lefthalf.filled.badge.checkmark")
+                            .font(.title2)
+                            .foregroundStyle(Color.accentColor)
+                        Text("WireGuard NE Sample")
+                            .font(.title2.bold())
+                        Spacer()
+                        Button("Logout") { manager.logoutUser() }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        statusPill
+                    }
+                    
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "shield.lefthalf.filled.badge.checkmark")
+                                .font(.title3)
+                                .foregroundStyle(Color.accentColor)
+                            Text("WireGuard NE Sample")
+                                .font(.headline.bold())
+                            Spacer(minLength: 0)
+                        }
+                        
+                        HStack(spacing: 8) {
+                            statusPill
+                            Spacer(minLength: 0)
+                            Button("Logout") { manager.logoutUser() }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                        }
+                    }
+                }
+            } else {
+                HStack(spacing: 10) {
+                    Image(systemName: "shield.lefthalf.filled.badge.checkmark")
+                        .font(.title2)
+                        .foregroundStyle(Color.accentColor)
+                    Text("WireGuard NE Sample")
+                        .font(.title2.bold())
+                    Spacer()
+                    Button("Logout") { manager.logoutUser() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    statusPill
+                }
             }
 
             serverControls
@@ -136,6 +186,116 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    private var loginView: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "lock.shield")
+                .font(.system(size: 42))
+                .foregroundStyle(Color.accentColor)
+
+            Text("Login Required")
+                .font(.title3.bold())
+
+            Text("Please register or login to use tunnel controls. Config pull will be added later.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+
+            Picker("Mode", selection: $isRegisterMode) {
+                Text("Login").tag(false)
+                Text("Register").tag(true)
+            }
+            .pickerStyle(.segmented)
+
+            if isRegisterMode {
+                TextField("Username", text: $username)
+                    .textFieldStyle(.roundedBorder)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+            }
+
+            TextField("Email", text: $email)
+                .textFieldStyle(.roundedBorder)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled(true)
+
+            SecureField("Password", text: $password)
+                .textFieldStyle(.roundedBorder)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled(true)
+
+            TextField("API Base URL", text: $apiBaseURL)
+                .textFieldStyle(.roundedBorder)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled(true)
+
+            if let info = manager.authInfo {
+                Text(info)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if let err = manager.authError {
+                Text(err)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Button {
+                Task {
+                    isAuthLoading = true
+                    if isRegisterMode {
+                        await manager.register(
+                            username: username,
+                            email: email,
+                            password: password,
+                            apiBaseURL: apiBaseURL
+                        )
+                    } else {
+                        await manager.login(
+                            email: email,
+                            password: password,
+                            apiBaseURL: apiBaseURL
+                        )
+                    }
+                    isAuthLoading = false
+                }
+            } label: {
+                Group {
+                    if isAuthLoading {
+                        ProgressView()
+                    } else {
+                        Text(isRegisterMode ? "Register" : "Login")
+                    }
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(
+                isAuthLoading ||
+                apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                (isRegisterMode && username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            )
+
+            Text("Config pull is disabled for now.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: 460)
+        .frame(maxWidth: .infinity)
+        .padding(20)
+        .background(Color.secondary.opacity(0.08))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
     private var statusPill: some View {
@@ -539,7 +699,9 @@ private var removePeerDemo: String {
     """
 }
 
-#Preview {
-    ContentView()
-        .frame(width: 800, height: 540)
+struct ContentView_Previews: PreviewProvider {
+    static var previews: some View {
+        ContentView()
+            .frame(width: 800, height: 540)
+    }
 }

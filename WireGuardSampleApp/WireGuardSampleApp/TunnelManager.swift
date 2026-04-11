@@ -52,6 +52,9 @@ final class TunnelManager: ObservableObject {
     @Published var lastError: String?
     @Published var storageMode: ProfileStorageMode = .local
     @Published var isLoaded: Bool = false
+    @Published var isAuthenticated: Bool = false
+    @Published var authError: String?
+    @Published var authInfo: String?
 
     @Published var profiles: [ServerProfile] = []
     @Published var selectedProfileID: UUID?
@@ -63,6 +66,7 @@ final class TunnelManager: ObservableObject {
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
     private static let storageModeDefaultsKey = "serverProfileStorageMode"
+    private static let authLoggedInDefaultsKey = "isLoggedIn"
 
     private struct StoredProfiles: Codable {
         var selectedProfileID: UUID?
@@ -71,6 +75,7 @@ final class TunnelManager: ObservableObject {
 
     init() {
         storageMode = TunnelManager.loadStoredStorageMode()
+        isAuthenticated = UserDefaults.standard.bool(forKey: Self.authLoggedInDefaultsKey)
     }
 
     deinit {
@@ -151,6 +156,61 @@ final class TunnelManager: ObservableObject {
         selectedProfileID = currentSelected ?? profiles.first?.id
         applySelectedProfileToEditor()
         persistProfilesToKeychain()
+    }
+
+    func login(email: String, password: String, apiBaseURL: String) async {
+        let user = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pass = password.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !user.isEmpty, !pass.isEmpty else {
+            authError = "Email and password are required."
+            return
+        }
+
+        APIClient.shared.setBaseURL(apiBaseURL)
+        do {
+            try await APIClient.shared.login(email: user, password: pass)
+            authError = nil
+            authInfo = nil
+            isAuthenticated = true
+            UserDefaults.standard.set(true, forKey: Self.authLoggedInDefaultsKey)
+        } catch {
+            isAuthenticated = false
+            authInfo = nil
+            authError = error.localizedDescription
+        }
+    }
+
+    func register(username: String, email: String, password: String, apiBaseURL: String) async {
+        let name = username.trimmingCharacters(in: .whitespacesAndNewlines)
+        let user = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pass = password.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !user.isEmpty, !pass.isEmpty else {
+            authError = "Username, email, and password are required."
+            return
+        }
+
+        APIClient.shared.setBaseURL(apiBaseURL)
+        do {
+            try await APIClient.shared.register(username: name, email: user, password: pass)
+            authError = nil
+            authInfo = "Register success. Please login."
+            isAuthenticated = false
+            UserDefaults.standard.set(false, forKey: Self.authLoggedInDefaultsKey)
+        } catch {
+            authInfo = nil
+            authError = error.localizedDescription
+        }
+    }
+
+    func logoutUser() {
+        stop()
+        isAuthenticated = false
+        authError = nil
+        authInfo = nil
+        UserDefaults.standard.set(false, forKey: Self.authLoggedInDefaultsKey)
+        Task {
+            try? await APIClient.shared.logout()
+        }
     }
 
     func selectProfile(_ id: UUID) {
@@ -425,6 +485,10 @@ private enum KeychainStore {
 
     static func loadData(mode: ProfileStorageMode) -> Data? {
         let account = accountBase + "-" + mode.rawValue
+        return loadData(account: account, mode: mode)
+    }
+
+    static func loadData(account: String, mode: ProfileStorageMode) -> Data? {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
@@ -441,6 +505,10 @@ private enum KeychainStore {
 
     static func saveData(_ data: Data, mode: ProfileStorageMode) throws {
         let account = accountBase + "-" + mode.rawValue
+        try saveData(data, account: account, mode: mode)
+    }
+
+    static func saveData(_ data: Data, account: String, mode: ProfileStorageMode) throws {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
@@ -471,6 +539,101 @@ private enum KeychainStore {
         let addStatus = SecItemAdd(add as CFDictionary, nil)
         guard addStatus == errSecSuccess else {
             throw NSError(domain: NSOSStatusErrorDomain, code: Int(addStatus))
+        }
+    }
+
+    static func loadString(account: String, mode: ProfileStorageMode) -> String? {
+        guard let data = loadData(account: account, mode: mode) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func saveString(_ value: String, account: String, mode: ProfileStorageMode) throws {
+        guard let data = value.data(using: .utf8) else { return }
+        try saveData(data, account: account, mode: mode)
+    }
+}
+
+final class APIClient {
+    static let shared = APIClient()
+
+    private let session = URLSession.shared
+    private let baseURLDefaultsKey = "api_base_url"
+
+    var baseURL: URL? {
+        let raw = UserDefaults.standard.string(forKey: baseURLDefaultsKey)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let raw, !raw.isEmpty else { return nil }
+        return URL(string: raw)
+    }
+
+    func setBaseURL(_ raw: String) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            UserDefaults.standard.removeObject(forKey: baseURLDefaultsKey)
+        } else {
+            UserDefaults.standard.set(trimmed, forKey: baseURLDefaultsKey)
+        }
+    }
+
+    func login(email: String, password: String) async throws {
+        let body: [String: Any] = ["email": email, "password": password]
+        _ = try await post(path: "/api/login", body: body, responseType: Empty.self)
+    }
+
+    func register(username: String, email: String, password: String) async throws {
+        let body: [String: Any] = ["username": username, "email": email, "password": password]
+        _ = try await post(path: "/api/register", body: body, responseType: Empty.self)
+    }
+
+    func logout() async throws {
+        _ = try await post(path: "/api/logout", body: nil, responseType: Empty.self)
+    }
+
+    private func post<T: Decodable>(path: String, body: Any?, responseType: T.Type) async throws -> T {
+        guard let baseURL else { throw APIError.invalidBaseURL }
+        var req = URLRequest(url: baseURL.appendingPathComponent(path))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let body {
+            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+        return try await perform(req, responseType: responseType)
+    }
+
+    private func perform<T: Decodable>(_ request: URLRequest, responseType: T.Type) async throws -> T {
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.invalidResponse
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let message = (try? JSONDecoder().decode(ErrorResponse.self, from: data))?.error ?? "HTTP \(http.statusCode)"
+            throw APIError.serverError(http.statusCode, message)
+        }
+        if T.self == Empty.self {
+            return Empty() as! T
+        }
+        return try JSONDecoder().decode(T.self, from: data)
+    }
+
+    private struct Empty: Decodable {}
+
+    private struct ErrorResponse: Decodable {
+        let error: String
+    }
+
+    private enum APIError: LocalizedError {
+        case invalidBaseURL
+        case invalidResponse
+        case serverError(Int, String)
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidBaseURL:
+                return "API Base URL is required."
+            case .invalidResponse:
+                return "Invalid server response."
+            case .serverError(_, let message):
+                return message
+            }
         }
     }
 }
