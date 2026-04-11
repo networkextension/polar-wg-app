@@ -80,6 +80,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             return .full
         }()
+        let splitInjectedRoutes = proto.providerConfiguration?["splitInjectedRoutes"] as? String ?? ""
 
         // 2. Build the C session with callbacks pointing back at self.
         //    We pass an unretained Unmanaged<PacketTunnelProvider> as the
@@ -107,7 +108,12 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         // 3. Build NEPacketTunnelNetworkSettings from the session's
         //    introspection API: interface addresses, peer allowed-ips.
-        let settings = buildNetworkSettings(for: session, configText: configText, routeMode: routeMode)
+        let settings = buildNetworkSettings(
+            for: session,
+            configText: configText,
+            routeMode: routeMode,
+            splitInjectedRoutes: splitInjectedRoutes
+        )
 
         // 4. Hand the settings to the system. Once this completes,
         //    packetFlow is ready and we can start the read loops.
@@ -228,7 +234,12 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     // MARK: - NE plumbing
 
-    private func buildNetworkSettings(for session: OpaquePointer, configText: String, routeMode: RouteMode) -> NEPacketTunnelNetworkSettings {
+    private func buildNetworkSettings(
+        for session: OpaquePointer,
+        configText: String,
+        routeMode: RouteMode,
+        splitInjectedRoutes: String
+    ) -> NEPacketTunnelNetworkSettings {
         // Tunnel remote address — cosmetic, shown in System Settings → VPN.
         // Pull it from the first peer's endpoint via the wg_session
         // introspection API, which is now the canonical source of truth
@@ -336,6 +347,23 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
+        if routeMode == .split {
+            let injected = parseInjectedCIDRs(splitInjectedRoutes)
+            for cidr in injected {
+                if cidr.family == AF_INET {
+                    included4.append(NEIPv4Route(
+                        destinationAddress: cidr.address,
+                        subnetMask: prefixLengthToSubnetMask(cidr.prefix)
+                    ))
+                } else if cidr.family == AF_INET6 {
+                    included6.append(NEIPv6Route(
+                        destinationAddress: cidr.address,
+                        networkPrefixLength: NSNumber(value: cidr.prefix)
+                    ))
+                }
+            }
+        }
+
         // Fallback: if endpoint introspection did not yield exclusions, parse
         // endpoint host from config text to avoid endpoint-via-utun loops.
         if routeMode == .full, excluded4.isEmpty && excluded6.isEmpty, let endpointHost = configEndpointHost {
@@ -412,7 +440,8 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             included4: included4,
             excluded4: excluded4,
             included6: included6,
-            excluded6: excluded6
+            excluded6: excluded6,
+            splitInjectedRoutes: splitInjectedRoutes
         )
         return settings
     }
@@ -703,13 +732,15 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         included4: [NEIPv4Route],
         excluded4: [NEIPv4Route],
         included6: [NEIPv6Route],
-        excluded6: [NEIPv6Route]
+        excluded6: [NEIPv6Route],
+        splitInjectedRoutes: String
     ) -> String {
         let inc4 = included4.map { "\($0.destinationAddress)/\($0.destinationSubnetMask)" }.prefix(12)
         let exc4 = excluded4.map { "\($0.destinationAddress)/\($0.destinationSubnetMask)" }.prefix(12)
         let inc6 = included6.map { "\($0.destinationAddress)/\($0.destinationNetworkPrefixLength)" }.prefix(12)
         let exc6 = excluded6.map { "\($0.destinationAddress)/\($0.destinationNetworkPrefixLength)" }.prefix(12)
         let peer = peerHost?.hostname ?? "(none)"
+        let injected = parseInjectedCIDRs(splitInjectedRoutes).map { "\($0.address)/\($0.prefix)" }
 
         return """
 
@@ -727,6 +758,8 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         excluded_v4=\(exc4.joined(separator: ","))
         included_v6=\(inc6.joined(separator: ","))
         excluded_v6=\(exc6.joined(separator: ","))
+        injected_route_count=\(injected.count)
+        injected_routes=\(injected.joined(separator: ","))
         """
     }
 
@@ -807,4 +840,28 @@ private func networkAddress(of address: String, prefixLength: Int) -> String? {
     var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
     guard inet_ntop(AF_INET, &netAddr, &buf, socklen_t(INET_ADDRSTRLEN)) != nil else { return nil }
     return String(cString: buf)
+}
+
+private func parseInjectedCIDRs(_ text: String) -> [(family: Int32, address: String, prefix: Int)] {
+    text
+        .split { $0 == "\n" || $0 == "," || $0 == ";" || $0 == " " || $0 == "\t" }
+        .compactMap { token -> (Int32, String, Int)? in
+            let part = token.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !part.isEmpty else { return nil }
+            guard let slash = part.lastIndex(of: "/") else { return nil }
+            let addr = String(part[..<slash])
+            let prefixText = String(part[part.index(after: slash)...])
+            guard let prefix = Int(prefixText) else { return nil }
+
+            var v4 = in_addr()
+            if addr.withCString({ inet_pton(AF_INET, $0, &v4) }) == 1, (0...32).contains(prefix) {
+                return (AF_INET, addr, prefix)
+            }
+
+            var v6 = in6_addr()
+            if addr.withCString({ inet_pton(AF_INET6, $0, &v6) }) == 1, (0...128).contains(prefix) {
+                return (AF_INET6, addr, prefix)
+            }
+            return nil
+        }
 }

@@ -40,6 +40,7 @@ final class TunnelManager: ObservableObject {
     @Published var status: NEVPNStatus = .invalid
     @Published var lastError: String?
     @Published var routeMode: RouteMode = .full
+    @Published var splitInjectedRoutes: String = ""
 
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
@@ -61,6 +62,10 @@ final class TunnelManager: ObservableObject {
                let parsed = RouteMode(rawValue: saved) {
                 routeMode = parsed
             }
+            if let proto = manager?.protocolConfiguration as? NETunnelProviderProtocol,
+               let injected = proto.providerConfiguration?["splitInjectedRoutes"] as? String {
+                splitInjectedRoutes = injected
+            }
             attachStatusObserver()
             refreshStatus()
         } catch {
@@ -71,7 +76,7 @@ final class TunnelManager: ObservableObject {
     /// Persist a wg-quick-style config text to the tunnel preference.
     /// The first call also installs the provider in System Settings —
     /// macOS will pop a permission dialog.
-    func save(config: String, routeMode: RouteMode) async {
+    func save(config: String, routeMode: RouteMode, splitInjectedRoutes: String) async {
         guard let m = manager else { return }
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = "com.change.wg.tunnel"
@@ -81,7 +86,8 @@ final class TunnelManager: ObservableObject {
         proto.serverAddress = firstEndpointFrom(config: config) ?? "wireguard"
         proto.providerConfiguration = [
             "config": config,
-            "routeMode": routeMode.rawValue
+            "routeMode": routeMode.rawValue,
+            "splitInjectedRoutes": splitInjectedRoutes
         ]
         m.protocolConfiguration = proto
         m.localizedDescription = "WireGuard Sample"
@@ -92,6 +98,7 @@ final class TunnelManager: ObservableObject {
             attachStatusObserver()
             refreshStatus()
             self.routeMode = routeMode
+            self.splitInjectedRoutes = splitInjectedRoutes
             lastError = nil
         } catch {
             lastError = "save: \(error.localizedDescription)"

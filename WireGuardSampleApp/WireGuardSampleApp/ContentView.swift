@@ -98,7 +98,15 @@ struct ContentView: View {
                 }
                 .pickerStyle(.segmented)
 
-                Button("Save config") { Task { await manager.save(config: configText, routeMode: manager.routeMode) } }
+                Button("Save config") {
+                    Task {
+                        await manager.save(
+                            config: configText,
+                            routeMode: manager.routeMode,
+                            splitInjectedRoutes: manager.splitInjectedRoutes
+                        )
+                    }
+                }
                 Button("Connect") { manager.start() }
                     .disabled(manager.status == .connected || manager.status == .connecting)
                 Button("Disconnect") { manager.stop() }
@@ -106,6 +114,22 @@ struct ContentView: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
+
+            if manager.routeMode == .split {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Split Injected Routes (CIDR)", systemImage: "list.bullet.rectangle")
+                        .font(.subheadline.weight(.semibold))
+                    TextEditor(text: $manager.splitInjectedRoutes)
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(minHeight: 64, maxHeight: 100)
+                        .padding(8)
+                        .background(platformTextBackgroundColor)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    Text("One per line or comma separated, e.g. 10.10.0.0/16, 172.16.203.0/24")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
     }
 
