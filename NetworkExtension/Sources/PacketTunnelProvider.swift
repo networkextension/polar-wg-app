@@ -485,19 +485,34 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             for d in datagrams {
                 d.withUnsafeBytes { raw in
                     guard let base = raw.baseAddress else { return }
-                    // We don't have a sockaddr from NWUDPSession; synthesize
-                    // one from the current endpoint so wgs_handle_udp has
-                    // something for roaming bookkeeping.
-                    var addr = self.makeSockaddrFromCurrentEndpoint()
-                    _ = wg_session_handle_udp(
-                        session,
-                        base.assumingMemoryBound(to: UInt8.self),
-                        d.count,
-                        withUnsafePointer(to: &addr) {
-                            UnsafeRawPointer($0).assumingMemoryBound(to: sockaddr.self)
-                        },
-                        socklen_t(MemoryLayout<sockaddr_in>.size)
-                    )
+                    if var peerAddr = self.makeSockaddrFromCurrentEndpoint() {
+                        _ = withUnsafeMutablePointer(to: &peerAddr.storage) { storagePtr in
+                            storagePtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+                                wg_session_handle_udp(
+                                    session,
+                                    base.assumingMemoryBound(to: UInt8.self),
+                                    d.count,
+                                    saPtr,
+                                    peerAddr.length
+                                )
+                            }
+                        }
+                    } else {
+                        // Last-resort fallback when current endpoint cannot be
+                        // represented (should be rare).
+                        var addr = sockaddr_in()
+                        addr.sin_family = sa_family_t(AF_INET)
+                        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+                        _ = wg_session_handle_udp(
+                            session,
+                            base.assumingMemoryBound(to: UInt8.self),
+                            d.count,
+                            withUnsafePointer(to: &addr) {
+                                UnsafeRawPointer($0).assumingMemoryBound(to: sockaddr.self)
+                            },
+                            socklen_t(MemoryLayout<sockaddr_in>.size)
+                        )
+                    }
                 }
             }
         }, maxDatagrams: 64)
@@ -562,15 +577,42 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         os_log("%{public}@", log: log, type: .info, msg)
     }
 
-    private func makeSockaddrFromCurrentEndpoint() -> sockaddr_in {
-        // Placeholder: fill in from the NWUDPSession's currentPath.remoteEndpoint
-        // when available. For the MVP this is a zeroed struct — the C library
-        // uses it only for roaming bookkeeping, so a bogus value just means
-        // the peer endpoint won't update from recvfrom.
-        var sin = sockaddr_in()
-        sin.sin_family = sa_family_t(AF_INET)
-        sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        return sin
+    private func makeSockaddrFromCurrentEndpoint() -> (storage: sockaddr_storage, length: socklen_t)? {
+        guard let endpoint = peerHost else { return nil }
+        guard let port = UInt16(endpoint.port) else { return nil }
+
+        let host = resolvedIPAddress(for: endpoint.hostname) ?? endpoint.hostname
+        if isIPv4Literal(host) {
+            var sin = sockaddr_in()
+            sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            sin.sin_family = sa_family_t(AF_INET)
+            sin.sin_port = port.bigEndian
+            guard host.withCString({ inet_pton(AF_INET, $0, &sin.sin_addr) }) == 1 else {
+                return nil
+            }
+            var storage = sockaddr_storage()
+            withUnsafeMutablePointer(to: &storage) { dst in
+                dst.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee = sin }
+            }
+            return (storage, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+
+        if isIPv6Literal(host) {
+            var sin6 = sockaddr_in6()
+            sin6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+            sin6.sin6_family = sa_family_t(AF_INET6)
+            sin6.sin6_port = port.bigEndian
+            guard host.withCString({ inet_pton(AF_INET6, $0, &sin6.sin6_addr) }) == 1 else {
+                return nil
+            }
+            var storage = sockaddr_storage()
+            withUnsafeMutablePointer(to: &storage) { dst in
+                dst.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee = sin6 }
+            }
+            return (storage, socklen_t(MemoryLayout<sockaddr_in6>.size))
+        }
+
+        return nil
     }
 
     private func isIPv4Literal(_ host: String) -> Bool {
