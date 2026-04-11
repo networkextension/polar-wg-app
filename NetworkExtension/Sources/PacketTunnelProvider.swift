@@ -409,6 +409,11 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
+        included4 = dedupeIPv4Routes(included4)
+        excluded4 = dedupeIPv4Routes(excluded4)
+        included6 = dedupeIPv6Routes(included6)
+        excluded6 = dedupeIPv6Routes(excluded6)
+
         if !v4Addrs.isEmpty {
             let s4 = NEIPv4Settings(addresses: v4Addrs, subnetMasks: v4Masks)
             if routeMode == .full {
@@ -921,4 +926,28 @@ private func parseInjectedCIDRs(_ text: String) -> [(family: Int32, address: Str
             }
             return nil
         }
+}
+
+private func dedupeIPv4Routes(_ routes: [NEIPv4Route]) -> [NEIPv4Route] {
+    var seen = Set<String>()
+    var result: [NEIPv4Route] = []
+    for route in routes {
+        let key = "\(route.destinationAddress)/\(route.destinationSubnetMask)"
+        if seen.insert(key).inserted {
+            result.append(route)
+        }
+    }
+    return result
+}
+
+private func dedupeIPv6Routes(_ routes: [NEIPv6Route]) -> [NEIPv6Route] {
+    var seen = Set<String>()
+    var result: [NEIPv6Route] = []
+    for route in routes {
+        let key = "\(route.destinationAddress)/\(route.destinationNetworkPrefixLength)"
+        if seen.insert(key).inserted {
+            result.append(route)
+        }
+    }
+    return result
 }
