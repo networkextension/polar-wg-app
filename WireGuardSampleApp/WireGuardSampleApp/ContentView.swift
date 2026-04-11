@@ -24,7 +24,6 @@ import UIKit
 struct ContentView: View {
     @StateObject private var manager = TunnelManager()
 
-    @State private var configText: String = defaultConfigText
     @State private var statusText: String = "(tunnel not running)"
     @State private var statusTimer: Timer?
 
@@ -91,6 +90,30 @@ struct ContentView: View {
             }
 
             HStack(spacing: 8) {
+                Picker("Server", selection: Binding(
+                    get: { manager.selectedProfileID ?? manager.profiles.first?.id ?? UUID() },
+                    set: { manager.selectProfile($0) }
+                )) {
+                    ForEach(manager.profiles) { profile in
+                        Text(profile.name).tag(profile.id)
+                    }
+                }
+                .frame(minWidth: 180)
+                .disabled(manager.profiles.isEmpty)
+
+                TextField("Server name", text: Binding(
+                    get: { manager.selectedProfileName },
+                    set: { manager.selectedProfileName = $0 }
+                ))
+                .textFieldStyle(.roundedBorder)
+
+                Button("New Server") { manager.addProfile() }
+                Button("Delete") { manager.deleteSelectedProfile() }
+                    .disabled(manager.profiles.count <= 1)
+            }
+            .controlSize(.small)
+
+            HStack(spacing: 8) {
                 Picker("Routing", selection: $manager.routeMode) {
                     ForEach(RouteMode.allCases) { mode in
                         Text(mode.title).tag(mode)
@@ -99,13 +122,7 @@ struct ContentView: View {
                 .pickerStyle(.segmented)
 
                 Button("Save config") {
-                    Task {
-                        await manager.save(
-                            config: configText,
-                            routeMode: manager.routeMode,
-                            splitInjectedRoutes: manager.splitInjectedRoutes
-                        )
-                    }
+                    Task { await manager.saveCurrentProfile() }
                 }
                 Button("Connect") { manager.start() }
                     .disabled(manager.status == .connected || manager.status == .connecting)
@@ -198,7 +215,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 8) {
             Label("wg-quick config", systemImage: "doc.text")
                 .font(.headline)
-            TextEditor(text: $configText)
+            TextEditor(text: $manager.configText)
                 .font(.system(.body, design: .monospaced))
                 .padding(8)
                 .background(platformTextBackgroundColor)
