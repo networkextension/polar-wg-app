@@ -7,13 +7,13 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		105A85908F90D7E75F2F78D2 /* WireGuardCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D7590B05B3DAB3968FDE075F /* WireGuardCore.framework */; };
 		233F2B77088A2EFC97CA841E /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F68B3BA5F48F5EC794AD5B4A /* ContentView.swift */; };
 		33CEC2F008BE19DF3FCCB8CC /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C1E1487C149B0AA2F3513A95 /* NetworkExtension.framework */; };
 		4BCF3B2BEFBC2471FD021C0B /* PacketTunnelProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 386678E2A6DEE7D1256C415B /* PacketTunnelProvider.swift */; };
+		4CAB3AC5948F8083913CFB6F /* WireGuardCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 948E6AE9A45486E850A4732F /* WireGuardCore.xcframework */; };
 		6C77658770331D7875A01AFC /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C1E1487C149B0AA2F3513A95 /* NetworkExtension.framework */; };
 		B770F7EA9F13C6DAE8EEA7EB /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6DD0C6CC9148DA272B2ED184 /* Network.framework */; };
-		BE6671D2218AA8FB548E73F4 /* WireGuardTunnelExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = CBAC9655422F9D3AC04AAE1B /* WireGuardTunnelExtension.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		BE6671D2218AA8FB548E73F4 /* WireGuardTunnelExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = CBAC9655422F9D3AC04AAE1B /* WireGuardTunnelExtension.appex */; platformFilters = (ios, macos, tvos, xros, ); settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		C0ABC618F84E3E30BBDDCB6F /* WireGuardSampleAppApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 56DB40C402BE07E79E1F47FC /* WireGuardSampleAppApp.swift */; };
 		DE2D28CB79BA301C6EA56905 /* TunnelManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 620AD448CB9AE06AE7BE8DEC /* TunnelManager.swift */; };
 /* End PBXBuildFile section */
@@ -50,9 +50,9 @@
 		620AD448CB9AE06AE7BE8DEC /* TunnelManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelManager.swift; sourceTree = "<group>"; };
 		6DD0C6CC9148DA272B2ED184 /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = System/Library/Frameworks/Network.framework; sourceTree = SDKROOT; };
 		714FC0A62C1B90C5E5EDD1A3 /* WireGuardSampleApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WireGuardSampleApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		948E6AE9A45486E850A4732F /* WireGuardCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = WireGuardCore.xcframework; path = ../build/xcframework/WireGuardCore.xcframework; sourceTree = "<group>"; };
 		C1E1487C149B0AA2F3513A95 /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = System/Library/Frameworks/NetworkExtension.framework; sourceTree = SDKROOT; };
 		CBAC9655422F9D3AC04AAE1B /* WireGuardTunnelExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = WireGuardTunnelExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
-		D7590B05B3DAB3968FDE075F /* WireGuardCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WireGuardCore.framework; path = "../build/xcframework/WireGuardCore.xcframework/macos-arm64_x86_64/WireGuardCore.framework"; sourceTree = "<group>"; };
 		F68B3BA5F48F5EC794AD5B4A /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -71,7 +71,7 @@
 			files = (
 				6C77658770331D7875A01AFC /* NetworkExtension.framework in Frameworks */,
 				B770F7EA9F13C6DAE8EEA7EB /* Network.framework in Frameworks */,
-				105A85908F90D7E75F2F78D2 /* WireGuardCore.framework in Frameworks */,
+				4CAB3AC5948F8083913CFB6F /* WireGuardCore.xcframework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -120,7 +120,7 @@
 			children = (
 				6DD0C6CC9148DA272B2ED184 /* Network.framework */,
 				C1E1487C149B0AA2F3513A95 /* NetworkExtension.framework */,
-				D7590B05B3DAB3968FDE075F /* WireGuardCore.framework */,
+				948E6AE9A45486E850A4732F /* WireGuardCore.xcframework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -203,11 +203,9 @@
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
 					216DB126CDFBD38B6A15B8C3 = {
-						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
 					88676EB8880BC3EFBDE05943 = {
-						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -256,6 +254,12 @@
 /* Begin PBXTargetDependency section */
 		D2B8CBAA4EB74D35F938CD15 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
+			platformFilters = (
+				ios,
+				macos,
+				tvos,
+				xros,
+			);
 			target = 216DB126CDFBD38B6A15B8C3 /* WireGuardTunnelExtension */;
 			targetProxy = A22FCB28CA5F787CF31156CD /* PBXContainerItemProxy */;
 		};
@@ -337,19 +341,22 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = WireGuardTunnelExtension/WireGuardTunnelExtension.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = Z9XG3YEP93;
 				FRAMEWORK_SEARCH_PATHS = (
-					"$(SRCROOT)/../build/xcframework/WireGuardCore.xcframework/macos-arm64_x86_64",
-					"\"../build/xcframework/WireGuardCore.xcframework/macos-arm64_x86_64\"",
+					"$(inherited)",
+					"\"../build/xcframework\"",
 				);
 				INFOPLIST_FILE = WireGuardTunnelExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.6;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../../../../Frameworks";
-				OTHER_LDFLAGS = (
-					"-framework",
-					WireGuardCore,
-				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.change.wg.tunnel;
 				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = "$(AVAILABLE_PLATFORMS)";
+				SUPPORTS_MACCATALYST = YES;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = YES;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = YES;
 				SWIFT_VERSION = 5.9;
+				TARGETED_DEVICE_FAMILY = "1,2,3,4,6,7";
 			};
 			name = Release;
 		};
@@ -359,11 +366,17 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = WireGuardSampleApp/WireGuardSampleApp.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = Z9XG3YEP93;
 				ENABLE_PREVIEWS = YES;
 				INFOPLIST_FILE = WireGuardSampleApp/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.6;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
 				PRODUCT_BUNDLE_IDENTIFIER = com.change.wg;
 				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = "appletvos appletvsimulator iphoneos iphonesimulator macosx xros xrsimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = YES;
+				TARGETED_DEVICE_FAMILY = "1,2,3,7";
 			};
 			name = Debug;
 		};
@@ -372,19 +385,22 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = WireGuardTunnelExtension/WireGuardTunnelExtension.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = Z9XG3YEP93;
 				FRAMEWORK_SEARCH_PATHS = (
-					"$(SRCROOT)/../build/xcframework/WireGuardCore.xcframework/macos-arm64_x86_64",
-					"\"../build/xcframework/WireGuardCore.xcframework/macos-arm64_x86_64\"",
+					"$(inherited)",
+					"\"../build/xcframework\"",
 				);
 				INFOPLIST_FILE = WireGuardTunnelExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.6;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../../../../Frameworks";
-				OTHER_LDFLAGS = (
-					"-framework",
-					WireGuardCore,
-				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.change.wg.tunnel;
 				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = "$(AVAILABLE_PLATFORMS)";
+				SUPPORTS_MACCATALYST = YES;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = YES;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = YES;
 				SWIFT_VERSION = 5.9;
+				TARGETED_DEVICE_FAMILY = "1,2,3,4,6,7";
 			};
 			name = Debug;
 		};
@@ -394,11 +410,17 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = WireGuardSampleApp/WireGuardSampleApp.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = Z9XG3YEP93;
 				ENABLE_PREVIEWS = YES;
 				INFOPLIST_FILE = WireGuardSampleApp/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.6;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
 				PRODUCT_BUNDLE_IDENTIFIER = com.change.wg;
 				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = "appletvos appletvsimulator iphoneos iphonesimulator macosx xros xrsimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = YES;
+				TARGETED_DEVICE_FAMILY = "1,2,3,7";
 			};
 			name = Release;
 		};

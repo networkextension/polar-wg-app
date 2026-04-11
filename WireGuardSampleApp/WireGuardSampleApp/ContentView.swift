@@ -14,6 +14,12 @@
 
 import SwiftUI
 import NetworkExtension
+#if canImport(AppKit)
+import AppKit
+#endif
+#if canImport(UIKit)
+import UIKit
+#endif
 
 struct ContentView: View {
     @StateObject private var manager = TunnelManager()
@@ -23,38 +29,21 @@ struct ContentView: View {
     @State private var statusTimer: Timer?
 
     var body: some View {
-        VStack(spacing: 12) {
-            header
+        ZStack {
+            LinearGradient(
+                colors: [Color.accentColor.opacity(0.08), Color.clear],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
 
-            HSplitView {
-                VStack(alignment: .leading, spacing: 8) {
-                    Label("wg-quick config", systemImage: "doc.text")
-                        .font(.headline)
-                    TextEditor(text: $configText)
-                        .font(.system(.body, design: .monospaced))
-                        .border(Color.secondary.opacity(0.4))
-                }
-                .padding(.trailing, 6)
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Label("UAPI status (get=1)", systemImage: "antenna.radiowaves.left.and.right")
-                        .font(.headline)
-                    ScrollView {
-                        Text(statusText)
-                            .font(.system(.caption, design: .monospaced))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .textSelection(.enabled)
-                            .padding(8)
-                    }
-                    .background(Color(NSColor.textBackgroundColor))
-                    .border(Color.secondary.opacity(0.4))
-                }
-                .padding(.leading, 6)
+            VStack(spacing: 12) {
+                header
+                contentArea
+                actionsBar
             }
-
-            actionsBar
+            .padding(16)
         }
-        .padding(16)
         .task {
             await manager.load()
             statusTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
@@ -69,17 +58,54 @@ struct ContentView: View {
 
     // MARK: - Sections
 
+    @ViewBuilder
+    private var contentArea: some View {
+#if os(macOS)
+        HSplitView {
+            configPanel
+                .padding(.trailing, 6)
+            statusPanel
+                .padding(.leading, 6)
+        }
+#else
+        ScrollView {
+            VStack(spacing: 12) {
+                configPanel
+                statusPanel
+            }
+            .frame(maxWidth: .infinity)
+        }
+#endif
+    }
+
     private var header: some View {
-        HStack(spacing: 12) {
-            Text("WireGuard NE Sample")
-                .font(.title2.bold())
-            Spacer()
-            statusPill
-            Button("Save config")    { Task { await manager.save(config: configText) } }
-            Button("Connect")        { manager.start() }
-                .disabled(manager.status == .connected || manager.status == .connecting)
-            Button("Disconnect")     { manager.stop() }
-                .disabled(manager.status != .connected && manager.status != .connecting)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: "shield.lefthalf.filled.badge.checkmark")
+                    .font(.title2)
+                    .foregroundStyle(Color.accentColor)
+                Text("WireGuard NE Sample")
+                    .font(.title2.bold())
+                Spacer()
+                statusPill
+            }
+
+            HStack(spacing: 8) {
+                Picker("Routing", selection: $manager.routeMode) {
+                    ForEach(RouteMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                Button("Save config") { Task { await manager.save(config: configText, routeMode: manager.routeMode) } }
+                Button("Connect") { manager.start() }
+                    .disabled(manager.status == .connected || manager.status == .connecting)
+                Button("Disconnect") { manager.stop() }
+                    .disabled(manager.status != .connected && manager.status != .connecting)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
         }
     }
 
@@ -140,7 +166,46 @@ struct ContentView: View {
         }
     }
 
+    private var configPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("wg-quick config", systemImage: "doc.text")
+                .font(.headline)
+            TextEditor(text: $configText)
+                .font(.system(.body, design: .monospaced))
+                .padding(8)
+                .background(platformTextBackgroundColor)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+        .panelCardStyle()
+    }
+
+    private var statusPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("UAPI status (get=1)", systemImage: "antenna.radiowaves.left.and.right")
+                .font(.headline)
+            ScrollView {
+                Text(statusText)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .padding(8)
+            }
+            .frame(minHeight: 180)
+            .background(platformTextBackgroundColor)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+        .panelCardStyle()
+    }
+
     // MARK: - Helpers
+
+    private var platformTextBackgroundColor: Color {
+#if os(macOS)
+        return Color(nsColor: .textBackgroundColor)
+#else
+        return Color(uiColor: .secondarySystemBackground)
+#endif
+    }
 
     private func refreshStatus() async {
         guard manager.status == .connected else {
@@ -158,6 +223,19 @@ struct ContentView: View {
         let resp = await manager.uapiSet(body) ?? "(no response)"
         // Tack the response on top so the user can see what came back.
         statusText = "── last SET response ──\n" + resp + "\n\n" + statusText
+    }
+}
+
+private extension View {
+    func panelCardStyle() -> some View {
+        self
+            .padding(12)
+            .background(Color.secondary.opacity(0.08))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 }
 

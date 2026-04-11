@@ -32,6 +32,7 @@ import Foundation
 import NetworkExtension
 import os.log
 import WireGuardCore
+import Darwin
 
 private let log = OSLog(subsystem: "com.example.wireguard", category: "tunnel")
 
@@ -43,6 +44,21 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var udpSession: NWUDPSession?
     private var tickTimer: DispatchSourceTimer?
     private var peerHost: NWHostEndpoint?       // current UDP destination
+    private var routeDebugInfo: String = "(route debug not initialized)"
+    private var selectedEndpointDebug: String = "(none)"
+    private var selectedLocalBindDebug: String = "(auto)"
+
+    private enum RouteMode: String {
+        case full
+        case split
+
+        var displayName: String {
+            switch self {
+            case .full: return "full"
+            case .split: return "split"
+            }
+        }
+    }
 
     // MARK: - Lifecycle
 
@@ -57,6 +73,13 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             completionHandler(ProviderError.missingConfig)
             return
         }
+        let routeMode: RouteMode = {
+            if let raw = proto.providerConfiguration?["routeMode"] as? String,
+               let mode = RouteMode(rawValue: raw) {
+                return mode
+            }
+            return .full
+        }()
 
         // 2. Build the C session with callbacks pointing back at self.
         //    We pass an unretained Unmanaged<PacketTunnelProvider> as the
@@ -84,7 +107,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         // 3. Build NEPacketTunnelNetworkSettings from the session's
         //    introspection API: interface addresses, peer allowed-ips.
-        let settings = buildNetworkSettings(for: session)
+        let settings = buildNetworkSettings(for: session, configText: configText, routeMode: routeMode)
 
         // 4. Hand the settings to the system. Once this completes,
         //    packetFlow is ready and we can start the read loops.
@@ -98,10 +121,21 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
 
             // 5. Open a UDP session to the first peer's endpoint.
-            if let endpoint = self.firstPeerEndpoint(for: session) {
+            if let endpoint = self.firstPeerEndpoint(for: session)
+                ?? self.firstPeerEndpointFromConfig(configText) {
                 self.peerHost = endpoint
-                self.udpSession = self.createUDPSession(to: endpoint, from: nil)
+                self.selectedEndpointDebug = "\(endpoint.hostname):\(endpoint.port)"
+                let localBind = self.localBindEndpointIfSameSubnet(peerEndpoint: endpoint)
+                if let localBind {
+                    self.selectedLocalBindDebug = "\(localBind.hostname):\(localBind.port)"
+                } else {
+                    self.selectedLocalBindDebug = "(none)"
+                }
+                self.udpSession = self.createUDPSession(to: endpoint, from: localBind)
                 self.attachUDPReadHandler()
+            } else {
+                self.selectedEndpointDebug = "(none)"
+                self.selectedLocalBindDebug = "(none)"
             }
 
             // 6. Start reading from the tunnel packetFlow.
@@ -172,7 +206,8 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             buf.withUnsafeMutableBufferPointer { p in
                 _ = wg_session_get_uapi(session, p.baseAddress, p.count)
             }
-            return String(cString: buf)
+            let uapi = String(cString: buf)
+            return uapi + routeDebugInfo + "\n"
         }
         if firstLine == "set=1" {
             // Forward the entire request body into the C parser. The
@@ -193,17 +228,24 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     // MARK: - NE plumbing
 
-    private func buildNetworkSettings(for session: OpaquePointer) -> NEPacketTunnelNetworkSettings {
-        // Tunnel remote address is cosmetic for wg; use the first peer endpoint
-        // if available, otherwise "0.0.0.0".
-        let remote = firstPeerEndpoint(for: session)?.hostname ?? "0.0.0.0"
+    private func buildNetworkSettings(for session: OpaquePointer, configText: String, routeMode: RouteMode) -> NEPacketTunnelNetworkSettings {
+        // Tunnel remote address — cosmetic, shown in System Settings → VPN.
+        // Pull it from the first peer's endpoint via the wg_session
+        // introspection API, which is now the canonical source of truth
+        // (parsed from the config + resolved via getaddrinfo at create time).
+        let configEndpointHost = firstEndpointHost(from: configText)
+        let remote = peerEndpoint(session: session, index: 0)?.hostname
+            ?? configEndpointHost
+            ?? "0.0.0.0"
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: remote)
 
-        // Interface addresses.
+        // ── Interface addresses ──────────────────────────────────────────
         var v4Addrs: [String] = []
         var v4Masks: [String] = []
         var v6Addrs: [String] = []
         var v6Prefix: [NSNumber] = []
+        var v4IfacePrefix: [Int] = []   // held so we can auto-add the
+                                        // interface subnet to includedRoutes
 
         var addrBuf = [CChar](repeating: 0, count: 64)
         let n = wg_session_iface_addr_count(session)
@@ -218,38 +260,193 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             if family == AF_INET {
                 v4Addrs.append(addr)
                 v4Masks.append(prefixLengthToSubnetMask(Int(prefix)))
+                v4IfacePrefix.append(Int(prefix))
             } else if family == AF_INET6 {
                 v6Addrs.append(addr)
                 v6Prefix.append(NSNumber(value: prefix))
             }
         }
+
+        // ── includedRoutes: from every peer's AllowedIPs ─────────────────
+        // ── excludedRoutes: every peer's outer endpoint /32|/128, so the
+        //    extension's own UDP to the peer does NOT loop back through
+        //    utun and get dropped. This is the classic NE packet-tunnel
+        //    trap: includedRoutes=0.0.0.0/0 without excluding the peer
+        //    endpoint means the kernel routes the outer wireguard UDP
+        //    through the same utun we're implementing, and the handshake
+        //    silently never completes. tx_bytes=0 / rx_bytes=0 /
+        //    last_handshake_time_sec=0 is the smoking gun.
+        var included4: [NEIPv4Route] = []
+        var excluded4: [NEIPv4Route] = []
+        var included6: [NEIPv6Route] = []
+        var excluded6: [NEIPv6Route] = []
+
+        let peerCount = Int(wg_session_peer_count(session))
+        for p in 0..<peerCount {
+            let aipCount = Int(wg_session_peer_allowed_count(session, Int32(p)))
+            for a in 0..<aipCount {
+                var cidrBuf = [CChar](repeating: 0, count: 64)
+                var prefix: Int32 = 0
+                var family: Int32 = 0
+                let rc = cidrBuf.withUnsafeMutableBufferPointer { ptr in
+                    wg_session_peer_allowed_get(session, Int32(p), Int32(a),
+                                                ptr.baseAddress, &prefix, &family)
+                }
+                guard rc == 0 else { continue }
+                let addr = String(cString: cidrBuf)
+                if family == AF_INET {
+                    if prefix == 0 {
+                        if routeMode == .full {
+                            included4.append(NEIPv4Route.default())
+                        }
+                    } else {
+                        included4.append(NEIPv4Route(
+                            destinationAddress: addr,
+                            subnetMask: prefixLengthToSubnetMask(Int(prefix))
+                        ))
+                    }
+                } else if family == AF_INET6 {
+                    if prefix == 0 {
+                        if routeMode == .full {
+                            included6.append(NEIPv6Route.default())
+                        }
+                    } else {
+                        included6.append(NEIPv6Route(
+                            destinationAddress: addr,
+                            networkPrefixLength: NSNumber(value: prefix)
+                        ))
+                    }
+                }
+            }
+
+            // Peer endpoint → excludedRoutes
+            if routeMode == .full, let ep = peerEndpoint(session: session, index: p) {
+                let host = resolvedIPAddress(for: ep.hostname) ?? ep.hostname
+                if isIPv6Literal(host) {
+                    excluded6.append(NEIPv6Route(
+                        destinationAddress: host,
+                        networkPrefixLength: 128
+                    ))
+                } else if isIPv4Literal(host) {
+                    excluded4.append(NEIPv4Route(
+                        destinationAddress: host,
+                        subnetMask: "255.255.255.255"
+                    ))
+                }
+            }
+        }
+
+        // Fallback: if endpoint introspection did not yield exclusions, parse
+        // endpoint host from config text to avoid endpoint-via-utun loops.
+        if routeMode == .full, excluded4.isEmpty && excluded6.isEmpty, let endpointHost = configEndpointHost {
+            let host = resolvedIPAddress(for: endpointHost) ?? endpointHost
+            if isIPv6Literal(host) {
+                excluded6.append(NEIPv6Route(
+                    destinationAddress: host,
+                    networkPrefixLength: 128
+                ))
+            } else if isIPv4Literal(host) {
+                excluded4.append(NEIPv4Route(
+                    destinationAddress: host,
+                    subnetMask: "255.255.255.255"
+                ))
+            }
+        }
+
+        // Keep RFC1918 private networks off-tunnel so local LAN / virtual
+        // lab ranges stay directly reachable:
+        //   10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+        if routeMode == .full {
+            excluded4.append(NEIPv4Route(
+                destinationAddress: "10.0.0.0",
+                subnetMask: "255.0.0.0"
+            ))
+            excluded4.append(NEIPv4Route(
+                destinationAddress: "192.168.0.0",
+                subnetMask: "255.255.0.0"
+            ))
+        }
+
+        // Belt and braces: add the interface subnets themselves to
+        // includedRoutes so `ping 10.88.0.1` when Address=10.88.0.2/24
+        // definitely resolves through utun, even if a downstream
+        // AllowedIPs list is narrower than the interface subnet.
+        for (i, addr) in v4Addrs.enumerated() {
+            let prefix = v4IfacePrefix[i]
+            if let net = networkAddress(of: addr, prefixLength: prefix) {
+                included4.append(NEIPv4Route(
+                    destinationAddress: net,
+                    subnetMask: prefixLengthToSubnetMask(prefix)
+                ))
+            }
+        }
+
         if !v4Addrs.isEmpty {
-            settings.ipv4Settings = NEIPv4Settings(addresses: v4Addrs, subnetMasks: v4Masks)
-            settings.ipv4Settings?.includedRoutes = [NEIPv4Route.default()]
+            let s4 = NEIPv4Settings(addresses: v4Addrs, subnetMasks: v4Masks)
+            if routeMode == .full {
+                s4.includedRoutes = included4.isEmpty ? [NEIPv4Route.default()] : included4
+                s4.excludedRoutes = excluded4
+            } else {
+                s4.includedRoutes = included4
+                s4.excludedRoutes = []
+            }
+            settings.ipv4Settings = s4
         }
         if !v6Addrs.isEmpty {
-            settings.ipv6Settings = NEIPv6Settings(addresses: v6Addrs, networkPrefixLengths: v6Prefix)
-            settings.ipv6Settings?.includedRoutes = [NEIPv6Route.default()]
+            let s6 = NEIPv6Settings(addresses: v6Addrs, networkPrefixLengths: v6Prefix)
+            if routeMode == .full {
+                s6.includedRoutes = included6.isEmpty ? [NEIPv6Route.default()] : included6
+                s6.excludedRoutes = excluded6
+            } else {
+                s6.includedRoutes = included6
+                s6.excludedRoutes = []
+            }
+            settings.ipv6Settings = s6
         }
 
         // MTU matches wg_core: 1420 gives us 60 bytes of outer overhead headroom.
         settings.mtu = 1420
+        routeDebugInfo = renderRouteDebug(
+            mode: routeMode,
+            tunnelRemote: remote,
+            included4: included4,
+            excluded4: excluded4,
+            included6: included6,
+            excluded6: excluded6
+        )
         return settings
     }
 
-    private func firstPeerEndpoint(for session: OpaquePointer) -> NWHostEndpoint? {
-        // wg_session does not currently expose the endpoint host/port back
-        // to Swift (it only carries resolved sockaddr inside). For the
-        // MVP, the caller passes the endpoint via providerConfiguration
-        // separately. This helper exists as a hook for when we add a
-        // peer-endpoint getter to the C API.
-        guard let proto = protocolConfiguration as? NETunnelProviderProtocol,
-              let ep = proto.providerConfiguration?["endpoint"] as? String else {
-            return nil
+    /// Read peer `i`'s current endpoint out of the wg_session and return
+    /// it as an NWHostEndpoint. Returns nil if the peer is responder-only
+    /// (has not roamed yet) or `i` is out of range.
+    private func peerEndpoint(session: OpaquePointer, index: Int) -> NWHostEndpoint? {
+        var addrBuf = [CChar](repeating: 0, count: 80)
+        var port: UInt16 = 0
+        let rc = addrBuf.withUnsafeMutableBufferPointer { ptr in
+            wg_session_peer_endpoint(session, Int32(index), ptr.baseAddress, &port)
         }
-        let parts = ep.split(separator: ":", maxSplits: 1).map(String.init)
-        guard parts.count == 2 else { return nil }
-        return NWHostEndpoint(hostname: parts[0], port: parts[1])
+        guard rc == 0 else { return nil }
+        let host = String(cString: addrBuf)
+        return NWHostEndpoint(hostname: host, port: String(port))
+    }
+
+    private func firstPeerEndpoint(for session: OpaquePointer) -> NWHostEndpoint? {
+        peerEndpoint(session: session, index: 0)
+    }
+
+    private func firstPeerEndpointFromConfig(_ configText: String) -> NWHostEndpoint? {
+        for line in configText.split(whereSeparator: \.isNewline) {
+            let raw = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !raw.isEmpty, !raw.hasPrefix("#"), !raw.hasPrefix(";") else { continue }
+            let lower = raw.lowercased()
+            guard lower.hasPrefix("endpoint") else { continue }
+            guard let eq = raw.firstIndex(of: "=") else { continue }
+            let rhs = raw[raw.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+            guard let parsed = parseEndpoint(rhs) else { continue }
+            return NWHostEndpoint(hostname: parsed.host, port: parsed.port)
+        }
+        return nil
     }
 
     private func attachUDPReadHandler() {
@@ -312,8 +509,12 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     // `self` from the user_ctx pointer the session was created with.
 
     fileprivate func writeDatagram(_ bytes: UnsafePointer<UInt8>, length: Int) {
+        guard let udpSession = udpSession else {
+            os_log("udp write dropped: udpSession is nil", log: log, type: .error)
+            return
+        }
         let data = Data(bytes: bytes, count: length)
-        udpSession?.writeDatagram(data) { err in
+        udpSession.writeDatagram(data) { err in
             if let err = err {
                 os_log("udp write error: %{public}@", log: log, type: .error,
                        String(describing: err))
@@ -341,6 +542,192 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         sin.sin_family = sa_family_t(AF_INET)
         sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         return sin
+    }
+
+    private func isIPv4Literal(_ host: String) -> Bool {
+        var addr = in_addr()
+        return host.withCString { inet_pton(AF_INET, $0, &addr) == 1 }
+    }
+
+    private func isIPv6Literal(_ host: String) -> Bool {
+        var addr = in6_addr()
+        return host.withCString { inet_pton(AF_INET6, $0, &addr) == 1 }
+    }
+
+    private func resolvedIPAddress(for host: String) -> String? {
+        let normalized = normalizeEndpointHost(host)
+        if isIPv4Literal(normalized) || isIPv6Literal(normalized) {
+            return normalized
+        }
+        var hints = addrinfo(
+            ai_flags: AI_ADDRCONFIG,
+            ai_family: AF_UNSPEC,
+            ai_socktype: SOCK_DGRAM,
+            ai_protocol: IPPROTO_UDP,
+            ai_addrlen: 0,
+            ai_canonname: nil,
+            ai_addr: nil,
+            ai_next: nil
+        )
+        var result: UnsafeMutablePointer<addrinfo>?
+        let rc = getaddrinfo(normalized, nil, &hints, &result)
+        guard rc == 0, let first = result else { return nil }
+        defer { freeaddrinfo(first) }
+
+        var nameBuf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        let ni = getnameinfo(
+            first.pointee.ai_addr,
+            first.pointee.ai_addrlen,
+            &nameBuf,
+            socklen_t(nameBuf.count),
+            nil,
+            0,
+            NI_NUMERICHOST
+        )
+        guard ni == 0 else { return nil }
+        return String(cString: nameBuf)
+    }
+
+    private func firstEndpointHost(from configText: String) -> String? {
+        for line in configText.split(whereSeparator: \.isNewline) {
+            let raw = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !raw.isEmpty, !raw.hasPrefix("#"), !raw.hasPrefix(";") else { continue }
+            let lower = raw.lowercased()
+            guard lower.hasPrefix("endpoint") else { continue }
+            guard let eq = raw.firstIndex(of: "=") else { continue }
+            let rhs = raw[raw.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+            let host = normalizeEndpointHost(rhs)
+            if !host.isEmpty { return host }
+        }
+        return nil
+    }
+
+    private func normalizeEndpointHost(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("["),
+           let close = trimmed.firstIndex(of: "]") {
+            return String(trimmed[trimmed.index(after: trimmed.startIndex)..<close])
+        }
+        // IPv4 / hostname with :port.
+        if let colon = trimmed.lastIndex(of: ":"), !trimmed.contains("]"), !trimmed[..<colon].contains(":") {
+            return String(trimmed[..<colon])
+        }
+        return trimmed
+    }
+
+    private func parseEndpoint(_ value: String) -> (host: String, port: String)? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        if trimmed.hasPrefix("["),
+           let close = trimmed.firstIndex(of: "]"),
+           close < trimmed.endIndex {
+            let host = String(trimmed[trimmed.index(after: trimmed.startIndex)..<close])
+            let rest = trimmed[trimmed.index(after: close)...]
+            if rest.hasPrefix(":") {
+                let port = String(rest.dropFirst())
+                if !host.isEmpty, !port.isEmpty { return (host, port) }
+            }
+            return nil
+        }
+
+        if let colon = trimmed.lastIndex(of: ":"),
+           !trimmed[..<colon].contains(":"),
+           colon < trimmed.endIndex {
+            let host = String(trimmed[..<colon])
+            let port = String(trimmed[trimmed.index(after: colon)...])
+            if !host.isEmpty, !port.isEmpty { return (host, port) }
+        }
+        return nil
+    }
+
+    private func localBindEndpointIfSameSubnet(peerEndpoint: NWHostEndpoint) -> NWHostEndpoint? {
+        guard let peerIP = resolvedIPAddress(for: peerEndpoint.hostname),
+              isIPv4Literal(peerIP) else {
+            return nil
+        }
+        guard let chosen = firstLocalIPv4InSameSubnet(as: peerIP) else {
+            return nil
+        }
+        return NWHostEndpoint(hostname: chosen, port: "0")
+    }
+
+    private func firstLocalIPv4InSameSubnet(as peerIP: String) -> String? {
+        var peerAddr = in_addr()
+        guard peerIP.withCString({ inet_pton(AF_INET, $0, &peerAddr) }) == 1 else {
+            return nil
+        }
+        let peer = UInt32(bigEndian: peerAddr.s_addr)
+
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
+        defer { freeifaddrs(first) }
+
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let current = cursor {
+            let ifa = current.pointee
+            let name = String(cString: ifa.ifa_name)
+            cursor = ifa.ifa_next
+
+            // Avoid loopback and utun addresses.
+            if name == "lo0" || name.hasPrefix("utun") { continue }
+            guard let addrPtr = ifa.ifa_addr, let maskPtr = ifa.ifa_netmask else { continue }
+            guard Int32(addrPtr.pointee.sa_family) == AF_INET,
+                  Int32(maskPtr.pointee.sa_family) == AF_INET else { continue }
+
+            let sin = withUnsafePointer(to: addrPtr.pointee) {
+                $0.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+            }
+            let msk = withUnsafePointer(to: maskPtr.pointee) {
+                $0.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+            }
+
+            let local = UInt32(bigEndian: sin.sin_addr.s_addr)
+            let mask = UInt32(bigEndian: msk.sin_addr.s_addr)
+            guard mask != 0 else { continue }
+
+            if (local & mask) == (peer & mask) {
+                var ip = sin.sin_addr
+                var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                if inet_ntop(AF_INET, &ip, &buf, socklen_t(INET_ADDRSTRLEN)) != nil {
+                    return String(cString: buf)
+                }
+            }
+        }
+        return nil
+    }
+
+    private func renderRouteDebug(
+        mode: RouteMode,
+        tunnelRemote: String,
+        included4: [NEIPv4Route],
+        excluded4: [NEIPv4Route],
+        included6: [NEIPv6Route],
+        excluded6: [NEIPv6Route]
+    ) -> String {
+        let inc4 = included4.map { "\($0.destinationAddress)/\($0.destinationSubnetMask)" }.prefix(12)
+        let exc4 = excluded4.map { "\($0.destinationAddress)/\($0.destinationSubnetMask)" }.prefix(12)
+        let inc6 = included6.map { "\($0.destinationAddress)/\($0.destinationNetworkPrefixLength)" }.prefix(12)
+        let exc6 = excluded6.map { "\($0.destinationAddress)/\($0.destinationNetworkPrefixLength)" }.prefix(12)
+        let peer = peerHost?.hostname ?? "(none)"
+
+        return """
+
+        route_mode=\(mode.displayName)
+        tunnel_remote=\(tunnelRemote)
+        peer_host=\(peer)
+        selected_endpoint=\(selectedEndpointDebug)
+        selected_local_bind=\(selectedLocalBindDebug)
+        udp_session=\(udpSession == nil ? "nil" : "active")
+        included_v4_count=\(included4.count)
+        excluded_v4_count=\(excluded4.count)
+        included_v6_count=\(included6.count)
+        excluded_v6_count=\(excluded6.count)
+        included_v4=\(inc4.joined(separator: ","))
+        excluded_v4=\(exc4.joined(separator: ","))
+        included_v6=\(inc6.joined(separator: ","))
+        excluded_v6=\(exc6.joined(separator: ","))
+        """
     }
 
     // MARK: - Errors
@@ -404,4 +791,20 @@ private func prefixLengthToSubnetMask(_ prefix: Int) -> String {
         (mask >>  8) & 0xff,
          mask        & 0xff
     )
+}
+
+private func networkAddress(of address: String, prefixLength: Int) -> String? {
+    guard (0...32).contains(prefixLength) else { return nil }
+    var rawAddr = in_addr()
+    let parsed = address.withCString { inet_pton(AF_INET, $0, &rawAddr) }
+    guard parsed == 1 else { return nil }
+
+    let hostOrder = UInt32(bigEndian: rawAddr.s_addr)
+    let mask: UInt32 = prefixLength == 0 ? 0 : (UInt32.max << (32 - prefixLength))
+    let netOrder = (hostOrder & mask).bigEndian
+
+    var netAddr = in_addr(s_addr: netOrder)
+    var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+    guard inet_ntop(AF_INET, &netAddr, &buf, socklen_t(INET_ADDRSTRLEN)) != nil else { return nil }
+    return String(cString: buf)
 }

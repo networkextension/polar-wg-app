@@ -54,6 +54,12 @@ settings:
 # opening the .xcodeproj.
 packages: {}
 
+schemes:
+  WireGuardSampleApp:
+    build:
+      targets:
+        WireGuardSampleApp: all
+
 targets:
   WireGuardSampleApp:
     type: application
@@ -91,20 +97,12 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.change.wg.tunnel
         INFOPLIST_FILE: WireGuardTunnelExtension/Info.plist
         CODE_SIGN_ENTITLEMENTS: WireGuardTunnelExtension/WireGuardTunnelExtension.entitlements
-        # Embed the WireGuardCore.xcframework as a static dependency.
-        # The framework is built outside Xcode by `make xcframework` —
-        # see ../scripts/build-xcframework.sh.
-        FRAMEWORK_SEARCH_PATHS:
-          - "$(SRCROOT)/../build/xcframework/WireGuardCore.xcframework/macos-arm64_x86_64"
-        OTHER_LDFLAGS:
-          - "-framework"
-          - "WireGuardCore"
         # NetworkExtension extension scaffolding.
         SWIFT_VERSION: "5.9"
         LD_RUNPATH_SEARCH_PATHS: "@executable_path/../../../../Frameworks"
     dependencies:
       - sdk: NetworkExtension.framework
       - sdk: Network.framework
-      - framework: ../build/xcframework/WireGuardCore.xcframework/macos-arm64_x86_64/WireGuardCore.framework
+      - framework: ../build/xcframework/WireGuardCore.xcframework
         embed: false
         codeSign: false

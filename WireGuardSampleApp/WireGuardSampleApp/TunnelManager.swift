@@ -21,10 +21,25 @@ import Foundation
 import NetworkExtension
 import Combine
 
+enum RouteMode: String, CaseIterable, Identifiable {
+    case full
+    case split
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .full: return "Full Tunnel"
+        case .split: return "Split Tunnel"
+        }
+    }
+}
+
 @MainActor
 final class TunnelManager: ObservableObject {
     @Published var status: NEVPNStatus = .invalid
     @Published var lastError: String?
+    @Published var routeMode: RouteMode = .full
 
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
@@ -41,6 +56,11 @@ final class TunnelManager: ObservableObject {
         do {
             let managers = try await NETunnelProviderManager.loadAllFromPreferences()
             manager = managers.first ?? NETunnelProviderManager()
+            if let proto = manager?.protocolConfiguration as? NETunnelProviderProtocol,
+               let saved = proto.providerConfiguration?["routeMode"] as? String,
+               let parsed = RouteMode(rawValue: saved) {
+                routeMode = parsed
+            }
             attachStatusObserver()
             refreshStatus()
         } catch {
@@ -51,7 +71,7 @@ final class TunnelManager: ObservableObject {
     /// Persist a wg-quick-style config text to the tunnel preference.
     /// The first call also installs the provider in System Settings —
     /// macOS will pop a permission dialog.
-    func save(config: String) async {
+    func save(config: String, routeMode: RouteMode) async {
         guard let m = manager else { return }
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = "com.change.wg.tunnel"
@@ -59,7 +79,10 @@ final class TunnelManager: ObservableObject {
         // VPN UI as the "server". Pull the first Endpoint line out of
         // the config text if we can find one.
         proto.serverAddress = firstEndpointFrom(config: config) ?? "wireguard"
-        proto.providerConfiguration = ["config": config]
+        proto.providerConfiguration = [
+            "config": config,
+            "routeMode": routeMode.rawValue
+        ]
         m.protocolConfiguration = proto
         m.localizedDescription = "WireGuard Sample"
         m.isEnabled = true
@@ -68,6 +91,7 @@ final class TunnelManager: ObservableObject {
             try await m.loadFromPreferences()
             attachStatusObserver()
             refreshStatus()
+            self.routeMode = routeMode
             lastError = nil
         } catch {
             lastError = "save: \(error.localizedDescription)"
