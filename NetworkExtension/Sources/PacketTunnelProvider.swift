@@ -213,7 +213,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
                 _ = wg_session_get_uapi(session, p.baseAddress, p.count)
             }
             let uapi = String(cString: buf)
-            return uapi + routeDebugInfo + "\n"
+            return uapi + routeDebugInfo + renderLiveDebug(for: session) + "\n"
         }
         if firstLine == "set=1" {
             // Forward the entire request body into the C parser. The
@@ -739,17 +739,12 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         let exc4 = excluded4.map { "\($0.destinationAddress)/\($0.destinationSubnetMask)" }.prefix(12)
         let inc6 = included6.map { "\($0.destinationAddress)/\($0.destinationNetworkPrefixLength)" }.prefix(12)
         let exc6 = excluded6.map { "\($0.destinationAddress)/\($0.destinationNetworkPrefixLength)" }.prefix(12)
-        let peer = peerHost?.hostname ?? "(none)"
         let injected = parseInjectedCIDRs(splitInjectedRoutes).map { "\($0.address)/\($0.prefix)" }
 
         return """
 
         route_mode=\(mode.displayName)
         tunnel_remote=\(tunnelRemote)
-        peer_host=\(peer)
-        selected_endpoint=\(selectedEndpointDebug)
-        selected_local_bind=\(selectedLocalBindDebug)
-        udp_session=\(udpSession == nil ? "nil" : "active")
         included_v4_count=\(included4.count)
         excluded_v4_count=\(excluded4.count)
         included_v6_count=\(included6.count)
@@ -760,6 +755,26 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         excluded_v6=\(exc6.joined(separator: ","))
         injected_route_count=\(injected.count)
         injected_routes=\(injected.joined(separator: ","))
+        """
+    }
+
+    private func renderLiveDebug(for session: OpaquePointer) -> String {
+        let livePeer = peerHost?.hostname ?? "(none)"
+        let liveSessionEndpoint: String = {
+            if let ep = firstPeerEndpoint(for: session) {
+                return "\(ep.hostname):\(ep.port)"
+            }
+            return "(none)"
+        }()
+        let hasUdp = udpSession == nil ? "nil" : "active"
+
+        return """
+
+        live_peer_host=\(livePeer)
+        live_session_endpoint=\(liveSessionEndpoint)
+        selected_endpoint=\(selectedEndpointDebug)
+        selected_local_bind=\(selectedLocalBindDebug)
+        udp_session=\(hasUdp)
         """
     }
 
