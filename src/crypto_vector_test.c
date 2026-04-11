@@ -836,6 +836,136 @@ static int test_wg_session_uapi_get(void)
     return 0;
 }
 
+/* Exercise wg_session_set_uapi: load a config, mutate the peer's
+ * endpoint + keepalive + allowed-ips via a SET request, then re-read
+ * via GET and verify every change took effect. */
+static int test_wg_session_uapi_set(void)
+{
+    static const char cfg[] =
+        "[Interface]\n"
+        "PrivateKey = yPDHiay/NDkJE9OyUT0J8qhuJXpihZw1aD7Xl4JJEVw=\n"
+        "Address    = 10.88.0.2/24\n"
+        "ListenPort = 51823\n"
+        "[Peer]\n"
+        "PublicKey  = XXFzbjDln02y/aWfo2RFVZ/foiMC/NEo9QKXDdk9SXk=\n"
+        "AllowedIPs = 10.88.0.0/24\n"
+        "PersistentKeepalive = 25\n";
+
+    wg_session_callbacks cb = {0};
+    cb.send_udp   = uapi_test_send;
+    cb.deliver_ip = uapi_test_deliver;
+    cb.log_line   = uapi_test_log;
+
+    wg_session_t *s = wg_session_create(cfg, sizeof(cfg) - 1, cb);
+    if (!s) { printf("[FAIL] set: create\n"); return 1; }
+
+    /* The peer pubkey we'll mutate (XXFzbjDln02y/...) hex-encoded. */
+    static const char *peer_hex =
+        "5d71736e30e59f4db2fda59fa36445559fdfa22302fcd128f502970dd93d4979";
+
+    /* SET request: change endpoint, change keepalive, replace
+     * allowed-ips with two new CIDRs. */
+    char setreq[1024];
+    snprintf(setreq, sizeof(setreq),
+             "set=1\n"
+             "public_key=%s\n"
+             "endpoint=192.0.2.5:51820\n"
+             "persistent_keepalive_interval=42\n"
+             "replace_allowed_ips=true\n"
+             "allowed_ip=10.99.0.0/16\n"
+             "allowed_ip=10.99.0.0/24\n"
+             "\n",
+             peer_hex);
+
+    if (wg_session_set_uapi(s, setreq, strlen(setreq)) != 0) {
+        printf("[FAIL] set: wg_session_set_uapi returned non-zero\n");
+        wg_session_destroy(s);
+        return 1;
+    }
+
+    /* Verify via the introspection getters. */
+    char addr[80] = {0};
+    uint16_t port = 0;
+    if (wg_session_peer_endpoint(s, 0, addr, &port) != 0 ||
+        strcmp(addr, "192.0.2.5") != 0 || port != 51820) {
+        printf("[FAIL] set: endpoint not updated (got %s:%u)\n", addr, port);
+        wg_session_destroy(s);
+        return 1;
+    }
+    if (wg_session_peer_keepalive(s, 0) != 42) {
+        printf("[FAIL] set: keepalive=%d\n", wg_session_peer_keepalive(s, 0));
+        wg_session_destroy(s);
+        return 1;
+    }
+    if (wg_session_peer_allowed_count(s, 0) != 2) {
+        printf("[FAIL] set: allowed_count=%d\n",
+               wg_session_peer_allowed_count(s, 0));
+        wg_session_destroy(s);
+        return 1;
+    }
+
+    /* Re-read as UAPI GET and verify the canonical fields reflect the
+     * change. */
+    int need = wg_session_get_uapi(s, NULL, 0);
+    char *out = (char *)malloc((size_t)need + 1);
+    wg_session_get_uapi(s, out, (size_t)need + 1);
+
+    const char *required[] = {
+        "endpoint=192.0.2.5:51820\n",
+        "persistent_keepalive_interval=42\n",
+        "allowed_ip=10.99.0.0/16\n",
+        "allowed_ip=10.99.0.0/24\n",
+    };
+    /* And the OLD allowed-ip must be GONE. */
+    if (strstr(out, "allowed_ip=10.88.0.0/24") != NULL) {
+        printf("[FAIL] set: old allowed_ip still present after replace\n");
+        free(out); wg_session_destroy(s); return 1;
+    }
+    for (size_t i = 0; i < sizeof(required)/sizeof(required[0]); i++) {
+        if (!strstr(out, required[i])) {
+            printf("[FAIL] set: GET response missing '%s'\n", required[i]);
+            printf("--- got ---\n%s---\n", out);
+            free(out); wg_session_destroy(s); return 1;
+        }
+    }
+    free(out);
+
+    /* Restricted fields must be rejected. */
+    char bad[256];
+    snprintf(bad, sizeof(bad),
+             "set=1\n"
+             "private_key=%s\n"
+             "\n", peer_hex);
+    if (wg_session_set_uapi(s, bad, strlen(bad)) == 0) {
+        printf("[FAIL] set: private_key was not rejected\n");
+        wg_session_destroy(s);
+        return 1;
+    }
+
+    snprintf(bad, sizeof(bad), "set=1\nlisten_port=12345\n\n");
+    if (wg_session_set_uapi(s, bad, strlen(bad)) == 0) {
+        printf("[FAIL] set: listen_port was not rejected\n");
+        wg_session_destroy(s);
+        return 1;
+    }
+
+    /* Unknown peer must be rejected. */
+    snprintf(bad, sizeof(bad),
+             "set=1\n"
+             "public_key=0000000000000000000000000000000000000000000000000000000000000000\n"
+             "endpoint=1.2.3.4:5\n"
+             "\n");
+    if (wg_session_set_uapi(s, bad, strlen(bad)) == 0) {
+        printf("[FAIL] set: unknown peer was not rejected\n");
+        wg_session_destroy(s);
+        return 1;
+    }
+
+    wg_session_destroy(s);
+    printf("[PASS] wg_session_set_uapi (endpoint + keepalive + replace allowed-ips + rejects)\n");
+    return 0;
+}
+
 static int test_aips_edge_cases(void)
 {
     struct aips_trie t;
@@ -882,6 +1012,7 @@ int main(void)
     fails += test_aips_v6();
     fails += test_aips_edge_cases();
     fails += test_wg_session_uapi_get();
+    fails += test_wg_session_uapi_set();
 
     crypto_deinit();
 

@@ -207,6 +207,42 @@ int wg_session_status(const wg_session_t *s, char *buf, size_t buf_len);
  * small (snprintf semantics). Pass NULL/0 first to size the buffer. */
 int wg_session_get_uapi(const wg_session_t *s, char *buf, size_t buf_len);
 
+/* Apply a WireGuard UAPI SET request. Parses the same text wire
+ * format that wg(8) sends to /var/run/wireguard/<ifname>.sock for
+ * `wg set ...`. Format:
+ *
+ *   set=1
+ *   public_key=<hex>                      ← identifies an existing peer
+ *   endpoint=<addr>:<port>                ← optional, re-resolves
+ *   persistent_keepalive_interval=<n>     ← optional
+ *   replace_allowed_ips=true              ← optional, clears the peer's
+ *                                           CIDRs before reading allowed_ip
+ *   allowed_ip=<cidr>                     ← optional, repeatable
+ *   public_key=<hex>                      ← may identify a different existing peer
+ *   ...                                   ← same set of fields again
+ *   \n                                    ← terminator (blank line)
+ *
+ * What is allowed:
+ *   - update the endpoint of an existing peer (re-resolves the host)
+ *   - update persistent_keepalive_interval
+ *   - replace_allowed_ips=true followed by zero or more allowed_ip
+ *
+ * What is rejected with -1 (and the session is left unmodified):
+ *   - private_key=...           (extension must not allow runtime
+ *                                 private key change from the host app)
+ *   - listen_port=...           (UDP socket binding lives in Swift)
+ *   - replace_peers=...         (mass mutation; do it in a separate PR)
+ *   - public_key=<unknown>      (peer add not supported yet)
+ *   - remove=true               (peer remove not supported yet)
+ *
+ * On success the allowed-ips trie is rebuilt from scratch over the new
+ * config and the function returns 0. On any parse / validation error
+ * the function returns -1 — partial state may have been written to the
+ * peers but the trie is rebuilt either way so anti-spoofing stays
+ * consistent. Callers should treat -1 as "request was rejected, log
+ * the failure" (the existing config remains usable). */
+int wg_session_set_uapi(wg_session_t *s, const char *text, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

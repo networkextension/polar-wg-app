@@ -173,11 +173,19 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             return String(cString: buf)
         }
         if firstLine == "set=1" {
-            // SET side not implemented yet — return EPERM so the caller
-            // can tell it's a "capability missing" vs. a "request bad".
-            // Full implementation requires runtime mutation hooks in
-            // wg_session which is the next PR.
-            return "errno=1\n\n"    // EPERM
+            // Forward the entire request body into the C parser. The
+            // wg_session_set_uapi spec is a strict subset of upstream:
+            // existing peers can have their endpoint, persistent
+            // keepalive, and allowed-ips updated; private_key,
+            // listen_port, replace_peers, peer add/remove are rejected.
+            let bytes = Array(body.utf8)
+            let rc = bytes.withUnsafeBufferPointer { buf -> Int32 in
+                guard let base = buf.baseAddress else { return -1 }
+                return wg_session_set_uapi(session, base, buf.count)
+                    .map { Int32($0) } ?? -1
+            }
+            if rc == 0 { return "errno=0\n\n" }
+            return "errno=1\n\n"    // EPERM — request rejected
         }
         return "errno=22\n\n"        // EINVAL — unknown request
     }
