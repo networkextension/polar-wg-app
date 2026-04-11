@@ -170,6 +170,10 @@ struct ContentView: View {
                 Task { await refreshStatus() }
             }
             .disabled(manager.status != .connected)
+            Button("Copy status") {
+                copyToClipboard(statusText)
+            }
+            .disabled(statusText.isEmpty || statusText == "(tunnel not running)")
 
             Menu("UAPI demos") {
                 Button("Roam endpoint to 192.0.2.5:51820") {
@@ -205,8 +209,19 @@ struct ContentView: View {
 
     private var statusPanel: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("UAPI status (get=1)", systemImage: "antenna.radiowaves.left.and.right")
-                .font(.headline)
+            HStack(spacing: 8) {
+                Label("UAPI status (get=1)", systemImage: "antenna.radiowaves.left.and.right")
+                    .font(.headline)
+                Spacer()
+                Button {
+                    copyToClipboard(statusText)
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(statusText.isEmpty || statusText == "(tunnel not running)")
+            }
             ScrollView {
                 Text(statusText)
                     .font(.system(.caption, design: .monospaced))
@@ -247,6 +262,15 @@ struct ContentView: View {
         let resp = await manager.uapiSet(body) ?? "(no response)"
         // Tack the response on top so the user can see what came back.
         statusText = "── last SET response ──\n" + resp + "\n\n" + statusText
+    }
+
+    private func copyToClipboard(_ text: String) {
+#if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+#else
+        UIPasteboard.general.string = text
+#endif
     }
 }
 
