@@ -23,9 +23,6 @@ import UIKit
 
 struct ContentView: View {
     @StateObject private var manager = TunnelManager()
-#if os(iOS)
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-#endif
 
     @State private var statusText: String = "(tunnel not running)"
     @State private var statusTimer: Timer?
@@ -113,131 +110,13 @@ struct ContentView: View {
                 statusPill
             }
 
-            Group {
-                if isCompactLayout {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Picker("Server", selection: Binding(
-                            get: { manager.selectedProfileID ?? manager.profiles.first?.id ?? UUID() },
-                            set: { manager.selectProfile($0) }
-                        )) {
-                            ForEach(manager.profiles) { profile in
-                                Text(profile.name).tag(profile.id)
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .disabled(manager.profiles.isEmpty)
-
-                        TextField("Server name", text: Binding(
-                            get: { manager.selectedProfileName },
-                            set: { manager.selectedProfileName = $0 }
-                        ))
-                        .textFieldStyle(.roundedBorder)
-
-                        HStack(spacing: 8) {
-                            Button("New Server") { manager.addProfile() }
-                            Button("Delete") { manager.deleteSelectedProfile() }
-                                .disabled(manager.profiles.count <= 1)
-                        }
-                    }
-                } else {
-                    HStack(spacing: 8) {
-                        Picker("Server", selection: Binding(
-                            get: { manager.selectedProfileID ?? manager.profiles.first?.id ?? UUID() },
-                            set: { manager.selectProfile($0) }
-                        )) {
-                            ForEach(manager.profiles) { profile in
-                                Text(profile.name).tag(profile.id)
-                            }
-                        }
-                        .frame(minWidth: 180)
-                        .disabled(manager.profiles.isEmpty)
-
-                        TextField("Server name", text: Binding(
-                            get: { manager.selectedProfileName },
-                            set: { manager.selectedProfileName = $0 }
-                        ))
-                        .textFieldStyle(.roundedBorder)
-
-                        Button("New Server") { manager.addProfile() }
-                        Button("Delete") { manager.deleteSelectedProfile() }
-                            .disabled(manager.profiles.count <= 1)
-                    }
-                }
-            }
+            serverControls
             .controlSize(.small)
 
-            Group {
-                if isCompactLayout {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Storage")
-                            .font(.subheadline.weight(.semibold))
-                        Picker("Storage", selection: Binding(
-                            get: { manager.storageMode },
-                            set: { manager.setStorageMode($0) }
-                        )) {
-                            ForEach(ProfileStorageMode.allCases) { mode in
-                                Text(mode.title).tag(mode)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                    }
-                } else {
-                    HStack(spacing: 8) {
-                        Text("Storage")
-                            .font(.subheadline.weight(.semibold))
-                        Picker("Storage", selection: Binding(
-                            get: { manager.storageMode },
-                            set: { manager.setStorageMode($0) }
-                        )) {
-                            ForEach(ProfileStorageMode.allCases) { mode in
-                                Text(mode.title).tag(mode)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .frame(maxWidth: 320)
-                        Spacer()
-                    }
-                }
-            }
+            storageControls
             .controlSize(.small)
 
-            Group {
-                if isCompactLayout {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Picker("Routing", selection: $manager.routeMode) {
-                            ForEach(RouteMode.allCases) { mode in
-                                Text(mode.title).tag(mode)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-
-                        HStack(spacing: 8) {
-                            Button("Save config") { Task { await manager.saveCurrentProfile() } }
-                            Button("Connect") { manager.start() }
-                                .disabled(manager.status == .connected || manager.status == .connecting)
-                            Button("Disconnect") { manager.stop() }
-                                .disabled(manager.status != .connected && manager.status != .connecting)
-                        }
-                    }
-                } else {
-                    HStack(spacing: 8) {
-                        Picker("Routing", selection: $manager.routeMode) {
-                            ForEach(RouteMode.allCases) { mode in
-                                Text(mode.title).tag(mode)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-
-                        Button("Save config") {
-                            Task { await manager.saveCurrentProfile() }
-                        }
-                        Button("Connect") { manager.start() }
-                            .disabled(manager.status == .connected || manager.status == .connecting)
-                        Button("Disconnect") { manager.stop() }
-                            .disabled(manager.status != .connected && manager.status != .connecting)
-                    }
-                }
-            }
+            routingControls
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
 
@@ -275,6 +154,8 @@ struct ContentView: View {
             Circle().fill(color).frame(width: 10, height: 10)
             Text(manager.status.displayString)
                 .font(.subheadline.monospaced())
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
@@ -283,67 +164,7 @@ struct ContentView: View {
     }
 
     private var actionsBar: some View {
-        Group {
-            if isCompactLayout {
-                VStack(alignment: .leading, spacing: 8) {
-                    if let err = manager.lastError {
-                        Label(err, systemImage: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.red)
-                            .font(.caption)
-                    }
-                    HStack(spacing: 8) {
-                        Button("Refresh") { Task { await refreshStatus() } }
-                            .disabled(manager.status != .connected)
-                        Button("Copy") { copyToClipboard(statusText) }
-                            .disabled(statusText.isEmpty || statusText == "(tunnel not running)")
-                        Menu("UAPI demos") {
-                            Button("Roam endpoint to 192.0.2.5:51820") { Task { await sendDemoSet(setEndpointDemo) } }
-                            Button("Set persistent_keepalive=15") { Task { await sendDemoSet(setKeepaliveDemo) } }
-                            Divider()
-                            Button("Add demo peer") { Task { await sendDemoSet(addPeerDemo) } }
-                            Button("Remove demo peer") { Task { await sendDemoSet(removePeerDemo) } }
-                        }
-                        .disabled(manager.status != .connected)
-                    }
-                }
-            } else {
-                HStack(spacing: 8) {
-                    if let err = manager.lastError {
-                        Label(err, systemImage: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.red)
-                            .font(.caption)
-                        Spacer()
-                    } else {
-                        Spacer()
-                    }
-                    Button("Refresh status now") {
-                        Task { await refreshStatus() }
-                    }
-                    .disabled(manager.status != .connected)
-                    Button("Copy status") {
-                        copyToClipboard(statusText)
-                    }
-                    .disabled(statusText.isEmpty || statusText == "(tunnel not running)")
-
-                    Menu("UAPI demos") {
-                        Button("Roam endpoint to 192.0.2.5:51820") {
-                            Task { await sendDemoSet(setEndpointDemo) }
-                        }
-                        Button("Set persistent_keepalive=15") {
-                            Task { await sendDemoSet(setKeepaliveDemo) }
-                        }
-                        Divider()
-                        Button("Add demo peer") {
-                            Task { await sendDemoSet(addPeerDemo) }
-                        }
-                        Button("Remove demo peer") {
-                            Task { await sendDemoSet(removePeerDemo) }
-                        }
-                    }
-                    .disabled(manager.status != .connected)
-                }
-            }
-        }
+        adaptiveActionsBar
     }
 
     private var configPanel: some View {
@@ -398,12 +219,223 @@ struct ContentView: View {
 #endif
     }
 
-    private var isCompactLayout: Bool {
-#if os(iOS)
-        horizontalSizeClass == .compact
-#else
-        false
-#endif
+    private var regularServerControls: some View {
+        HStack(spacing: 8) {
+            Picker("Server", selection: Binding(
+                get: { manager.selectedProfileID ?? manager.profiles.first?.id ?? UUID() },
+                set: { manager.selectProfile($0) }
+            )) {
+                ForEach(manager.profiles) { profile in
+                    Text(profile.name).tag(profile.id)
+                }
+            }
+            .frame(minWidth: 140, maxWidth: 260)
+            .disabled(manager.profiles.isEmpty)
+
+            TextField("Server name", text: Binding(
+                get: { manager.selectedProfileName },
+                set: { manager.selectedProfileName = $0 }
+            ))
+            .textFieldStyle(.roundedBorder)
+
+            Button("New Server") { manager.addProfile() }
+            Button("Delete") { manager.deleteSelectedProfile() }
+                .disabled(manager.profiles.count <= 1)
+        }
+    }
+
+    @ViewBuilder
+    private var serverControls: some View {
+        if #available(iOS 16.0, macOS 13.0, tvOS 16.0, *) {
+            ViewThatFits(in: .vertical) {
+                regularServerControls
+                compactServerControls
+            }
+        } else {
+            compactServerControls
+        }
+    }
+
+    private var compactServerControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Picker("Server", selection: Binding(
+                get: { manager.selectedProfileID ?? manager.profiles.first?.id ?? UUID() },
+                set: { manager.selectProfile($0) }
+            )) {
+                ForEach(manager.profiles) { profile in
+                    Text(profile.name).tag(profile.id)
+                }
+            }
+            .pickerStyle(.menu)
+            .disabled(manager.profiles.isEmpty)
+
+            TextField("Server name", text: Binding(
+                get: { manager.selectedProfileName },
+                set: { manager.selectedProfileName = $0 }
+            ))
+            .textFieldStyle(.roundedBorder)
+
+            HStack(spacing: 8) {
+                Button("New Server") { manager.addProfile() }
+                Button("Delete") { manager.deleteSelectedProfile() }
+                    .disabled(manager.profiles.count <= 1)
+            }
+        }
+    }
+
+    private var regularStorageControls: some View {
+        HStack(spacing: 8) {
+            Text("Storage")
+                .font(.subheadline.weight(.semibold))
+            Picker("Storage", selection: Binding(
+                get: { manager.storageMode },
+                set: { manager.setStorageMode($0) }
+            )) {
+                ForEach(ProfileStorageMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 320)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var compactStorageControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Storage")
+                .font(.subheadline.weight(.semibold))
+            Picker("Storage", selection: Binding(
+                get: { manager.storageMode },
+                set: { manager.setStorageMode($0) }
+            )) {
+                ForEach(ProfileStorageMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+        }
+    }
+
+    @ViewBuilder
+    private var storageControls: some View {
+        if #available(iOS 16.0, macOS 13.0, tvOS 16.0, *) {
+            ViewThatFits(in: .vertical) {
+                regularStorageControls
+                compactStorageControls
+            }
+        } else {
+            compactStorageControls
+        }
+    }
+
+    private var regularRoutingControls: some View {
+        HStack(spacing: 8) {
+            Picker("Routing", selection: $manager.routeMode) {
+                ForEach(RouteMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Button("Save config") { Task { await manager.saveCurrentProfile() } }
+            Button("Connect") { manager.start() }
+                .disabled(manager.status == .connected || manager.status == .connecting)
+            Button("Disconnect") { manager.stop() }
+                .disabled(manager.status != .connected && manager.status != .connecting)
+        }
+    }
+
+    private var compactRoutingControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Picker("Routing", selection: $manager.routeMode) {
+                ForEach(RouteMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            HStack(spacing: 8) {
+                Button("Save config") { Task { await manager.saveCurrentProfile() } }
+                Button("Connect") { manager.start() }
+                    .disabled(manager.status == .connected || manager.status == .connecting)
+                Button("Disconnect") { manager.stop() }
+                    .disabled(manager.status != .connected && manager.status != .connecting)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var routingControls: some View {
+        if #available(iOS 16.0, macOS 13.0, tvOS 16.0, *) {
+            ViewThatFits(in: .vertical) {
+                regularRoutingControls
+                compactRoutingControls
+            }
+        } else {
+            compactRoutingControls
+        }
+    }
+
+    private var regularActionsBar: some View {
+        HStack(spacing: 8) {
+            if let err = manager.lastError {
+                Label(err, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                    .font(.caption)
+                Spacer()
+            } else {
+                Spacer()
+            }
+            Button("Refresh status now") { Task { await refreshStatus() } }
+                .disabled(manager.status != .connected)
+            Button("Copy status") { copyToClipboard(statusText) }
+                .disabled(statusText.isEmpty || statusText == "(tunnel not running)")
+            Menu("UAPI demos") {
+                Button("Roam endpoint to 192.0.2.5:51820") { Task { await sendDemoSet(setEndpointDemo) } }
+                Button("Set persistent_keepalive=15") { Task { await sendDemoSet(setKeepaliveDemo) } }
+                Divider()
+                Button("Add demo peer") { Task { await sendDemoSet(addPeerDemo) } }
+                Button("Remove demo peer") { Task { await sendDemoSet(removePeerDemo) } }
+            }
+            .disabled(manager.status != .connected)
+        }
+    }
+
+    private var compactActionsBar: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let err = manager.lastError {
+                Label(err, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                    .font(.caption)
+            }
+            HStack(spacing: 8) {
+                Button("Refresh") { Task { await refreshStatus() } }
+                    .disabled(manager.status != .connected)
+                Button("Copy") { copyToClipboard(statusText) }
+                    .disabled(statusText.isEmpty || statusText == "(tunnel not running)")
+                Menu("UAPI demos") {
+                    Button("Roam endpoint to 192.0.2.5:51820") { Task { await sendDemoSet(setEndpointDemo) } }
+                    Button("Set persistent_keepalive=15") { Task { await sendDemoSet(setKeepaliveDemo) } }
+                    Divider()
+                    Button("Add demo peer") { Task { await sendDemoSet(addPeerDemo) } }
+                    Button("Remove demo peer") { Task { await sendDemoSet(removePeerDemo) } }
+                }
+                .disabled(manager.status != .connected)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var adaptiveActionsBar: some View {
+        if #available(iOS 16.0, macOS 13.0, tvOS 16.0, *) {
+            ViewThatFits(in: .vertical) {
+                regularActionsBar
+                compactActionsBar
+            }
+        } else {
+            compactActionsBar
+        }
     }
 
     private func refreshStatus() async {
