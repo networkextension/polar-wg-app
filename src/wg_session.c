@@ -126,8 +126,11 @@ extern int                 noise_local_keys(struct noise_local *,
 extern struct noise_remote *noise_remote_alloc(struct noise_local *, void *arg,
                                                const uint8_t pub[WG_KEY_LEN]);
 extern int                  noise_remote_enable(struct noise_remote *);
+extern void                 noise_remote_disable(struct noise_remote *);
 extern void                 noise_remote_put(struct noise_remote *);
 extern void                *noise_remote_arg(struct noise_remote *);
+extern void                 noise_remote_set_psk(struct noise_remote *,
+                                                  const uint8_t psk[WG_KEY_LEN]);
 
 extern int noise_create_initiation(struct noise_remote *, uint32_t *s_idx,
                                    uint8_t ue[WG_KEY_LEN],
@@ -179,7 +182,17 @@ struct wgs_iface_addr {
 };
 
 struct wgs_peer {
+    /* false ⇢ tombstone slot. Stays this way until the slot is reused
+     * by a peer add. All iteration paths skip !active peers. */
+    bool                     active;
+
     uint8_t pubkey[WG_KEY_LEN];
+
+    /* Pre-shared key. has_psk == false ⇢ emit zero sentinel in UAPI
+     * GET; the noise layer is not told about it. Set via either
+     * config (PresharedKey = base64) or UAPI SET (preshared_key=hex). */
+    uint8_t                  psk[WG_KEY_LEN];
+    bool                     has_psk;
 
     bool                     has_endpoint;
     char                     endpoint_host[128];
@@ -456,6 +469,11 @@ parse_config_text(wg_session_t *s, const char *text, size_t len)
                 peer->has_endpoint = true;
             } else if (strcmp(p, "PersistentKeepalive") == 0) {
                 peer->pk_sec = atoi(eq);
+            } else if (strcmp(p, "PresharedKey") == 0) {
+                if (decode_base64_32(eq, peer->psk) != 0) {
+                    free(scratch); return -1;
+                }
+                peer->has_psk = true;
             } else if (strcmp(p, "AllowedIPs") == 0) {
                 if (parse_list_cidrs(eq, peer) != 0) { free(scratch); return -1; }
             }
@@ -694,6 +712,7 @@ static struct wgs_peer *
 find_pending(wg_session_t *s, uint32_t r_idx)
 {
     for (int i = 0; i < s->n_peers; i++) {
+        if (!s->peers[i].active) continue;
         if (s->peers[i].hs_pending && s->peers[i].hs_local_idx == r_idx)
             return &s->peers[i];
     }
@@ -831,11 +850,14 @@ wg_session_create(const char *config_text, size_t config_len,
 
     for (int i = 0; i < s->n_peers; i++) {
         struct wgs_peer *p = &s->peers[i];
+        p->active = true;
         p->remote = noise_remote_alloc(s->local, p, p->pubkey);
         if (!p->remote) goto err;
         if (noise_remote_enable(p->remote) != 0) goto err;
         cookie_maker_init(&p->cookie, p->pubkey);
         p->cookie_inited = true;
+        if (p->has_psk)
+            noise_remote_set_psk(p->remote, p->psk);
         if (p->has_endpoint) {
             if (resolve_endpoint(p->endpoint_host, p->endpoint_port,
                                  &p->endpoint, &p->endpoint_len) != 0) {
@@ -885,6 +907,7 @@ wg_session_destroy(wg_session_t *s)
     }
     if (s->checker_inited) cookie_checker_free(&s->checker);
     for (int i = 0; i < s->n_peers; i++) {
+        /* Free both active and tombstoned slots — destroy is final. */
         if (s->peers[i].cookie_inited) cookie_maker_free(&s->peers[i].cookie);
         if (s->peers[i].remote) noise_remote_put(s->peers[i].remote);
     }
@@ -927,6 +950,7 @@ wg_session_tick(wg_session_t *s)
     time_t now = time(NULL);
     for (int i = 0; i < s->n_peers; i++) {
         struct wgs_peer *p = &s->peers[i];
+        if (!p->active) continue;
 
         if (p->hs_pending && (now - p->hs_sent_at) >= REKEY_TIMEOUT_SEC) {
             if (p->hs_attempts >= MAX_HANDSHAKE_ATTEMPTS) {
@@ -954,6 +978,7 @@ wg_session_kick(wg_session_t *s)
 {
     if (!s) return -1;
     for (int i = 0; i < s->n_peers; i++) {
+        if (!s->peers[i].active) continue;
         if (s->peers[i].has_endpoint && s->peers[i].endpoint_len > 0)
             return wgs_send_initiation(s, &s->peers[i], "startup");
     }
@@ -982,6 +1007,7 @@ int
 wg_session_peer_pubkey(const wg_session_t *s, int i, uint8_t *out)
 {
     if (!s || i < 0 || i >= s->n_peers || !out) return -1;
+    if (!s->peers[i].active) return -1;
     memcpy(out, s->peers[i].pubkey, WG_KEY_LEN);
     return 0;
 }
@@ -990,6 +1016,7 @@ int
 wg_session_peer_allowed_count(const wg_session_t *s, int i)
 {
     if (!s || i < 0 || i >= s->n_peers) return 0;
+    if (!s->peers[i].active) return 0;
     return s->peers[i].n_allowed;
 }
 
@@ -1111,17 +1138,24 @@ wg_session_get_uapi(const wg_session_t *s, char *buf, size_t buf_len)
     /* Per peer. */
     for (int i = 0; i < s->n_peers; i++) {
         const struct wgs_peer *peer = &s->peers[i];
+        if (!peer->active) continue;
         char pkhex[65];
         hex_encode(pkhex, peer->pubkey, WG_KEY_LEN);
         pkhex[64] = '\0';
 
         append_fmt(&p, &cap, &written, "public_key=%s\n", pkhex);
-        /* We don't support PSK yet (the config parser doesn't read
-         * PresharedKey), so always emit the all-zero sentinel that
-         * wg(8) treats as "no PSK". */
-        append_fmt(&p, &cap, &written,
-                   "preshared_key=00000000000000000000000000000000"
-                   "00000000000000000000000000000000\n");
+        if (peer->has_psk) {
+            char pskhex[65];
+            hex_encode(pskhex, peer->psk, WG_KEY_LEN);
+            pskhex[64] = '\0';
+            append_fmt(&p, &cap, &written, "preshared_key=%s\n", pskhex);
+        } else {
+            /* No PSK configured — emit the all-zero sentinel that
+             * wg(8) treats as "no PSK". */
+            append_fmt(&p, &cap, &written,
+                       "preshared_key=00000000000000000000000000000000"
+                       "00000000000000000000000000000000\n");
+        }
 
         if (peer->endpoint_len > 0) {
             char addr[80] = {0}; uint16_t port = 0;
@@ -1216,10 +1250,41 @@ static struct wgs_peer *
 find_peer_by_pubkey(wg_session_t *s, const uint8_t pubkey[WG_KEY_LEN])
 {
     for (int i = 0; i < s->n_peers; i++) {
+        if (!s->peers[i].active) continue;
         if (memcmp(s->peers[i].pubkey, pubkey, WG_KEY_LEN) == 0)
             return &s->peers[i];
     }
     return NULL;
+}
+
+/* Find an empty (non-active) slot we can reuse, or grow the array. */
+static struct wgs_peer *
+alloc_peer_slot(wg_session_t *s)
+{
+    for (int i = 0; i < s->n_peers; i++) {
+        if (!s->peers[i].active) return &s->peers[i];
+    }
+    if (s->n_peers >= WGS_MAX_PEERS) return NULL;
+    return &s->peers[s->n_peers++];
+}
+
+/* Tear down a peer's noise + cookie state and tombstone the slot.
+ * Does not compact the array — find_peer_by_pubkey and friends
+ * already skip !active. */
+static void
+peer_tombstone(struct wgs_peer *p)
+{
+    if (p->remote) {
+        noise_remote_disable(p->remote);
+        noise_remote_put(p->remote);
+        p->remote = NULL;
+    }
+    if (p->cookie_inited) {
+        cookie_maker_free(&p->cookie);
+        p->cookie_inited = false;
+    }
+    memset(p, 0, sizeof(*p));
+    p->active = false;
 }
 
 /* Parse "host:port" or "[ipv6]:port", re-resolve via getaddrinfo, and
@@ -1284,12 +1349,37 @@ rebuild_aips(wg_session_t *s)
     s->aips_inited = true;
     for (int i = 0; i < s->n_peers; i++) {
         struct wgs_peer *p = &s->peers[i];
+        if (!p->active) continue;
         for (int j = 0; j < p->n_allowed; j++) {
             struct aips_trie *t = (p->allowed[j].family == AF_INET)
                                       ? &s->aips_v4 : &s->aips_v6;
             aips_insert(t, p->allowed[j].addr, p->allowed[j].prefix_len, p);
         }
     }
+}
+
+/* Initialize a freshly-allocated peer slot for runtime add. Allocates
+ * the noise_remote with arg = peer (so the data plane can recover the
+ * peer back from a noise_keypair via noise_remote_arg), enables it,
+ * inits the cookie maker, marks the slot active. Returns 0 on
+ * success. */
+static int
+peer_init_runtime(wg_session_t *s, struct wgs_peer *p,
+                  const uint8_t pubkey[WG_KEY_LEN])
+{
+    memset(p, 0, sizeof(*p));
+    memcpy(p->pubkey, pubkey, WG_KEY_LEN);
+    p->active = true;
+    p->remote = noise_remote_alloc(s->local, p, p->pubkey);
+    if (!p->remote) return -1;
+    if (noise_remote_enable(p->remote) != 0) {
+        noise_remote_put(p->remote);
+        p->remote = NULL;
+        return -1;
+    }
+    cookie_maker_init(&p->cookie, p->pubkey);
+    p->cookie_inited = true;
+    return 0;
 }
 
 int
@@ -1322,15 +1412,27 @@ wg_session_set_uapi(wg_session_t *s, const char *text, size_t len)
             continue;
         }
 
-        /* Restricted: anything that would force us to reallocate noise
-         * state, change the UDP bind, or read a fresh private key. */
+        /* Still rejected: anything that would force us to read a fresh
+         * private key, change the bound socket from underneath the
+         * Swift side, or do a mass mutation of the peer list. */
         if (strcmp(key, "private_key")  == 0 ||
-            strcmp(key, "listen_port")  == 0 ||
             strcmp(key, "fwmark")       == 0 ||
             strcmp(key, "replace_peers") == 0) {
             wgs_log(s, "[set] field '%s' not supported (rejected)", key);
             rc = -1;
             goto done;
+        }
+
+        /* listen_port is now accepted — the C library doesn't bind any
+         * sockets, so this is just a stored value. The Swift host is
+         * expected to poll wg_session_listen_port() and rebind its
+         * NWUDPSession when this changes. */
+        if (strcmp(key, "listen_port") == 0) {
+            int lp = atoi(val);
+            if (lp < 0 || lp > 65535) { rc = -1; goto done; }
+            s->listen_port = (uint16_t)lp;
+            wgs_log(s, "[set] listen_port=%d (Swift must rebind)", lp);
+            continue;
         }
 
         if (strcmp(key, "public_key") == 0) {
@@ -1342,30 +1444,53 @@ wg_session_set_uapi(wg_session_t *s, const char *text, size_t len)
             }
             cur = find_peer_by_pubkey(s, pk);
             if (!cur) {
-                wgs_log(s, "[set] unknown public_key (peer add not supported)");
-                rc = -1;
-                goto done;
+                /* Peer add: allocate a new slot. */
+                struct wgs_peer *fresh = alloc_peer_slot(s);
+                if (!fresh) {
+                    wgs_log(s, "[set] peer add: no free slot (max %d)",
+                            WGS_MAX_PEERS);
+                    rc = -1;
+                    goto done;
+                }
+                if (peer_init_runtime(s, fresh, pk) != 0) {
+                    wgs_log(s, "[set] peer add: noise alloc failed");
+                    rc = -1;
+                    goto done;
+                }
+                cur = fresh;
+                wgs_log(s, "[set] peer added");
             }
             continue;
         }
 
         if (!cur) {
-            /* Field appeared before any public_key. The wg-tool sometimes
-             * does this for fwmark/listen_port/private_key — we already
-             * rejected those above, so any other key here is unknown. */
             wgs_log(s, "[set] field '%s' before public_key", key);
             continue;
         }
 
         if (strcmp(key, "remove") == 0) {
-            wgs_log(s, "[set] peer remove not supported");
-            rc = -1;
-            goto done;
+            if (strcmp(val, "true") == 0) {
+                wgs_log(s, "[set] peer removed");
+                peer_tombstone(cur);
+                cur = NULL;
+            }
+            continue;
         }
         if (strcmp(key, "preshared_key") == 0) {
-            /* Tolerated but ignored — we don't support PSK yet, and the
-             * wg tool emits the all-zero sentinel by default which is
-             * functionally equivalent. */
+            uint8_t psk[WG_KEY_LEN];
+            if (hex_decode(val, psk, WG_KEY_LEN) != 0) {
+                wgs_log(s, "[set] bad preshared_key hex");
+                rc = -1;
+                goto done;
+            }
+            /* All-zero hex means "remove PSK". */
+            int nonzero = 0;
+            for (int i = 0; i < WG_KEY_LEN; i++) if (psk[i]) { nonzero = 1; break; }
+            memcpy(cur->psk, psk, WG_KEY_LEN);
+            cur->has_psk = nonzero ? true : false;
+            if (cur->remote)
+                noise_remote_set_psk(cur->remote, cur->psk);
+            wgs_log(s, "[set] preshared_key %s", nonzero ? "updated" : "cleared");
             continue;
         }
         if (strcmp(key, "endpoint") == 0) {
@@ -1417,10 +1542,6 @@ wg_session_set_uapi(wg_session_t *s, const char *text, size_t len)
 
 done:
     free(scratch);
-    /* Rebuild the trie regardless of success. On the success path it
-     * picks up new allowed-ips entries; on the failure path it makes
-     * sure the trie still reflects exactly what's in peer->allowed[]
-     * even if we wrote partial state before bailing. */
     rebuild_aips(s);
     return rc;
 }
@@ -1436,6 +1557,7 @@ wg_session_status(const wg_session_t *s, char *buf, size_t buf_len)
                     s->n_peers, (unsigned)s->listen_port);
     for (int i = 0; i < s->n_peers && off < (int)buf_len; i++) {
         const struct wgs_peer *p = &s->peers[i];
+        if (!p->active) continue;
         off += snprintf(buf + off, buf_len - off,
                         "peer #%d: tx=%llu/%lluB rx=%llu/%lluB "
                         "kp_age=%lds hs=%s\n",
