@@ -32,10 +32,25 @@ struct ServerProfile: Codable, Identifiable, Equatable {
     var splitInjectedRoutes: String
 }
 
+enum ProfileStorageMode: String, CaseIterable, Identifiable {
+    case local
+    case iCloud
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .local: return "Local"
+        case .iCloud: return "iCloud Sync"
+        }
+    }
+}
+
 @MainActor
 final class TunnelManager: ObservableObject {
     @Published var status: NEVPNStatus = .invalid
     @Published var lastError: String?
+    @Published var storageMode: ProfileStorageMode = .local
 
     @Published var profiles: [ServerProfile] = []
     @Published var selectedProfileID: UUID?
@@ -46,10 +61,15 @@ final class TunnelManager: ObservableObject {
 
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
+    private static let storageModeDefaultsKey = "serverProfileStorageMode"
 
     private struct StoredProfiles: Codable {
         var selectedProfileID: UUID?
         var profiles: [ServerProfile]
+    }
+
+    init() {
+        storageMode = TunnelManager.loadStoredStorageMode()
     }
 
     deinit {
@@ -94,6 +114,35 @@ final class TunnelManager: ObservableObject {
         } catch {
             lastError = "load: \(error.localizedDescription)"
         }
+    }
+
+    func setStorageMode(_ mode: ProfileStorageMode) {
+        guard mode != storageMode else { return }
+        syncCurrentProfileDraft()
+        let currentProfiles = profiles
+        let currentSelected = selectedProfileID
+
+        storageMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: Self.storageModeDefaultsKey)
+
+        if let data = KeychainStore.loadData(mode: mode),
+           let stored = try? JSONDecoder().decode(StoredProfiles.self, from: data),
+           !stored.profiles.isEmpty {
+            profiles = stored.profiles
+            if let selected = stored.selectedProfileID,
+               profiles.contains(where: { $0.id == selected }) {
+                selectedProfileID = selected
+            } else {
+                selectedProfileID = profiles.first?.id
+            }
+            applySelectedProfileToEditor()
+            return
+        }
+
+        profiles = currentProfiles
+        selectedProfileID = currentSelected ?? profiles.first?.id
+        applySelectedProfileToEditor()
+        persistProfilesToKeychain()
     }
 
     func selectProfile(_ id: UUID) {
@@ -288,7 +337,7 @@ final class TunnelManager: ObservableObject {
         fallbackMode: RouteMode,
         fallbackSplit: String
     ) {
-        if let data = KeychainStore.loadData(),
+        if let data = KeychainStore.loadData(mode: storageMode),
            let stored = try? JSONDecoder().decode(StoredProfiles.self, from: data),
            !stored.profiles.isEmpty {
             profiles = stored.profiles
@@ -319,10 +368,18 @@ final class TunnelManager: ObservableObject {
         let payload = StoredProfiles(selectedProfileID: selectedProfileID, profiles: profiles)
         guard let data = try? JSONEncoder().encode(payload) else { return }
         do {
-            try KeychainStore.saveData(data)
+            try KeychainStore.saveData(data, mode: storageMode)
         } catch {
             lastError = "keychain save: \(error.localizedDescription)"
         }
+    }
+
+    private static func loadStoredStorageMode() -> ProfileStorageMode {
+        guard let raw = UserDefaults.standard.string(forKey: storageModeDefaultsKey),
+              let mode = ProfileStorageMode(rawValue: raw) else {
+            return .local
+        }
+        return mode
     }
 
     private func firstEndpointFrom(config: String) -> String? {
@@ -341,13 +398,15 @@ final class TunnelManager: ObservableObject {
 
 private enum KeychainStore {
     private static let service = "com.change.wg.sampleapp"
-    private static let account = "server-profiles-v1"
+    private static let accountBase = "server-profiles-v1"
 
-    static func loadData() -> Data? {
+    static func loadData(mode: ProfileStorageMode) -> Data? {
+        let account = accountBase + "-" + mode.rawValue
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecAttrAccount: account,
+            kSecAttrSynchronizable: mode == .iCloud ? kCFBooleanTrue as Any : kCFBooleanFalse as Any,
             kSecReturnData: true,
             kSecMatchLimit: kSecMatchLimitOne
         ]
@@ -357,16 +416,20 @@ private enum KeychainStore {
         return result as? Data
     }
 
-    static func saveData(_ data: Data) throws {
+    static func saveData(_ data: Data, mode: ProfileStorageMode) throws {
+        let account = accountBase + "-" + mode.rawValue
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
-            kSecAttrAccount: account
+            kSecAttrAccount: account,
+            kSecAttrSynchronizable: mode == .iCloud ? kCFBooleanTrue as Any : kCFBooleanFalse as Any
         ]
 
         let attrs: [CFString: Any] = [
             kSecValueData: data,
-            kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            kSecAttrAccessible: mode == .iCloud
+                ? kSecAttrAccessibleAfterFirstUnlock
+                : kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         ]
 
         let updateStatus = SecItemUpdate(query as CFDictionary, attrs as CFDictionary)
@@ -379,7 +442,9 @@ private enum KeychainStore {
 
         var add = query
         add[kSecValueData] = data
-        add[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        add[kSecAttrAccessible] = mode == .iCloud
+            ? kSecAttrAccessibleAfterFirstUnlock
+            : kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         let addStatus = SecItemAdd(add as CFDictionary, nil)
         guard addStatus == errSecSuccess else {
             throw NSError(domain: NSOSStatusErrorDomain, code: Int(addStatus))

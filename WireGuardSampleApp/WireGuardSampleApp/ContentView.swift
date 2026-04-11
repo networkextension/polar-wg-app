@@ -114,6 +114,23 @@ struct ContentView: View {
             .controlSize(.small)
 
             HStack(spacing: 8) {
+                Text("Storage")
+                    .font(.subheadline.weight(.semibold))
+                Picker("Storage", selection: Binding(
+                    get: { manager.storageMode },
+                    set: { manager.setStorageMode($0) }
+                )) {
+                    ForEach(ProfileStorageMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 320)
+                Spacer()
+            }
+            .controlSize(.small)
+
+            HStack(spacing: 8) {
                 Picker("Routing", selection: $manager.routeMode) {
                     ForEach(RouteMode.allCases) { mode in
                         Text(mode.title).tag(mode)
