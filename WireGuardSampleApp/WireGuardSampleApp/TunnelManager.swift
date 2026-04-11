@@ -92,8 +92,14 @@ final class TunnelManager: ObservableObject {
     func load() async {
         defer { isLoaded = true }
         do {
-            let managers = try await NETunnelProviderManager.loadAllFromPreferences()
-            manager = managers.first ?? NETunnelProviderManager()
+            let managers = try await loadManagersWithTimeout(seconds: 6)
+            if let managers {
+                manager = managers.first ?? NETunnelProviderManager()
+            } else {
+                // Avoid getting stuck on splash forever if NE prefs API stalls.
+                manager = NETunnelProviderManager()
+                lastError = "VPN service load timeout. You can still edit/save and retry connect."
+            }
 
             let proto = manager?.protocolConfiguration as? NETunnelProviderProtocol
             let fallbackConfig = proto?.providerConfiguration?["config"] as? String ?? defaultConfigText
@@ -305,6 +311,21 @@ final class TunnelManager: ObservableObject {
             Task { @MainActor in
                 self?.refreshStatus()
             }
+        }
+    }
+
+    private func loadManagersWithTimeout(seconds: TimeInterval) async throws -> [NETunnelProviderManager]? {
+        try await withThrowingTaskGroup(of: [NETunnelProviderManager]?.self) { group in
+            group.addTask {
+                try await NETunnelProviderManager.loadAllFromPreferences()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                return nil
+            }
+            let first = try await group.next() ?? nil
+            group.cancelAll()
+            return first
         }
     }
 
