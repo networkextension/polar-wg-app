@@ -51,6 +51,7 @@ final class TunnelManager: ObservableObject {
     @Published var status: NEVPNStatus = .invalid
     @Published var lastError: String?
     @Published var storageMode: ProfileStorageMode = .local
+    @Published var isLoaded: Bool = false
 
     @Published var profiles: [ServerProfile] = []
     @Published var selectedProfileID: UUID?
@@ -89,6 +90,7 @@ final class TunnelManager: ObservableObject {
     }
 
     func load() async {
+        defer { isLoaded = true }
         do {
             let managers = try await NETunnelProviderManager.loadAllFromPreferences()
             manager = managers.first ?? NETunnelProviderManager()

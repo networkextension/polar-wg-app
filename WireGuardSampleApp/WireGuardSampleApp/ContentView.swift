@@ -23,6 +23,9 @@ import UIKit
 
 struct ContentView: View {
     @StateObject private var manager = TunnelManager()
+#if os(iOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+#endif
 
     @State private var statusText: String = "(tunnel not running)"
     @State private var statusTimer: Timer?
@@ -36,12 +39,17 @@ struct ContentView: View {
             )
             .ignoresSafeArea()
 
-            VStack(spacing: 12) {
-                header
-                contentArea
-                actionsBar
+            if manager.isLoaded {
+                VStack(spacing: 12) {
+                    header
+                    contentArea
+                    actionsBar
+                }
+                .padding(16)
+            } else {
+                loadingView
+                    .padding(16)
             }
-            .padding(16)
         }
         .task {
             await manager.load()
@@ -56,6 +64,22 @@ struct ContentView: View {
     }
 
     // MARK: - Sections
+
+    private var loadingView: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "shield.lefthalf.filled.badge.checkmark")
+                .font(.system(size: 42))
+                .foregroundStyle(Color.accentColor)
+            Text("Loading profiles…")
+                .font(.headline)
+            ProgressView()
+                .controlSize(.large)
+        }
+        .frame(maxWidth: 360)
+        .padding(20)
+        .background(Color.secondary.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
 
     @ViewBuilder
     private var contentArea: some View {
@@ -89,62 +113,130 @@ struct ContentView: View {
                 statusPill
             }
 
-            HStack(spacing: 8) {
-                Picker("Server", selection: Binding(
-                    get: { manager.selectedProfileID ?? manager.profiles.first?.id ?? UUID() },
-                    set: { manager.selectProfile($0) }
-                )) {
-                    ForEach(manager.profiles) { profile in
-                        Text(profile.name).tag(profile.id)
+            Group {
+                if isCompactLayout {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Picker("Server", selection: Binding(
+                            get: { manager.selectedProfileID ?? manager.profiles.first?.id ?? UUID() },
+                            set: { manager.selectProfile($0) }
+                        )) {
+                            ForEach(manager.profiles) { profile in
+                                Text(profile.name).tag(profile.id)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .disabled(manager.profiles.isEmpty)
+
+                        TextField("Server name", text: Binding(
+                            get: { manager.selectedProfileName },
+                            set: { manager.selectedProfileName = $0 }
+                        ))
+                        .textFieldStyle(.roundedBorder)
+
+                        HStack(spacing: 8) {
+                            Button("New Server") { manager.addProfile() }
+                            Button("Delete") { manager.deleteSelectedProfile() }
+                                .disabled(manager.profiles.count <= 1)
+                        }
+                    }
+                } else {
+                    HStack(spacing: 8) {
+                        Picker("Server", selection: Binding(
+                            get: { manager.selectedProfileID ?? manager.profiles.first?.id ?? UUID() },
+                            set: { manager.selectProfile($0) }
+                        )) {
+                            ForEach(manager.profiles) { profile in
+                                Text(profile.name).tag(profile.id)
+                            }
+                        }
+                        .frame(minWidth: 180)
+                        .disabled(manager.profiles.isEmpty)
+
+                        TextField("Server name", text: Binding(
+                            get: { manager.selectedProfileName },
+                            set: { manager.selectedProfileName = $0 }
+                        ))
+                        .textFieldStyle(.roundedBorder)
+
+                        Button("New Server") { manager.addProfile() }
+                        Button("Delete") { manager.deleteSelectedProfile() }
+                            .disabled(manager.profiles.count <= 1)
                     }
                 }
-                .frame(minWidth: 180)
-                .disabled(manager.profiles.isEmpty)
-
-                TextField("Server name", text: Binding(
-                    get: { manager.selectedProfileName },
-                    set: { manager.selectedProfileName = $0 }
-                ))
-                .textFieldStyle(.roundedBorder)
-
-                Button("New Server") { manager.addProfile() }
-                Button("Delete") { manager.deleteSelectedProfile() }
-                    .disabled(manager.profiles.count <= 1)
             }
             .controlSize(.small)
 
-            HStack(spacing: 8) {
-                Text("Storage")
-                    .font(.subheadline.weight(.semibold))
-                Picker("Storage", selection: Binding(
-                    get: { manager.storageMode },
-                    set: { manager.setStorageMode($0) }
-                )) {
-                    ForEach(ProfileStorageMode.allCases) { mode in
-                        Text(mode.title).tag(mode)
+            Group {
+                if isCompactLayout {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Storage")
+                            .font(.subheadline.weight(.semibold))
+                        Picker("Storage", selection: Binding(
+                            get: { manager.storageMode },
+                            set: { manager.setStorageMode($0) }
+                        )) {
+                            ForEach(ProfileStorageMode.allCases) { mode in
+                                Text(mode.title).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                    }
+                } else {
+                    HStack(spacing: 8) {
+                        Text("Storage")
+                            .font(.subheadline.weight(.semibold))
+                        Picker("Storage", selection: Binding(
+                            get: { manager.storageMode },
+                            set: { manager.setStorageMode($0) }
+                        )) {
+                            ForEach(ProfileStorageMode.allCases) { mode in
+                                Text(mode.title).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(maxWidth: 320)
+                        Spacer()
                     }
                 }
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 320)
-                Spacer()
             }
             .controlSize(.small)
 
-            HStack(spacing: 8) {
-                Picker("Routing", selection: $manager.routeMode) {
-                    ForEach(RouteMode.allCases) { mode in
-                        Text(mode.title).tag(mode)
+            Group {
+                if isCompactLayout {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Picker("Routing", selection: $manager.routeMode) {
+                            ForEach(RouteMode.allCases) { mode in
+                                Text(mode.title).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+
+                        HStack(spacing: 8) {
+                            Button("Save config") { Task { await manager.saveCurrentProfile() } }
+                            Button("Connect") { manager.start() }
+                                .disabled(manager.status == .connected || manager.status == .connecting)
+                            Button("Disconnect") { manager.stop() }
+                                .disabled(manager.status != .connected && manager.status != .connecting)
+                        }
+                    }
+                } else {
+                    HStack(spacing: 8) {
+                        Picker("Routing", selection: $manager.routeMode) {
+                            ForEach(RouteMode.allCases) { mode in
+                                Text(mode.title).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+
+                        Button("Save config") {
+                            Task { await manager.saveCurrentProfile() }
+                        }
+                        Button("Connect") { manager.start() }
+                            .disabled(manager.status == .connected || manager.status == .connecting)
+                        Button("Disconnect") { manager.stop() }
+                            .disabled(manager.status != .connected && manager.status != .connecting)
                     }
                 }
-                .pickerStyle(.segmented)
-
-                Button("Save config") {
-                    Task { await manager.saveCurrentProfile() }
-                }
-                Button("Connect") { manager.start() }
-                    .disabled(manager.status == .connected || manager.status == .connecting)
-                Button("Disconnect") { manager.stop() }
-                    .disabled(manager.status != .connected && manager.status != .connecting)
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
@@ -191,40 +283,66 @@ struct ContentView: View {
     }
 
     private var actionsBar: some View {
-        HStack(spacing: 8) {
-            if let err = manager.lastError {
-                Label(err, systemImage: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.red)
-                    .font(.caption)
-                Spacer()
+        Group {
+            if isCompactLayout {
+                VStack(alignment: .leading, spacing: 8) {
+                    if let err = manager.lastError {
+                        Label(err, systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.red)
+                            .font(.caption)
+                    }
+                    HStack(spacing: 8) {
+                        Button("Refresh") { Task { await refreshStatus() } }
+                            .disabled(manager.status != .connected)
+                        Button("Copy") { copyToClipboard(statusText) }
+                            .disabled(statusText.isEmpty || statusText == "(tunnel not running)")
+                        Menu("UAPI demos") {
+                            Button("Roam endpoint to 192.0.2.5:51820") { Task { await sendDemoSet(setEndpointDemo) } }
+                            Button("Set persistent_keepalive=15") { Task { await sendDemoSet(setKeepaliveDemo) } }
+                            Divider()
+                            Button("Add demo peer") { Task { await sendDemoSet(addPeerDemo) } }
+                            Button("Remove demo peer") { Task { await sendDemoSet(removePeerDemo) } }
+                        }
+                        .disabled(manager.status != .connected)
+                    }
+                }
             } else {
-                Spacer()
-            }
-            Button("Refresh status now") {
-                Task { await refreshStatus() }
-            }
-            .disabled(manager.status != .connected)
-            Button("Copy status") {
-                copyToClipboard(statusText)
-            }
-            .disabled(statusText.isEmpty || statusText == "(tunnel not running)")
+                HStack(spacing: 8) {
+                    if let err = manager.lastError {
+                        Label(err, systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.red)
+                            .font(.caption)
+                        Spacer()
+                    } else {
+                        Spacer()
+                    }
+                    Button("Refresh status now") {
+                        Task { await refreshStatus() }
+                    }
+                    .disabled(manager.status != .connected)
+                    Button("Copy status") {
+                        copyToClipboard(statusText)
+                    }
+                    .disabled(statusText.isEmpty || statusText == "(tunnel not running)")
 
-            Menu("UAPI demos") {
-                Button("Roam endpoint to 192.0.2.5:51820") {
-                    Task { await sendDemoSet(setEndpointDemo) }
-                }
-                Button("Set persistent_keepalive=15") {
-                    Task { await sendDemoSet(setKeepaliveDemo) }
-                }
-                Divider()
-                Button("Add demo peer") {
-                    Task { await sendDemoSet(addPeerDemo) }
-                }
-                Button("Remove demo peer") {
-                    Task { await sendDemoSet(removePeerDemo) }
+                    Menu("UAPI demos") {
+                        Button("Roam endpoint to 192.0.2.5:51820") {
+                            Task { await sendDemoSet(setEndpointDemo) }
+                        }
+                        Button("Set persistent_keepalive=15") {
+                            Task { await sendDemoSet(setKeepaliveDemo) }
+                        }
+                        Divider()
+                        Button("Add demo peer") {
+                            Task { await sendDemoSet(addPeerDemo) }
+                        }
+                        Button("Remove demo peer") {
+                            Task { await sendDemoSet(removePeerDemo) }
+                        }
+                    }
+                    .disabled(manager.status != .connected)
                 }
             }
-            .disabled(manager.status != .connected)
         }
     }
 
@@ -277,6 +395,14 @@ struct ContentView: View {
         return Color(nsColor: .textBackgroundColor)
 #else
         return Color(uiColor: .secondarySystemBackground)
+#endif
+    }
+
+    private var isCompactLayout: Bool {
+#if os(iOS)
+        horizontalSizeClass == .compact
+#else
+        false
 #endif
     }
 
