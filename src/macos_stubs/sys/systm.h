@@ -1,10 +1,16 @@
-/* FreeBSD sys/systm.h → macOS userspace stub */
+/* FreeBSD sys/systm.h → cross-platform userspace stub */
 #pragma once
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <sys/queue.h>    /* LIST_*, TAILQ_*, LIST_FOREACH_SAFE, ... */
+
+#if defined(__APPLE__)
+  #include <sys/queue.h>    /* LIST_*, TAILQ_*, LIST_FOREACH_SAFE, ... */
+#elif defined(__ANDROID__) || defined(__linux__)
+  #include <sys/queue.h>    /* bionic/glibc also has this */
+#endif
+
 #include <sys/callout.h>  /* struct callout, callout_*, hz */
 
 /* getnanotime: current real-time wall clock into timespec */

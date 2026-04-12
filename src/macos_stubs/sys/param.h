@@ -1,6 +1,11 @@
-/* FreeBSD sys/param.h → macOS stub: include real macOS header then add extras */
+/* FreeBSD sys/param.h → cross-platform stub */
 #pragma once
-#include_next <sys/param.h>
+
+#if defined(__APPLE__)
+  #include_next <sys/param.h>
+#elif defined(__ANDROID__) || defined(__linux__)
+  #include <sys/param.h>
+#endif
 
 #include <stdint.h>
 #include <stdbool.h>
