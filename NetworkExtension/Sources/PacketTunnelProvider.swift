@@ -381,16 +381,25 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        // Keep RFC1918 private networks off-tunnel so local LAN / virtual
-        // lab ranges stay directly reachable:
-        //   10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+        // Exclude the ACTUAL local physical network subnets so LAN access
+        // (printers, file shares, other devices on the same Wi-Fi/Ethernet)
+        // stays reachable without going through the tunnel. We detect these
+        // dynamically via getifaddrs() instead of blanket-excluding all of
+        // RFC1918, because blanket exclusion would also exclude the tunnel's
+        // OWN subnet (e.g. 10.88.0.0/24) which must go through utun.
+        //
+        // Also exclude link-local (169.254.0.0/16) since it's never tunneled.
         if routeMode == .full {
+            let localNets = localPhysicalSubnets()
+            for (netAddr, netMask) in localNets {
+                excluded4.append(NEIPv4Route(
+                    destinationAddress: netAddr,
+                    subnetMask: netMask
+                ))
+            }
+            // Link-local is always excluded.
             excluded4.append(NEIPv4Route(
-                destinationAddress: "10.0.0.0",
-                subnetMask: "255.0.0.0"
-            ))
-            excluded4.append(NEIPv4Route(
-                destinationAddress: "192.168.0.0",
+                destinationAddress: "169.254.0.0",
                 subnetMask: "255.255.0.0"
             ))
         }
@@ -715,6 +724,64 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             if !host.isEmpty, !port.isEmpty { return (host, port) }
         }
         return nil
+    }
+
+    /// Enumerate all physical (non-loopback, non-utun) IPv4 interfaces
+    /// and return their network address + subnet mask. Used to build
+    /// excludedRoutes so the local LAN stays reachable in full-tunnel mode
+    /// WITHOUT blanket-excluding all of RFC1918 (which would break the
+    /// tunnel's own subnet if it's in a private range like 10.88.0.0/24).
+    private func localPhysicalSubnets() -> [(address: String, mask: String)] {
+        var result: [(String, String)] = []
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return result }
+        defer { freeifaddrs(first) }
+
+        var seen = Set<String>()  // dedup by "net/mask"
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let current = cursor {
+            let ifa = current.pointee
+            let name = String(cString: ifa.ifa_name)
+            cursor = ifa.ifa_next
+
+            // Skip loopback, utun (our tunnel), and awdl/llw (Apple Wireless)
+            if name == "lo0" || name.hasPrefix("utun") ||
+               name.hasPrefix("awdl") || name.hasPrefix("llw") { continue }
+            guard let addrPtr = ifa.ifa_addr, let maskPtr = ifa.ifa_netmask else { continue }
+            guard Int32(addrPtr.pointee.sa_family) == AF_INET,
+                  Int32(maskPtr.pointee.sa_family) == AF_INET else { continue }
+
+            let sin = withUnsafePointer(to: addrPtr.pointee) {
+                $0.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+            }
+            let msk = withUnsafePointer(to: maskPtr.pointee) {
+                $0.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+            }
+
+            let localIP = UInt32(bigEndian: sin.sin_addr.s_addr)
+            let mask    = UInt32(bigEndian: msk.sin_addr.s_addr)
+            guard mask != 0 else { continue }
+
+            let net = localIP & mask
+
+            // Convert back to dotted strings.
+            var netAddr = in_addr(s_addr: UInt32(bigEndian: net))
+            var maskAddr = in_addr(s_addr: msk.sin_addr.s_addr)
+            var netBuf  = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            var maskBuf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            guard inet_ntop(AF_INET, &netAddr, &netBuf, socklen_t(INET_ADDRSTRLEN)) != nil,
+                  inet_ntop(AF_INET, &maskAddr, &maskBuf, socklen_t(INET_ADDRSTRLEN)) != nil
+            else { continue }
+
+            let netStr  = String(cString: netBuf)
+            let maskStr = String(cString: maskBuf)
+            let key = "\(netStr)/\(maskStr)"
+            if seen.contains(key) { continue }
+            seen.insert(key)
+
+            result.append((netStr, maskStr))
+        }
+        return result
     }
 
     private func localBindEndpointIfSameSubnet(peerEndpoint: NWHostEndpoint) -> NWHostEndpoint? {

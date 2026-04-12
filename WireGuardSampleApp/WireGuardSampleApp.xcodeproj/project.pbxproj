@@ -207,11 +207,9 @@
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
 					216DB126CDFBD38B6A15B8C3 = {
-						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
 					88676EB8880BC3EFBDE05943 = {
-						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -352,15 +350,20 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = WireGuardTunnelExtension/WireGuardTunnelExtension.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = Z9XG3YEP93;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"\"../build/xcframework\"",
 				);
 				INFOPLIST_FILE = WireGuardTunnelExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.6;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../../../../Frameworks";
 				PRODUCT_BUNDLE_IDENTIFIER = com.change.wg.tunnel;
 				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
 				SWIFT_VERSION = 5.9;
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Release;
 		};
@@ -370,11 +373,16 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = WireGuardSampleApp/WireGuardSampleApp.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = Z9XG3YEP93;
 				ENABLE_PREVIEWS = YES;
 				INFOPLIST_FILE = WireGuardSampleApp/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.6;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
 				PRODUCT_BUNDLE_IDENTIFIER = com.change.wg;
 				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Debug;
 		};
@@ -383,15 +391,20 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = WireGuardTunnelExtension/WireGuardTunnelExtension.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = Z9XG3YEP93;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"\"../build/xcframework\"",
 				);
 				INFOPLIST_FILE = WireGuardTunnelExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.6;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../../../../Frameworks";
 				PRODUCT_BUNDLE_IDENTIFIER = com.change.wg.tunnel;
 				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
 				SWIFT_VERSION = 5.9;
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Debug;
 		};
@@ -401,11 +414,16 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = WireGuardSampleApp/WireGuardSampleApp.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = Z9XG3YEP93;
 				ENABLE_PREVIEWS = YES;
 				INFOPLIST_FILE = WireGuardSampleApp/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.6;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
 				PRODUCT_BUNDLE_IDENTIFIER = com.change.wg;
 				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Release;
 		};
