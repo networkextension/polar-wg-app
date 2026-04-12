@@ -14,6 +14,13 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
+
+        // Only 64-bit ABIs — our Curve25519 uses __uint128_t which
+        // isn't available on 32-bit ARM. Google Play requires 64-bit
+        // since Aug 2019 anyway.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
     }
 
     buildTypes {
