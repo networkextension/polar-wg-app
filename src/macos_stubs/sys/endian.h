@@ -54,6 +54,15 @@
     #endif
   #endif
 
+  /* ntohs / htons — bionic sometimes hides these behind feature macros */
+  #ifndef ntohs
+    static inline uint16_t _stub_ntohs(uint16_t x) {
+        return (uint16_t)((x >> 8) | (x << 8));
+    }
+    #define ntohs(x) _stub_ntohs(x)
+    #define htons(x) _stub_ntohs(x)
+  #endif
+
   /* le32toh etc. — already defined by <endian.h> on most Linux */
   #ifndef le32toh
     #if __BYTE_ORDER == __LITTLE_ENDIAN
