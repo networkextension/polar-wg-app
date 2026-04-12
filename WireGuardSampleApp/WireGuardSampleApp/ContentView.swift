@@ -552,26 +552,59 @@ struct ContentView: View {
     }
 
     private var routeModeSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("Routing", systemImage: "arrow.triangle.branch")
-                .font(.subheadline.weight(.semibold))
+        VStack(alignment: .leading, spacing: 12) {
+            // Route mode
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Routing", systemImage: "arrow.triangle.branch")
+                    .font(.subheadline.weight(.semibold))
 
-            Picker("", selection: $manager.routeMode) {
-                ForEach(RouteMode.allCases) { m in
-                    Text(m.title).tag(m)
+                Picker("", selection: $manager.routeMode) {
+                    ForEach(RouteMode.allCases) { m in
+                        Text(m.title).tag(m)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                if manager.routeMode == .split {
+                    TextEditor(text: $manager.splitInjectedRoutes)
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(minHeight: 60, maxHeight: 100)
+                        .padding(6)
+                        .background(textBg)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    Text("CIDRs: 10.10.0.0/16, 172.16.203.0/24")
+                        .font(.caption2).foregroundStyle(.tertiary)
                 }
             }
-            .pickerStyle(.segmented)
 
-            if manager.routeMode == .split {
-                TextEditor(text: $manager.splitInjectedRoutes)
-                    .font(.system(.caption, design: .monospaced))
-                    .frame(minHeight: 60, maxHeight: 100)
-                    .padding(6)
-                    .background(textBg)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                Text("CIDRs: 10.10.0.0/16, 172.16.203.0/24")
-                    .font(.caption2).foregroundStyle(.tertiary)
+            Divider()
+
+            // DNS mode
+            VStack(alignment: .leading, spacing: 6) {
+                Label("DNS", systemImage: "network")
+                    .font(.subheadline.weight(.semibold))
+
+                Picker("", selection: $manager.dnsMode) {
+                    ForEach(DNSMode.allCases) { m in
+                        Text(m.title).tag(m)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                Text(manager.dnsMode.subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+
+                if manager.dnsMode == .doh {
+                    HStack(spacing: 6) {
+                        Image(systemName: "lock.shield.fill")
+                            .foregroundStyle(.green)
+                            .font(.caption)
+                        Text("Encrypted DNS via Cloudflare 1.1.1.1")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
         }
         .cardStyle()

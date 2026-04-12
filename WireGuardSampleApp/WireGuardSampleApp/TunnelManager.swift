@@ -24,6 +24,30 @@ enum RouteMode: String, CaseIterable, Identifiable, Codable {
     }
 }
 
+enum DNSMode: String, CaseIterable, Identifiable, Codable {
+    case system     // no override — use whatever the OS has
+    case plain      // plain DNS from config's "DNS = ..." line
+    case doh        // DNS-over-HTTPS via Cloudflare 1.1.1.1
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .system: return "System DNS"
+        case .plain:  return "Config DNS"
+        case .doh:    return "DoH (1.1.1.1)"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .system: return "Use device default"
+        case .plain:  return "Use DNS from wg-quick config"
+        case .doh:    return "Encrypted DNS via Cloudflare"
+        }
+    }
+}
+
 enum NodeSource: String, Codable {
     case manual    // user-created, config visible + editable
     case platform  // API-delivered, config hidden, only name shown
@@ -36,6 +60,7 @@ struct VPNNode: Codable, Identifiable, Equatable {
     var source: NodeSource
     var country: String             // emoji flag "🇯🇵" or "" if unknown
     var routeMode: RouteMode
+    var dnsMode: DNSMode
     var splitInjectedRoutes: String
 
     // Platform metadata (nil for manual nodes)
@@ -77,6 +102,7 @@ final class TunnelManager: ObservableObject {
 
     @Published var configText: String = defaultConfigText
     @Published var routeMode: RouteMode = .full
+    @Published var dnsMode: DNSMode = .plain
     @Published var splitInjectedRoutes: String = ""
 
     private var manager: NETunnelProviderManager?
@@ -270,6 +296,7 @@ final class TunnelManager: ObservableObject {
                         source: .platform,
                         country: proxy.country ?? "",
                         routeMode: .full,
+                        dnsMode: .plain,
                         splitInjectedRoutes: "",
                         platformProxyId: proxy.id,
                         platformProfileId: lp.id,
@@ -354,6 +381,7 @@ final class TunnelManager: ObservableObject {
             source: .manual,
             country: "",
             routeMode: base?.routeMode ?? .full,
+            dnsMode: base?.dnsMode ?? .plain,
             splitInjectedRoutes: base?.splitInjectedRoutes ?? ""
         )
         profiles.append(profile)
@@ -407,6 +435,7 @@ final class TunnelManager: ObservableObject {
         proto.providerConfiguration = [
             "config": config,
             "routeMode": routeMode.rawValue,
+            "dnsMode": dnsMode.rawValue,
             "splitInjectedRoutes": splitInjectedRoutes
         ]
         m.protocolConfiguration = proto
@@ -522,6 +551,7 @@ final class TunnelManager: ObservableObject {
         guard let profile = selectedProfile else { return }
         configText = profile.config
         routeMode = profile.routeMode
+        dnsMode = profile.dnsMode
         splitInjectedRoutes = profile.splitInjectedRoutes
     }
 
@@ -530,6 +560,7 @@ final class TunnelManager: ObservableObject {
               let idx = profiles.firstIndex(where: { $0.id == id }) else { return }
         profiles[idx].config = configText
         profiles[idx].routeMode = routeMode
+        profiles[idx].dnsMode = dnsMode
         profiles[idx].splitInjectedRoutes = splitInjectedRoutes
         persistProfilesToKeychain()
     }
@@ -566,6 +597,7 @@ final class TunnelManager: ObservableObject {
             source: .manual,
             country: "",
             routeMode: fallbackMode,
+            dnsMode: .plain,
             splitInjectedRoutes: fallbackSplit
         )
         profiles = [initial]

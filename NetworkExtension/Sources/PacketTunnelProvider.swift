@@ -81,6 +81,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             return .full
         }()
         let splitInjectedRoutes = proto.providerConfiguration?["splitInjectedRoutes"] as? String ?? ""
+        let dnsMode: String = proto.providerConfiguration?["dnsMode"] as? String ?? "plain"
 
         // 2. Build the C session with callbacks pointing back at self.
         //    We pass an unretained Unmanaged<PacketTunnelProvider> as the
@@ -112,6 +113,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             for: session,
             configText: configText,
             routeMode: routeMode,
+            dnsMode: dnsMode,
             splitInjectedRoutes: splitInjectedRoutes
         )
 
@@ -238,6 +240,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         for session: OpaquePointer,
         configText: String,
         routeMode: RouteMode,
+        dnsMode: String,
         splitInjectedRoutes: String
     ) -> NEPacketTunnelNetworkSettings {
         // Tunnel remote address — cosmetic, shown in System Settings → VPN.
@@ -449,12 +452,22 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         // MTU matches wg_core: 1420 gives us 60 bytes of outer overhead headroom.
         settings.mtu = 1420
 
-        // DNS: parse "DNS = 1.1.1.1, 1.0.0.1" from the wg-quick config text.
-        // When set, all DNS queries on the device go through the tunnel to
-        // these resolvers (Cloudflare, Google, or whatever the config says).
-        let dnsServers = parseDNSFromConfig(configText)
-        if !dnsServers.isEmpty {
-            settings.dnsSettings = NEDNSSettings(servers: dnsServers)
+        // DNS mode (user choice via UI):
+        //   "system" → no override, use device default
+        //   "plain"  → plain DNS from the config's "DNS = ..." line
+        //   "doh"    → DNS-over-HTTPS via Cloudflare (1.1.1.1)
+        switch dnsMode {
+        case "system":
+            break  // no DNSSettings → system default
+        case "doh":
+            let doh = NEDNSOverHTTPSSettings(servers: ["1.1.1.1", "1.0.0.1"])
+            doh.serverURL = URL(string: "https://cloudflare-dns.com/dns-query")
+            settings.dnsSettings = doh
+        default: // "plain"
+            let dnsServers = parseDNSFromConfig(configText)
+            if !dnsServers.isEmpty {
+                settings.dnsSettings = NEDNSSettings(servers: dnsServers)
+            }
         }
         routeDebugInfo = renderRouteDebug(
             mode: routeMode,
