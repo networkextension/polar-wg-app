@@ -92,6 +92,28 @@ struct ContentView: View {
     // MARK: - Tabs
 
     private var mainTabs: some View {
+        #if os(macOS)
+        // macOS: sidebar navigation (standard Mac pattern)
+        NavigationSplitView {
+            List(selection: $selectedTab) {
+                Label("Connection", systemImage: "shield.checkered")
+                    .tag(AppTab.connection)
+                Label("Servers", systemImage: "server.rack")
+                    .tag(AppTab.servers)
+            }
+            .listStyle(.sidebar)
+            .navigationTitle("WireGuard")
+        } detail: {
+            Group {
+                switch selectedTab {
+                case .connection: connectionTab
+                case .servers:    serversTab
+                }
+            }
+        }
+        .navigationSplitViewColumnWidth(min: 160, ideal: 200, max: 260)
+        #else
+        // iPhone / iPad: bottom tab bar (standard iOS pattern)
         TabView(selection: $selectedTab) {
             connectionTab
                 .tabItem {
@@ -105,6 +127,7 @@ struct ContentView: View {
                 }
                 .tag(AppTab.servers)
         }
+        #endif
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
