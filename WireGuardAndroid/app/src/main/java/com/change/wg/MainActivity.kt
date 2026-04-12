@@ -8,11 +8,15 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.material3.LocalTextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.change.wg.data.flagEmoji
 import com.change.wg.tunnel.WgTunnelManager
@@ -50,6 +54,9 @@ fun MainScreen(tm: WgTunnelManager) {
     val state by tm.tunnelState.collectAsState()
     val error by tm.lastError.collectAsState()
     val isSkipped by tm.isSkippedLogin.collectAsState()
+    val configText by tm.configText.collectAsState()
+    var showConfig by remember { mutableStateOf(false) }
+    var editableConfig by remember { mutableStateOf("") }
 
     if (!isSkipped) {
         // Simple skip-login screen
@@ -102,7 +109,7 @@ fun MainScreen(tm: WgTunnelManager) {
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+    Column(modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState())) {
         // Header
         Text("Connect to VPN", style = MaterialTheme.typography.headlineMedium)
         Text(
@@ -194,5 +201,45 @@ fun MainScreen(tm: WgTunnelManager) {
                 }
             }
         }
+
+        Spacer(Modifier.height(20.dp))
+
+        // Config editor toggle
+        OutlinedButton(
+            onClick = {
+                if (!showConfig) editableConfig = configText
+                showConfig = !showConfig
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(if (showConfig) "Hide Config" else "Edit Config")
+        }
+
+        if (showConfig) {
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = editableConfig,
+                onValueChange = { editableConfig = it },
+                modifier = Modifier.fillMaxWidth().height(250.dp),
+                textStyle = LocalTextStyle.current.copy(fontFamily = FontFamily.Monospace),
+                label = { Text("wg-quick config") }
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = {
+                    tm.configText.value = editableConfig
+                    tm.saveCurrentNode()
+                }) {
+                    Text("Save")
+                }
+                OutlinedButton(onClick = {
+                    editableConfig = configText
+                }) {
+                    Text("Reset")
+                }
+            }
+        }
+
+        Spacer(Modifier.height(32.dp))
     }
 }

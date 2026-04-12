@@ -3,11 +3,13 @@ package com.change.wg.tunnel
 import android.app.Application
 import android.content.Intent
 import android.net.VpnService
+import android.util.Log
 import com.change.wg.data.*
 import com.wireguard.android.backend.GoBackend
 import com.wireguard.android.backend.Tunnel
 import com.wireguard.config.Config
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.withContext
@@ -120,16 +122,27 @@ class WgTunnelManager(private val app: Application) {
             return
         }
         try {
+            // Start our VpnService explicitly BEFORE setState — the
+            // GoBackend's internal future needs a running VpnService
+            // instance. It tries to start GoBackend.VpnService.class
+            // but Android only knows about our WgVpnService subclass.
+            val serviceIntent = Intent(app, WgVpnService::class.java)
+            app.startService(serviceIntent)
+            delay(500) // Give the service time to start and complete the future
+
             val config = Config.parse(BufferedReader(StringReader(node.config)))
             val tunnel = WgTunnel(node.name)
             activeTunnel = tunnel
+            Log.i("WgTunnel", "Connecting to ${node.name}...")
             withContext(Dispatchers.IO) {
                 backend.setState(tunnel, Tunnel.State.UP, config)
             }
             tunnelState.value = Tunnel.State.UP
             lastError.value = null
+            Log.i("WgTunnel", "Connected!")
         } catch (e: Exception) {
-            lastError.value = "Connect failed: ${e.localizedMessage}"
+            Log.e("WgTunnel", "Connect failed", e)
+            lastError.value = "Connect failed: ${e.localizedMessage ?: e.toString()}"
             tunnelState.value = Tunnel.State.DOWN
         }
     }
