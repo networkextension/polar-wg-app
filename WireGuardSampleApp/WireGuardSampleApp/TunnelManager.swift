@@ -218,6 +218,13 @@ final class TunnelManager: ObservableObject {
         }
     }
 
+    func skipLogin() {
+        isAuthenticated = true
+        authError = nil
+        authInfo = "Skipped login (offline mode)"
+        UserDefaults.standard.set(true, forKey: Self.authLoggedInDefaultsKey)
+    }
+
     func logoutUser() {
         stop()
         isAuthenticated = false

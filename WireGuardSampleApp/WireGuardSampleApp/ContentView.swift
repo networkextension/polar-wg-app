@@ -723,6 +723,17 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(isAuthLoading || apiBaseURL.isEmpty || email.isEmpty || password.isEmpty
                           || (isRegisterMode && username.isEmpty))
+
+                Divider()
+
+                Button {
+                    manager.skipLogin()
+                } label: {
+                    Text("Skip — use without account")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(.secondary)
             }
             .frame(maxWidth: 400)
             .padding(20)
