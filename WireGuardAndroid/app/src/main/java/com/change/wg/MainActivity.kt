@@ -1,13 +1,18 @@
 package com.change.wg
 
+import android.app.Activity
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.change.wg.data.flagEmoji
 import com.change.wg.tunnel.WgTunnelManager
@@ -70,6 +75,33 @@ fun MainScreen(tm: WgTunnelManager) {
         if (it.country.isNotEmpty()) it.country else flagEmoji(it.name)
     } ?: "🌐"
 
+    // VPN permission launcher — Android requires user consent before
+    // establishing a VPN. VpnService.prepare() returns an Intent if
+    // permission hasn't been granted yet; null if already granted.
+    val vpnPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            // Permission granted — now actually connect
+            tm.saveCurrentNode()
+            CoroutineScope(Dispatchers.Main).launch { tm.connect() }
+        } else {
+            tm.lastError.value = "VPN permission denied"
+        }
+    }
+
+    fun doConnect() {
+        val prepareIntent: Intent? = tm.prepareVpn()
+        if (prepareIntent != null) {
+            // Need to ask user for VPN permission first
+            vpnPermissionLauncher.launch(prepareIntent)
+        } else {
+            // Already have permission — connect directly
+            tm.saveCurrentNode()
+            CoroutineScope(Dispatchers.Main).launch { tm.connect() }
+        }
+    }
+
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         // Header
         Text("Connect to VPN", style = MaterialTheme.typography.headlineMedium)
@@ -108,12 +140,7 @@ fun MainScreen(tm: WgTunnelManager) {
                 Button(
                     onClick = {
                         if (isConnected) tm.disconnect()
-                        else {
-                            tm.saveCurrentNode()
-                            CoroutineScope(Dispatchers.Main).launch {
-                                tm.connect()
-                            }
-                        }
+                        else doConnect()
                     },
                     modifier = Modifier.fillMaxWidth().height(48.dp),
                     colors = ButtonDefaults.buttonColors(
