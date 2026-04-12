@@ -20,6 +20,8 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 /* ── Field arithmetic in GF(2^255 - 19) using 5 × 51-bit limbs ─────── */
 
@@ -292,9 +294,7 @@ void curve25519_generate_secret(uint8_t priv[32])
 #if defined(__APPLE__)
     arc4random_buf(priv, 32);
 #elif defined(__linux__) || defined(__ANDROID__)
-    #include <fcntl.h>
-    #include <unistd.h>
-    int fd = open("/dev/urandom", 0);
+    int fd = open("/dev/urandom", O_RDONLY);
     if (fd >= 0) { read(fd, priv, 32); close(fd); }
 #else
     /* Fallback: zero (unsafe! should never ship without a real RNG) */
