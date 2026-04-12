@@ -11,6 +11,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.withContext
+import java.io.BufferedReader
 import java.io.StringReader
 
 /**
@@ -119,7 +120,7 @@ class WgTunnelManager(private val app: Application) {
             return
         }
         try {
-            val config = Config.parse(StringReader(node.config))
+            val config = Config.parse(BufferedReader(StringReader(node.config)))
             val tunnel = WgTunnel(node.name)
             activeTunnel = tunnel
             withContext(Dispatchers.IO) {
