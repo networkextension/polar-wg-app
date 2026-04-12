@@ -775,6 +775,152 @@ final class APIClient {
     }
 }
 
+// MARK: - Config Validator
+
+struct WGConfigValidator {
+
+    struct ValidationResult {
+        let isValid: Bool
+        let errors: [String]
+
+        var errorSummary: String { errors.joined(separator: "\n") }
+
+        static let ok = ValidationResult(isValid: true, errors: [])
+    }
+
+    /// Validate a wg-quick config text. Returns specific error messages
+    /// for each problem found. An empty errors array means the config
+    /// is structurally sound (it might still fail at runtime due to
+    /// wrong keys or unreachable endpoints, but the format is correct).
+    static func validate(_ config: String) -> ValidationResult {
+        let trimmed = config.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return .init(isValid: false, errors: ["Config is empty."])
+        }
+
+        var errors: [String] = []
+        let lines = trimmed.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+
+        // Section tracking
+        var hasInterface = false
+        var hasPeer = false
+        var currentSection = ""
+
+        // Required fields
+        var hasPrivateKey = false
+        var hasAddress = false
+        var hasPublicKey = false
+        var hasEndpoint = false
+        var hasAllowedIPs = false
+
+        for line in lines {
+            if line.isEmpty || line.hasPrefix("#") || line.hasPrefix(";") { continue }
+
+            if line.hasPrefix("[") {
+                let section = line.lowercased()
+                    .replacingOccurrences(of: "[", with: "")
+                    .replacingOccurrences(of: "]", with: "")
+                    .trimmingCharacters(in: .whitespaces)
+                currentSection = section
+                if section == "interface" { hasInterface = true }
+                if section == "peer"      { hasPeer = true }
+                continue
+            }
+
+            let parts = line.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            let key = parts[0].trimmingCharacters(in: .whitespaces)
+            let value = parts[1].trimmingCharacters(in: .whitespaces)
+
+            if currentSection == "interface" {
+                switch key {
+                case "PrivateKey":
+                    hasPrivateKey = true
+                    if !isValidBase64Key(value) {
+                        errors.append("PrivateKey is not a valid 32-byte base64 key.")
+                    }
+                case "Address":
+                    hasAddress = true
+                    if value.isEmpty {
+                        errors.append("Address is empty.")
+                    }
+                default: break
+                }
+            }
+
+            if currentSection == "peer" {
+                switch key {
+                case "PublicKey":
+                    hasPublicKey = true
+                    if !isValidBase64Key(value) {
+                        errors.append("PublicKey is not a valid 32-byte base64 key.")
+                    }
+                case "Endpoint":
+                    hasEndpoint = true
+                    if value.isEmpty {
+                        errors.append("Endpoint is empty.")
+                    } else if !value.contains(":") {
+                        errors.append("Endpoint must be host:port format.")
+                    }
+                case "AllowedIPs":
+                    hasAllowedIPs = true
+                default: break
+                }
+            }
+        }
+
+        // Check required sections
+        if !hasInterface {
+            errors.append("Missing [Interface] section.")
+        }
+        if !hasPeer {
+            errors.append("Missing [Peer] section.")
+        }
+
+        // Check required fields
+        if hasInterface && !hasPrivateKey {
+            errors.append("Missing PrivateKey in [Interface].")
+        }
+        if hasInterface && !hasAddress {
+            errors.append("Missing Address in [Interface].")
+        }
+        if hasPeer && !hasPublicKey {
+            errors.append("Missing PublicKey in [Peer].")
+        }
+        if hasPeer && !hasAllowedIPs {
+            errors.append("Missing AllowedIPs in [Peer].")
+        }
+
+        return ValidationResult(isValid: errors.isEmpty, errors: errors)
+    }
+
+    /// Validate a VPNNode is ready to connect.
+    static func validateForConnect(_ node: VPNNode?) -> ValidationResult {
+        guard let node else {
+            return .init(isValid: false, errors: ["No node selected."])
+        }
+        if node.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return .init(isValid: false, errors: ["Node name is empty."])
+        }
+        let configResult = validate(node.config)
+        if !configResult.isValid {
+            return configResult
+        }
+        return .ok
+    }
+
+    /// Check if a string looks like a valid 32-byte base64 WireGuard key.
+    /// WG keys are always exactly 44 characters of base64 with trailing '='.
+    private static func isValidBase64Key(_ s: String) -> Bool {
+        let trimmed = s.trimmingCharacters(in: .whitespaces)
+        guard trimmed.count == 44, trimmed.hasSuffix("=") else { return false }
+        let charset = CharacterSet.alphanumerics
+            .union(CharacterSet(charactersIn: "+/="))
+        return trimmed.unicodeScalars.allSatisfy { charset.contains($0) }
+    }
+}
+
 extension NEVPNStatus {
     var displayString: String {
         switch self {

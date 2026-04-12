@@ -38,6 +38,10 @@ struct ContentView: View {
     // Tab
     @State private var selectedTab: AppTab = .connection
 
+    // Validation alerts
+    @State private var showValidationAlert = false
+    @State private var validationMessage = ""
+
     enum AppTab: Hashable {
         case connection, servers
     }
@@ -61,6 +65,11 @@ struct ContentView: View {
             }
         }
         .onDisappear { statusTimer?.invalidate() }
+        .alert("Config Validation", isPresented: $showValidationAlert) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(validationMessage)
+        }
     }
 
     // MARK: - Background
@@ -216,8 +225,16 @@ struct ContentView: View {
                 if isConnected || isConnecting {
                     manager.stop()
                 } else {
-                    Task { await manager.saveCurrentProfile() }
-                    manager.start()
+                    // Validate before connecting
+                    let node = manager.profiles.first { $0.id == manager.selectedProfileID }
+                    let result = WGConfigValidator.validateForConnect(node)
+                    if result.isValid {
+                        Task { await manager.saveCurrentProfile() }
+                        manager.start()
+                    } else {
+                        validationMessage = result.errorSummary
+                        showValidationAlert = true
+                    }
                 }
             } label: {
                 Text(isConnected ? "Disconnect" : isConnecting ? "Connecting..." : "Connect")
@@ -435,10 +452,33 @@ struct ContentView: View {
 
                 // Save / Connect / Disconnect
                 HStack {
-                    Button("Save") { Task { await manager.saveCurrentProfile() } }
-                        .buttonStyle(.borderedProminent)
-                    Button("Connect") { manager.start() }
-                        .disabled(manager.status == .connected || manager.status == .connecting)
+                    Button("Save") {
+                        // Validate config before saving (manual nodes only)
+                        if !selectedNodeIsPlatform {
+                            let result = WGConfigValidator.validate(manager.configText)
+                            if !result.isValid {
+                                validationMessage = result.errorSummary
+                                showValidationAlert = true
+                                return
+                            }
+                        }
+                        Task { await manager.saveCurrentProfile() }
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button("Connect") {
+                        let node = manager.profiles.first { $0.id == manager.selectedProfileID }
+                        let result = WGConfigValidator.validateForConnect(node)
+                        if result.isValid {
+                            Task { await manager.saveCurrentProfile() }
+                            manager.start()
+                        } else {
+                            validationMessage = result.errorSummary
+                            showValidationAlert = true
+                        }
+                    }
+                    .disabled(manager.status == .connected || manager.status == .connecting)
+
                     Button("Disconnect") { manager.stop() }
                         .disabled(manager.status != .connected && manager.status != .connecting)
                 }
