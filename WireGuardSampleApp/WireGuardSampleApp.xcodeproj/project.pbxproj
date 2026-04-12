@@ -7,11 +7,11 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		1825A12E2F8B7431008326CC /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 18639A142F8B72A80067E265 /* Assets.xcassets */; };
 		233F2B77088A2EFC97CA841E /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F68B3BA5F48F5EC794AD5B4A /* ContentView.swift */; };
 		33CEC2F008BE19DF3FCCB8CC /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C1E1487C149B0AA2F3513A95 /* NetworkExtension.framework */; };
 		4BCF3B2BEFBC2471FD021C0B /* PacketTunnelProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 386678E2A6DEE7D1256C415B /* PacketTunnelProvider.swift */; };
 		4CAB3AC5948F8083913CFB6F /* WireGuardCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 948E6AE9A45486E850A4732F /* WireGuardCore.xcframework */; };
+		4F7DDC504362059098530F4B /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B72808EF75454FD9ADDF931D /* Assets.xcassets */; };
 		6C77658770331D7875A01AFC /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C1E1487C149B0AA2F3513A95 /* NetworkExtension.framework */; };
 		B770F7EA9F13C6DAE8EEA7EB /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6DD0C6CC9148DA272B2ED184 /* Network.framework */; };
 		BE6671D2218AA8FB548E73F4 /* WireGuardTunnelExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = CBAC9655422F9D3AC04AAE1B /* WireGuardTunnelExtension.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
@@ -45,7 +45,6 @@
 
 /* Begin PBXFileReference section */
 		1534BDE4AD3D3F47FC1B40F1 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
-		18639A142F8B72A80067E265 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		2B3C1ADABB80E6CBDE695F11 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		386678E2A6DEE7D1256C415B /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
 		56DB40C402BE07E79E1F47FC /* WireGuardSampleAppApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WireGuardSampleAppApp.swift; sourceTree = "<group>"; };
@@ -53,6 +52,7 @@
 		6DD0C6CC9148DA272B2ED184 /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = System/Library/Frameworks/Network.framework; sourceTree = SDKROOT; };
 		714FC0A62C1B90C5E5EDD1A3 /* WireGuardSampleApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WireGuardSampleApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		948E6AE9A45486E850A4732F /* WireGuardCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = WireGuardCore.xcframework; path = ../build/xcframework/WireGuardCore.xcframework; sourceTree = "<group>"; };
+		B72808EF75454FD9ADDF931D /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		C1E1487C149B0AA2F3513A95 /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = System/Library/Frameworks/NetworkExtension.framework; sourceTree = SDKROOT; };
 		CBAC9655422F9D3AC04AAE1B /* WireGuardTunnelExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = WireGuardTunnelExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		F68B3BA5F48F5EC794AD5B4A /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -109,6 +109,7 @@
 		57E0EF92E787EF4C3837D946 /* WireGuardSampleApp */ = {
 			isa = PBXGroup;
 			children = (
+				B72808EF75454FD9ADDF931D /* Assets.xcassets */,
 				F68B3BA5F48F5EC794AD5B4A /* ContentView.swift */,
 				1534BDE4AD3D3F47FC1B40F1 /* Info.plist */,
 				620AD448CB9AE06AE7BE8DEC /* TunnelManager.swift */,
@@ -146,7 +147,6 @@
 		F23C51F85BB6324563CFF5AD = {
 			isa = PBXGroup;
 			children = (
-				18639A142F8B72A80067E265 /* Assets.xcassets */,
 				364B8F26746C453C12C25FC6 /* wg */,
 				57E0EF92E787EF4C3837D946 /* WireGuardSampleApp */,
 				DF783E59E8DC7CF3DCD7E76F /* WireGuardTunnelExtension */,
@@ -181,9 +181,9 @@
 			buildConfigurationList = BA5951F19E0F8533E40E9DC4 /* Build configuration list for PBXNativeTarget "WireGuardSampleApp" */;
 			buildPhases = (
 				E05AA3AFF8770E5371E38EC3 /* Sources */,
+				4EE418B95F41B09659CCF935 /* Resources */,
 				142698F075567F964BEE3922 /* Frameworks */,
 				A19531BB900E69678A4D868E /* Embed Foundation Extensions */,
-				1825A12D2F8B7428008326CC /* Resources */,
 			);
 			buildRules = (
 			);
@@ -207,9 +207,11 @@
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
 					216DB126CDFBD38B6A15B8C3 = {
+						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
 					88676EB8880BC3EFBDE05943 = {
+						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -235,11 +237,11 @@
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		1825A12D2F8B7428008326CC /* Resources */ = {
+		4EE418B95F41B09659CCF935 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				1825A12E2F8B7431008326CC /* Assets.xcassets in Resources */,
+				4F7DDC504362059098530F4B /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -350,8 +352,6 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = WireGuardTunnelExtension/WireGuardTunnelExtension.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 2;
-				DEVELOPMENT_TEAM = Z9XG3YEP93;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"\"../build/xcframework\"",
@@ -368,11 +368,8 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = NO;
 				CODE_SIGN_ENTITLEMENTS = WireGuardSampleApp/WireGuardSampleApp.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 2;
-				DEVELOPMENT_TEAM = Z9XG3YEP93;
 				ENABLE_PREVIEWS = YES;
 				INFOPLIST_FILE = WireGuardSampleApp/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
@@ -386,8 +383,6 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = WireGuardTunnelExtension/WireGuardTunnelExtension.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 2;
-				DEVELOPMENT_TEAM = Z9XG3YEP93;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"\"../build/xcframework\"",
@@ -404,11 +399,8 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = NO;
 				CODE_SIGN_ENTITLEMENTS = WireGuardSampleApp/WireGuardSampleApp.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 2;
-				DEVELOPMENT_TEAM = Z9XG3YEP93;
 				ENABLE_PREVIEWS = YES;
 				INFOPLIST_FILE = WireGuardSampleApp/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
