@@ -24,13 +24,29 @@ enum RouteMode: String, CaseIterable, Identifiable, Codable {
     }
 }
 
-struct ServerProfile: Codable, Identifiable, Equatable {
+enum NodeSource: String, Codable {
+    case manual    // user-created, config visible + editable
+    case platform  // API-delivered, config hidden, only name shown
+}
+
+struct VPNNode: Codable, Identifiable, Equatable {
     let id: UUID
     var name: String
-    var config: String
+    var config: String              // wg-quick text (always present for NE)
+    var source: NodeSource
+    var country: String             // emoji flag "🇯🇵" or "" if unknown
     var routeMode: RouteMode
     var splitInjectedRoutes: String
+
+    // Platform metadata (nil for manual nodes)
+    var platformProxyId: String?
+    var platformProfileId: String?
+    var proxyVersion: Int?
+    var lastSynced: Date?
 }
+
+// Keep backward compat alias so existing code compiles during migration
+typealias ServerProfile = VPNNode
 
 enum ProfileStorageMode: String, CaseIterable, Identifiable {
     case local
@@ -213,6 +229,106 @@ final class TunnelManager: ObservableObject {
         }
     }
 
+    // MARK: - Platform sync
+
+    @Published var isSyncing: Bool = false
+
+    /// Fetch profiles from the Latch platform API, convert each proxy
+    /// to a VPNNode, and merge into the local node list. Manual nodes
+    /// are never touched. Platform nodes are matched by platformProxyId:
+    ///   - new proxy → add node
+    ///   - existing proxy with newer version → update config + name
+    ///   - local platform node not in API response → remove
+    func syncFromPlatform() async {
+        guard !isSyncing else { return }
+        isSyncing = true
+        defer { isSyncing = false }
+
+        do {
+            let latchProfiles = try await APIClient.shared.getLatchProfiles()
+            syncCurrentProfileDraft()
+
+            // Collect all proxies across all profiles into VPNNodes.
+            var incoming: [String: VPNNode] = [:]  // keyed by proxy.id
+            for lp in latchProfiles {
+                for proxy in lp.proxies {
+                    guard let wgConfig = proxy.toWGQuickConfig() else {
+                        // Config doesn't have required WG keys — skip.
+                        continue
+                    }
+                    let node = VPNNode(
+                        id: UUID(),
+                        name: proxy.name,
+                        config: wgConfig,
+                        source: .platform,
+                        country: proxy.country ?? "",
+                        routeMode: .full,
+                        splitInjectedRoutes: "",
+                        platformProxyId: proxy.id,
+                        platformProfileId: lp.id,
+                        proxyVersion: proxy.version,
+                        lastSynced: Date()
+                    )
+                    incoming[proxy.id] = node
+                }
+            }
+
+            // Merge.
+            var merged: [VPNNode] = []
+
+            // Keep all manual nodes as-is.
+            for node in profiles where node.source == .manual {
+                merged.append(node)
+            }
+
+            // For each existing platform node, update if still in API,
+            // drop if removed from API.
+            for node in profiles where node.source == .platform {
+                if let proxyId = node.platformProxyId,
+                   let fresh = incoming[proxyId] {
+                    var updated = node
+                    updated.name = fresh.name
+                    updated.country = fresh.country
+                    if fresh.proxyVersion != node.proxyVersion {
+                        updated.config = fresh.config
+                        updated.proxyVersion = fresh.proxyVersion
+                    }
+                    updated.lastSynced = Date()
+                    merged.append(updated)
+                    incoming.removeValue(forKey: proxyId)
+                }
+                // else: platform node no longer in API → dropped
+            }
+
+            // Add brand-new platform nodes.
+            for (_, node) in incoming {
+                merged.append(node)
+            }
+
+            profiles = merged
+
+            // If the selected node was removed, pick the first available.
+            if let sel = selectedProfileID,
+               !profiles.contains(where: { $0.id == sel }) {
+                selectedProfileID = profiles.first?.id
+            }
+
+            applySelectedProfileToEditor()
+            persistProfilesToKeychain()
+            lastError = nil
+        } catch {
+            lastError = "Sync failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Convenience computed properties for UI sections.
+    var platformNodes: [VPNNode] {
+        profiles.filter { $0.source == .platform }
+    }
+    var manualNodes: [VPNNode] {
+        profiles.filter { $0.source == .manual }
+    }
+
     func selectProfile(_ id: UUID) {
         syncCurrentProfileDraft()
         selectedProfileID = id
@@ -224,10 +340,12 @@ final class TunnelManager: ObservableObject {
         syncCurrentProfileDraft()
         let base = selectedProfile
         let name = normalizedProfileName(proposedName) ?? "Server \(profiles.count + 1)"
-        let profile = ServerProfile(
+        let profile = VPNNode(
             id: UUID(),
             name: name,
             config: base?.config ?? defaultConfigText,
+            source: .manual,
+            country: "",
             routeMode: base?.routeMode ?? .full,
             splitInjectedRoutes: base?.splitInjectedRoutes ?? ""
         )
@@ -434,10 +552,12 @@ final class TunnelManager: ObservableObject {
             return
         }
 
-        let initial = ServerProfile(
+        let initial = VPNNode(
             id: UUID(),
-            name: "Default Server",
+            name: "Default Node",
             config: fallbackConfig,
+            source: .manual,
+            country: "",
             routeMode: fallbackMode,
             splitInjectedRoutes: fallbackSplit
         )
@@ -588,6 +708,18 @@ final class APIClient {
         _ = try await post(path: "/api/logout", body: nil, responseType: Empty.self)
     }
 
+    func getLatchProfiles() async throws -> [LatchProfile] {
+        let resp = try await get(path: "/api/latch/profiles", responseType: LatchProfilesResponse.self)
+        return resp.profiles
+    }
+
+    private func get<T: Decodable>(path: String, responseType: T.Type) async throws -> T {
+        guard let baseURL else { throw APIError.invalidBaseURL }
+        var req = URLRequest(url: baseURL.appendingPathComponent(path))
+        req.httpMethod = "GET"
+        return try await perform(req, responseType: responseType)
+    }
+
     private func post<T: Decodable>(path: String, body: Any?, responseType: T.Type) async throws -> T {
         guard let baseURL else { throw APIError.invalidBaseURL }
         var req = URLRequest(url: baseURL.appendingPathComponent(path))
@@ -611,7 +743,12 @@ final class APIClient {
         if T.self == Empty.self {
             return Empty() as! T
         }
-        return try JSONDecoder().decode(T.self, from: data)
+        // Use the Latch API decoder (snake_case + ISO8601 dates) for
+        // platform responses; plain JSONDecoder for everything else.
+        let decoder: JSONDecoder = (T.self == LatchProfilesResponse.self)
+            ? .latchAPI
+            : JSONDecoder()
+        return try decoder.decode(T.self, from: data)
     }
 
     private struct Empty: Decodable {}
@@ -650,4 +787,158 @@ extension NEVPNStatus {
         @unknown default:    return "unknown"
         }
     }
+}
+
+// MARK: - Latch Platform Types
+
+struct LatchProfilesResponse: Codable {
+    let profiles: [LatchProfile]
+}
+
+struct LatchProfile: Codable, Identifiable {
+    let id: String
+    let name: String
+    let description: String
+    let proxyGroupIds: [String]
+    let ruleGroupId: String?
+    let enabled: Bool
+    let shareable: Bool
+    let createdAt: Date
+    let updatedAt: Date
+    let proxies: [LatchProxy]
+    let rule: LatchRule?
+}
+
+struct LatchProxy: Codable, Identifiable {
+    let id: String
+    let groupId: String
+    let name: String
+    let type: String              // "wireguard" etc.
+    let config: [String: JSONValue]
+    let country: String?          // emoji flag "🇯🇵" or ISO "JP"
+    let sha1: String
+    let version: Int
+    let createdAt: Date
+}
+
+struct LatchRule: Codable, Identifiable {
+    let id: String
+    let groupId: String
+    let name: String
+    let content: String
+    let sha1: String
+    let version: Int
+    let createdAt: Date
+}
+
+// MARK: - JSONValue (dynamic JSON dict for proxy config)
+
+enum JSONValue: Codable, Equatable {
+    case string(String)
+    case int(Int)
+    case double(Double)
+    case bool(Bool)
+    case object([String: JSONValue])
+    case array([JSONValue])
+    case null
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let v = try? c.decode(String.self)            { self = .string(v); return }
+        if let v = try? c.decode(Int.self)               { self = .int(v); return }
+        if let v = try? c.decode(Double.self)             { self = .double(v); return }
+        if let v = try? c.decode(Bool.self)              { self = .bool(v); return }
+        if let v = try? c.decode([String: JSONValue].self) { self = .object(v); return }
+        if let v = try? c.decode([JSONValue].self)        { self = .array(v); return }
+        if c.decodeNil()                                  { self = .null; return }
+        throw DecodingError.dataCorruptedError(in: c, debugDescription: "Unsupported JSON value")
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        switch self {
+        case .string(let v):  try c.encode(v)
+        case .int(let v):     try c.encode(v)
+        case .double(let v):  try c.encode(v)
+        case .bool(let v):    try c.encode(v)
+        case .object(let v):  try c.encode(v)
+        case .array(let v):   try c.encode(v)
+        case .null:           try c.encodeNil()
+        }
+    }
+
+    /// Coerce any JSON value to a flat string for wg-quick config lines.
+    var asString: String? {
+        switch self {
+        case .string(let v):  return v
+        case .int(let v):     return String(v)
+        case .double(let v):  return String(v)
+        case .bool(let v):    return v ? "true" : "false"
+        default:              return nil
+        }
+    }
+}
+
+// MARK: - LatchProxy → wg-quick config converter
+
+extension LatchProxy {
+    /// Convert the proxy's JSON config dict into a wg-quick INI text that
+    /// the WireGuardCore C library can parse. Uses standard WireGuard
+    /// config key names directly (no mapping). Keys are categorized into
+    /// [Interface] vs [Peer] by a known-key set; unknowns default to
+    /// [Interface]. Returns nil if essential keys (PrivateKey + PublicKey)
+    /// are missing — the caller should discard this proxy.
+    func toWGQuickConfig() -> String? {
+        let peerKeys: Set<String> = [
+            "PublicKey", "Endpoint", "AllowedIPs", "PresharedKey",
+            "PersistentKeepalive"
+        ]
+
+        var ifaceLines: [String] = []
+        var peerLines: [String] = []
+
+        for (key, value) in config {
+            guard let strVal = value.asString else { continue }
+            if peerKeys.contains(key) {
+                peerLines.append("\(key) = \(strVal)")
+            } else {
+                ifaceLines.append("\(key) = \(strVal)")
+            }
+        }
+
+        // Must have at least PrivateKey and PublicKey to be usable.
+        let hasPrivate = ifaceLines.contains { $0.hasPrefix("PrivateKey") }
+        let hasPublic  = peerLines.contains  { $0.hasPrefix("PublicKey") }
+        guard hasPrivate && hasPublic else { return nil }
+
+        var text = "[Interface]\n"
+        text += ifaceLines.joined(separator: "\n")
+        text += "\n\n[Peer]\n"
+        text += peerLines.joined(separator: "\n")
+        text += "\n"
+        return text
+    }
+}
+
+// MARK: - ISO8601 + fractional seconds decoder for Latch API dates
+
+extension JSONDecoder {
+    static let latchAPI: JSONDecoder = {
+        let d = JSONDecoder()
+        d.keyDecodingStrategy = .convertFromSnakeCase
+        d.dateDecodingStrategy = .custom { decoder in
+            let s = try decoder.singleValueContainer().decode(String.self)
+            let fmtFrac = ISO8601DateFormatter()
+            fmtFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let d = fmtFrac.date(from: s) { return d }
+            let fmtPlain = ISO8601DateFormatter()
+            fmtPlain.formatOptions = [.withInternetDateTime]
+            if let d = fmtPlain.date(from: s) { return d }
+            throw DecodingError.dataCorruptedError(
+                in: try decoder.singleValueContainer(),
+                debugDescription: "Cannot parse date: \(s)"
+            )
+        }
+        return d
+    }()
 }

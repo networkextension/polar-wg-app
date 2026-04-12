@@ -171,8 +171,8 @@ struct ContentView: View {
 
     private var heroServerCard: some View {
         let profile = manager.profiles.first(where: { $0.id == manager.selectedProfileID })
-        let name = profile?.name ?? "No Server"
-        let flag = flagEmoji(for: name)
+        let name = profile?.name ?? "No Node"
+        let flag = (profile?.country.isEmpty == false) ? profile!.country : flagEmoji(for: name)
         let isConnected = manager.status == .connected
         let isConnecting = manager.status == .connecting || manager.status == .reasserting
 
@@ -239,22 +239,79 @@ struct ContentView: View {
 
     private var serverListSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Server List")
+            Text("Nodes")
                 .font(.headline)
 
-            // Recent / configured servers
-            if !manager.profiles.isEmpty {
-                Text("Recent")
+            // Platform nodes
+            if !manager.platformNodes.isEmpty {
+                HStack {
+                    Text("Platform")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        Task { await manager.syncFromPlatform() }
+                    } label: {
+                        HStack(spacing: 4) {
+                            if manager.isSyncing {
+                                ProgressView().controlSize(.mini)
+                            } else {
+                                Image(systemName: "arrow.triangle.2.circlepath")
+                            }
+                            Text("Sync")
+                        }
+                        .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    .disabled(manager.isSyncing)
+                }
+                .padding(.leading, 4)
+
+                ForEach(manager.platformNodes) { node in
+                    nodeRow(node: node)
+                }
+            } else {
+                // Show sync button even if no platform nodes yet
+                Button {
+                    Task { await manager.syncFromPlatform() }
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .font(.title3)
+                            .foregroundStyle(.blue)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Sync from Platform")
+                                .font(.body.weight(.medium))
+                            Text("Pull nodes from your Latch account")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if manager.isSyncing {
+                            ProgressView().controlSize(.small)
+                        }
+                    }
+                    .padding(14)
+                    .cardStyle()
+                }
+                .buttonStyle(.plain)
+                .disabled(manager.isSyncing)
+            }
+
+            // Manual nodes
+            if !manager.manualNodes.isEmpty {
+                Text("Manual")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .padding(.leading, 4)
 
-                ForEach(manager.profiles) { profile in
-                    serverRow(profile: profile)
+                ForEach(manager.manualNodes) { node in
+                    nodeRow(node: node)
                 }
             }
 
-            // Add server
+            // Add node (manual)
             Button {
                 manager.addProfile()
                 selectedTab = .servers
@@ -263,7 +320,7 @@ struct ContentView: View {
                     Image(systemName: "plus.circle.fill")
                         .font(.title3)
                         .foregroundStyle(.blue)
-                    Text("Add Server")
+                    Text("Add Node")
                         .font(.body.weight(.medium))
                     Spacer()
                     Image(systemName: "chevron.right")
@@ -277,25 +334,35 @@ struct ContentView: View {
         }
     }
 
-    private func serverRow(profile: ServerProfile) -> some View {
-        let isSelected = profile.id == manager.selectedProfileID
+    private func nodeRow(node: VPNNode) -> some View {
+        let isSelected = node.id == manager.selectedProfileID
         let isActive = isSelected && manager.status == .connected
+        let flag = node.country.isEmpty ? flagEmoji(for: node.name) : node.country
 
         return Button {
-            manager.selectProfile(profile.id)
+            manager.selectProfile(node.id)
         } label: {
             HStack(spacing: 12) {
-                Text(flagEmoji(for: profile.name))
+                Text(flag)
                     .font(.title3)
                     .frame(width: 36, height: 36)
                     .background(Color.secondary.opacity(0.06))
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(profile.name)
-                        .font(.body.weight(.medium))
-                        .foregroundStyle(.primary)
-                    Text(isActive ? "Connected" : isSelected ? "Selected" : "Configured")
+                    HStack(spacing: 4) {
+                        Text(node.name)
+                            .font(.body.weight(.medium))
+                            .foregroundStyle(.primary)
+                        if node.source == .platform {
+                            Image(systemName: "lock.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Text(isActive ? "Connected" :
+                         isSelected ? "Selected" :
+                         node.source == .platform ? "Platform" : "Manual")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -331,17 +398,52 @@ struct ContentView: View {
     // MARK: - Tab 2: Servers (config editor + settings + UAPI)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+    private var selectedNodeIsPlatform: Bool {
+        guard let id = manager.selectedProfileID,
+              let node = manager.profiles.first(where: { $0.id == id }) else {
+            return false
+        }
+        return node.source == .platform
+    }
+
     private var serversTab: some View {
         ScrollView {
             VStack(spacing: 16) {
-                // Server picker + rename
+                // Node picker + rename
                 serverEditorHeader
 
-                // Route mode
+                // Platform node notice
+                if selectedNodeIsPlatform {
+                    HStack(spacing: 8) {
+                        Image(systemName: "lock.shield.fill")
+                            .foregroundStyle(.blue)
+                        Text("Platform node — config is managed remotely and hidden for security.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(12)
+                    .cardStyle()
+                }
+
+                // Route mode (both manual + platform)
                 routeModeSection
 
-                // Config editor
-                configEditorSection
+                // Config editor — only for manual nodes
+                if !selectedNodeIsPlatform {
+                    configEditorSection
+                }
+
+                // Save / Connect / Disconnect
+                HStack {
+                    Button("Save") { Task { await manager.saveCurrentProfile() } }
+                        .buttonStyle(.borderedProminent)
+                    Button("Connect") { manager.start() }
+                        .disabled(manager.status == .connected || manager.status == .connecting)
+                    Button("Disconnect") { manager.stop() }
+                        .disabled(manager.status != .connected && manager.status != .connecting)
+                }
+                .controlSize(.small)
+                .cardStyle()
 
                 // UAPI status
                 uapiStatusSection
@@ -360,11 +462,11 @@ struct ContentView: View {
 
     private var serverEditorHeader: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Server Settings")
+            Text("Node Settings")
                 .font(.title2.bold())
 
             HStack(spacing: 8) {
-                Picker("Server", selection: Binding(
+                Picker("Node", selection: Binding(
                     get: { manager.selectedProfileID ?? manager.profiles.first?.id ?? UUID() },
                     set: { manager.selectProfile($0) }
                 )) {
@@ -383,12 +485,12 @@ struct ContentView: View {
 
             HStack(spacing: 8) {
                 Button { manager.addProfile() } label: {
-                    Label("New", systemImage: "plus")
+                    Label("New Node", systemImage: "plus")
                 }
                 Button { manager.deleteSelectedProfile() } label: {
                     Label("Delete", systemImage: "trash")
                 }
-                .disabled(manager.profiles.count <= 1)
+                .disabled(manager.profiles.count <= 1 || selectedNodeIsPlatform)
 
                 Spacer()
 
