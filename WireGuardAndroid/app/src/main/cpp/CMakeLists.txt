@@ -46,6 +46,7 @@ target_include_directories(wg_session PRIVATE
 # Compiler flags matching the macOS Makefile
 target_compile_definitions(wg_session PRIVATE
     COMPAT_NEED_BLAKE2S
+    _GNU_SOURCE
 )
 
 target_compile_options(wg_session PRIVATE

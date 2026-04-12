@@ -1,0 +1,1 @@
+/Users/apple/Codex/wg/WireGuardAndroid/app/build/intermediates/cxx/Debug/5s3p311x/obj/x86

@@ -1,11 +1,8 @@
-/* FreeBSD sys/param.h → cross-platform stub */
+/* FreeBSD sys/param.h → cross-platform stub.
+ * #include_next skips this file and finds the real system header
+ * (works on macOS, Android NDK, and Linux — all use GCC/Clang). */
 #pragma once
-
-#if defined(__APPLE__)
-  #include_next <sys/param.h>
-#elif defined(__ANDROID__) || defined(__linux__)
-  #include <sys/param.h>
-#endif
+#include_next <sys/param.h>
 
 #include <stdint.h>
 #include <stdbool.h>

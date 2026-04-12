@@ -1,0 +1,27 @@
+{
+  "buildFiles": [
+    "/Users/apple/Codex/wg/WireGuardAndroid/app/src/main/cpp/CMakeLists.txt"
+  ],
+  "cleanCommandsComponents": [
+    [
+      "/Users/apple/Library/Android/sdk/cmake/3.22.1/bin/ninja",
+      "-C",
+      "/Users/apple/Codex/wg/WireGuardAndroid/app/.cxx/Debug/5s3p311x/x86",
+      "clean"
+    ]
+  ],
+  "buildTargetsCommandComponents": [
+    "/Users/apple/Library/Android/sdk/cmake/3.22.1/bin/ninja",
+    "-C",
+    "/Users/apple/Codex/wg/WireGuardAndroid/app/.cxx/Debug/5s3p311x/x86",
+    "{LIST_OF_TARGETS_TO_BUILD}"
+  ],
+  "libraries": {
+    "wg_session::@6890427a1f51a3e7e1df": {
+      "artifactName": "wg_session",
+      "abi": "x86",
+      "output": "/Users/apple/Codex/wg/WireGuardAndroid/app/build/intermediates/cxx/Debug/5s3p311x/obj/x86/libwg_session.so",
+      "runtimeFiles": []
+    }
+  }
+}

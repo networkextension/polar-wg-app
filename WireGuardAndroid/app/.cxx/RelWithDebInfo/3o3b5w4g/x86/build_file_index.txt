@@ -1,0 +1,1 @@
+/Users/apple/Codex/wg/WireGuardAndroid/app/src/main/cpp/CMakeLists.txt
