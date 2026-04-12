@@ -56,6 +56,9 @@ target_compile_options(wg_session PRIVATE
     -O2
 )
 
+# 16KB page alignment (required by Google Play from Nov 2025)
+target_link_options(wg_session PRIVATE -Wl,-z,max-page-size=16384)
+
 # Link against Android's log library for __android_log_print
 find_library(log-lib log)
 target_link_libraries(wg_session ${log-lib})
