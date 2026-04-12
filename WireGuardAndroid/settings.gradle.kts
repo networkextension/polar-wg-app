@@ -5,12 +5,11 @@ pluginManagement {
         gradlePluginPortal()
     }
 }
-dependencyResolution {
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
         google()
         mavenCentral()
-        // WireGuard Android tunnel library
-        maven { url = uri("https://raw.githubusercontent.com/nickoala/tailscale-android/maven-repo/") }
     }
 }
 
