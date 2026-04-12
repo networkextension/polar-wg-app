@@ -953,6 +953,11 @@ wg_session_tick(wg_session_t *s)
         if (!p->active) continue;
 
         if (p->hs_pending && (now - p->hs_sent_at) >= REKEY_TIMEOUT_SEC) {
+            /* Back off BEFORE trying, so even if noise_create_initiation
+             * fails (e.g. CryptoKit rejects the ephemeral key on re-import),
+             * we wait a full REKEY_TIMEOUT before the next attempt instead
+             * of hammering every 1-second tick. */
+            p->hs_sent_at = now;
             if (p->hs_attempts >= MAX_HANDSHAKE_ATTEMPTS) {
                 wgs_log(s, "[hs] giving up after %d attempts", p->hs_attempts);
                 p->hs_pending  = false;

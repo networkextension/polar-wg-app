@@ -1437,8 +1437,11 @@ tunnel_send_initiation(tunnel_ctx *ctx, struct peer_state *peer,
 static void
 tunnel_tick_peer(tunnel_ctx *ctx, struct peer_state *peer, time_t now)
 {
-    /* 1. Pending handshake retransmit. */
+    /* 1. Pending handshake retransmit. Back off BEFORE trying, so even
+     * if noise_create_initiation fails, we wait a full REKEY_TIMEOUT
+     * before the next attempt instead of hammering every tick. */
     if (peer->hs_pending && (now - peer->hs_sent_at) >= REKEY_TIMEOUT_SEC) {
+        peer->hs_sent_at = now;
         if (peer->hs_attempts >= MAX_HANDSHAKE_ATTEMPTS) {
             fprintf(stderr, "[hs] giving up after %d attempts\n", peer->hs_attempts);
             peer->hs_pending  = false;
