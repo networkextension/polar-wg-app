@@ -448,6 +448,14 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         // MTU matches wg_core: 1420 gives us 60 bytes of outer overhead headroom.
         settings.mtu = 1420
+
+        // DNS: parse "DNS = 1.1.1.1, 1.0.0.1" from the wg-quick config text.
+        // When set, all DNS queries on the device go through the tunnel to
+        // these resolvers (Cloudflare, Google, or whatever the config says).
+        let dnsServers = parseDNSFromConfig(configText)
+        if !dnsServers.isEmpty {
+            settings.dnsSettings = NEDNSSettings(servers: dnsServers)
+        }
         routeDebugInfo = renderRouteDebug(
             mode: routeMode,
             tunnelRemote: remote,
@@ -724,6 +732,30 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             if !host.isEmpty, !port.isEmpty { return (host, port) }
         }
         return nil
+    }
+
+    /// Parse "DNS = 1.1.1.1, 1.0.0.1" from a wg-quick config text.
+    /// Returns an array of IP strings, empty if no DNS line found.
+    private func parseDNSFromConfig(_ config: String) -> [String] {
+        var inInterface = false
+        for line in config.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.lowercased().hasPrefix("[interface]") {
+                inInterface = true; continue
+            }
+            if trimmed.hasPrefix("[") {
+                inInterface = false; continue
+            }
+            if inInterface, trimmed.lowercased().hasPrefix("dns") {
+                let parts = trimmed.split(separator: "=", maxSplits: 1)
+                guard parts.count == 2 else { continue }
+                return parts[1]
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
+            }
+        }
+        return []
     }
 
     /// Enumerate all physical (non-loopback, non-utun) IPv4 interfaces
