@@ -2,15 +2,13 @@
 //
 // ContentView.swift
 //
-// Two-pane SwiftUI shell:
-//   - LEFT:  wg-quick config text editor + Save / Connect / Disconnect
-//   - RIGHT: live status from `sendProviderMessage("get=1\n\n")`,
-//            polled every 2 s while the tunnel is connected
+// VPN client UI matching the "WireGuard VPN Config Redesign" mockup:
+//   - Tab 1 (Connection): hero server card with big Connect button,
+//     server list, latency dots
+//   - Tab 2 (Servers): full config editor, route mode, UAPI status
 //
-// At the top sits a status bar that follows NEVPNStatus and a row of
-// "quick action" buttons that exercise UAPI SET (roam endpoint,
-// add/remove peer, etc.) so you can demo every wg(8) feature without
-// leaving the host app.
+// Preserves all existing TunnelManager functionality (multi-profile,
+// keychain persistence, auth, route modes, UAPI GET/SET demos).
 
 import SwiftUI
 import NetworkExtension
@@ -21,42 +19,39 @@ import AppKit
 import UIKit
 #endif
 
+// MARK: - Root
+
 struct ContentView: View {
     @StateObject private var manager = TunnelManager()
 
-    @State private var statusText: String = "(tunnel not running)"
+    @State private var statusText: String = ""
     @State private var statusTimer: Timer?
-    @State private var username: String = ""
-    @State private var email: String = ""
-    @State private var password: String = ""
-    @State private var isRegisterMode: Bool = false
-    @State private var isAuthLoading: Bool = false
+
+    // Auth fields
+    @State private var username = ""
+    @State private var email = ""
+    @State private var password = ""
+    @State private var isRegisterMode = false
+    @State private var isAuthLoading = false
     @State private var apiBaseURL: String = UserDefaults.standard.string(forKey: "api_base_url") ?? ""
+
+    // Tab
+    @State private var selectedTab: AppTab = .connection
+
+    enum AppTab: Hashable {
+        case connection, servers
+    }
 
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [Color.accentColor.opacity(0.08), Color.clear],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
+            bgGradient.ignoresSafeArea()
 
-            if manager.isLoaded {
-                if manager.isAuthenticated {
-                    VStack(spacing: 12) {
-                        header
-                        contentArea
-                        actionsBar
-                    }
-                    .padding(16)
-                } else {
-                    loginView
-                        .padding(16)
-                }
-            } else {
+            if !manager.isLoaded {
                 loadingView
-                    .padding(16)
+            } else if !manager.isAuthenticated {
+                loginView
+            } else {
+                mainTabs
             }
         }
         .task {
@@ -65,581 +60,602 @@ struct ContentView: View {
                 Task { @MainActor in await refreshStatus() }
             }
         }
-        .onDisappear {
-            statusTimer?.invalidate()
-            statusTimer = nil
-        }
+        .onDisappear { statusTimer?.invalidate() }
     }
 
-    // MARK: - Sections
+    // MARK: - Background
+
+    private var bgGradient: some View {
+        LinearGradient(
+            colors: [Color.blue.opacity(0.06), bgColor],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+    }
+
+    // MARK: - Loading
 
     private var loadingView: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 14) {
             Image(systemName: "shield.lefthalf.filled.badge.checkmark")
-                .font(.system(size: 42))
-                .foregroundStyle(Color.accentColor)
-            Text("Loading profiles…")
+                .font(.system(size: 44))
+                .foregroundStyle(.blue)
+            Text("Loading profiles...")
                 .font(.headline)
-            ProgressView()
-                .controlSize(.large)
+            ProgressView().controlSize(.large)
         }
-        .frame(maxWidth: 360)
-        .padding(20)
-        .background(Color.secondary.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .frame(maxWidth: 340)
+        .padding(24)
+        .cardStyle()
     }
 
-    @ViewBuilder
-    private var contentArea: some View {
-#if os(macOS)
-        HSplitView {
-            configPanel
-                .padding(.trailing, 6)
-            statusPanel
-                .padding(.leading, 6)
+    // MARK: - Tabs
+
+    private var mainTabs: some View {
+        TabView(selection: $selectedTab) {
+            connectionTab
+                .tabItem {
+                    Label("Connection", systemImage: "shield.checkered")
+                }
+                .tag(AppTab.connection)
+
+            serversTab
+                .tabItem {
+                    Label("Servers", systemImage: "server.rack")
+                }
+                .tag(AppTab.servers)
         }
-#else
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // MARK: - Tab 1: Connection
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    private var connectionTab: some View {
         ScrollView {
-            VStack(spacing: 12) {
-                configPanel
-                statusPanel
+            VStack(spacing: 20) {
+                // Title
+                VStack(spacing: 4) {
+                    Text("Connect to VPN")
+                        .font(.title.bold())
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text("Secure and fast WireGuard VPN")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                // Hero card — selected server
+                heroServerCard
+
+                // Server list
+                serverListSection
+
+                // Footer
+                if let err = manager.lastError {
+                    Label(err, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+
+                Text("Last updated a few seconds ago")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
-            .frame(maxWidth: .infinity)
+            .padding(16)
         }
-#endif
     }
 
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if #available(iOS 16.0, macOS 13.0, tvOS 16.0, *) {
-                ViewThatFits(in: .vertical) {
-                    HStack(spacing: 10) {
-                        Image(systemName: "shield.lefthalf.filled.badge.checkmark")
-                            .font(.title2)
-                            .foregroundStyle(Color.accentColor)
-                        Text("WireGuard NE Sample")
-                            .font(.title2.bold())
-                        Spacer()
-                        Button("Logout") { manager.logoutUser() }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                        statusPill
-                    }
-                    
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack(spacing: 8) {
-                            Image(systemName: "shield.lefthalf.filled.badge.checkmark")
-                                .font(.title3)
-                                .foregroundStyle(Color.accentColor)
-                            Text("WireGuard NE Sample")
-                                .font(.headline.bold())
-                            Spacer(minLength: 0)
-                        }
-                        
-                        HStack(spacing: 8) {
-                            statusPill
-                            Spacer(minLength: 0)
-                            Button("Logout") { manager.logoutUser() }
-                                .buttonStyle(.bordered)
-                                .controlSize(.small)
-                        }
+    private var heroServerCard: some View {
+        let profile = manager.profiles.first(where: { $0.id == manager.selectedProfileID })
+        let name = profile?.name ?? "No Server"
+        let flag = flagEmoji(for: name)
+        let isConnected = manager.status == .connected
+        let isConnecting = manager.status == .connecting || manager.status == .reasserting
+
+        return VStack(spacing: 16) {
+            HStack(spacing: 14) {
+                // Flag
+                Text(flag)
+                    .font(.system(size: 36))
+                    .frame(width: 48, height: 48)
+                    .background(Color.secondary.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(name)
+                        .font(.title3.bold())
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(isConnected ? .green : .gray)
+                            .frame(width: 8, height: 8)
+                        Text(isConnected ? "Latency: -" : "")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
-            } else {
-                HStack(spacing: 10) {
-                    Image(systemName: "shield.lefthalf.filled.badge.checkmark")
-                        .font(.title2)
-                        .foregroundStyle(Color.accentColor)
-                    Text("WireGuard NE Sample")
-                        .font(.title2.bold())
-                    Spacer()
-                    Button("Logout") { manager.logoutUser() }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    statusPill
+
+                Spacer()
+
+                // Status badge
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(statusColor)
+                        .frame(width: 8, height: 8)
+                    Text(manager.status.displayString.capitalized)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(statusColor)
                 }
             }
 
-            serverControls
-            .controlSize(.small)
+            // Big connect / disconnect button
+            Button {
+                if isConnected || isConnecting {
+                    manager.stop()
+                } else {
+                    Task { await manager.saveCurrentProfile() }
+                    manager.start()
+                }
+            } label: {
+                Text(isConnected ? "Disconnect" : isConnecting ? "Connecting..." : "Connect")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 48)
+                    .background(
+                        isConnected ? Color.red :
+                        isConnecting ? Color.orange : Color.blue
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(16)
+        .cardStyle()
+    }
 
-            storageControls
-            .controlSize(.small)
+    private var serverListSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Server List")
+                .font(.headline)
 
-            routingControls
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
+            // Recent / configured servers
+            if !manager.profiles.isEmpty {
+                Text("Recent")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 4)
 
-            if manager.routeMode == .split {
-                VStack(alignment: .leading, spacing: 6) {
-                    Label("Split Injected Routes (CIDR)", systemImage: "list.bullet.rectangle")
-                        .font(.subheadline.weight(.semibold))
-                    TextEditor(text: $manager.splitInjectedRoutes)
-                        .font(.system(.caption, design: .monospaced))
-                        .frame(minHeight: 64, maxHeight: 100)
-                        .padding(8)
-                        .background(platformTextBackgroundColor)
-                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    Text("One per line or comma separated, e.g. 10.10.0.0/16, 172.16.203.0/24")
+                ForEach(manager.profiles) { profile in
+                    serverRow(profile: profile)
+                }
+            }
+
+            // Add server
+            Button {
+                manager.addProfile()
+                selectedTab = .servers
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.title3)
+                        .foregroundStyle(.blue)
+                    Text("Add Server")
+                        .font(.body.weight(.medium))
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(14)
+                .cardStyle()
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private func serverRow(profile: ServerProfile) -> some View {
+        let isSelected = profile.id == manager.selectedProfileID
+        let isActive = isSelected && manager.status == .connected
+
+        return Button {
+            manager.selectProfile(profile.id)
+        } label: {
+            HStack(spacing: 12) {
+                Text(flagEmoji(for: profile.name))
+                    .font(.title3)
+                    .frame(width: 36, height: 36)
+                    .background(Color.secondary.opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(profile.name)
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(.primary)
+                    Text(isActive ? "Connected" : isSelected ? "Selected" : "Configured")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+
+                Spacer()
+
+                if isActive {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                } else if isSelected {
+                    Image(systemName: "checkmark.circle")
+                        .foregroundStyle(.blue)
+                }
+
+                Image(systemName: "chevron.right")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
             }
+            .padding(14)
+            .background(
+                isSelected ? Color.blue.opacity(0.06) : Color.secondary.opacity(0.04)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(isSelected ? Color.blue.opacity(0.2) : Color.clear, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // MARK: - Tab 2: Servers (config editor + settings + UAPI)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    private var serversTab: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                // Server picker + rename
+                serverEditorHeader
+
+                // Route mode
+                routeModeSection
+
+                // Config editor
+                configEditorSection
+
+                // UAPI status
+                uapiStatusSection
+
+                // Actions
+                actionsSection
+
+                // Logout
+                Button("Logout", role: .destructive) { manager.logoutUser() }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+            .padding(16)
         }
     }
 
-    private var loginView: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "lock.shield")
-                .font(.system(size: 42))
-                .foregroundStyle(Color.accentColor)
+    private var serverEditorHeader: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Server Settings")
+                .font(.title2.bold())
 
-            Text("Login Required")
-                .font(.title3.bold())
+            HStack(spacing: 8) {
+                Picker("Server", selection: Binding(
+                    get: { manager.selectedProfileID ?? manager.profiles.first?.id ?? UUID() },
+                    set: { manager.selectProfile($0) }
+                )) {
+                    ForEach(manager.profiles) { p in
+                        Text(p.name).tag(p.id)
+                    }
+                }
+                .labelsHidden()
 
-            Text("Please register or login to use tunnel controls. Config pull will be added later.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
+                TextField("Name", text: Binding(
+                    get: { manager.selectedProfileName },
+                    set: { manager.selectedProfileName = $0 }
+                ))
+                .textFieldStyle(.roundedBorder)
+            }
 
-            Picker("Mode", selection: $isRegisterMode) {
-                Text("Login").tag(false)
-                Text("Register").tag(true)
+            HStack(spacing: 8) {
+                Button { manager.addProfile() } label: {
+                    Label("New", systemImage: "plus")
+                }
+                Button { manager.deleteSelectedProfile() } label: {
+                    Label("Delete", systemImage: "trash")
+                }
+                .disabled(manager.profiles.count <= 1)
+
+                Spacer()
+
+                // Storage mode
+                Picker("Storage", selection: Binding(
+                    get: { manager.storageMode },
+                    set: { manager.setStorageMode($0) }
+                )) {
+                    ForEach(ProfileStorageMode.allCases) { m in
+                        Text(m.title).tag(m)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 200)
+            }
+            .controlSize(.small)
+        }
+        .cardStyle()
+    }
+
+    private var routeModeSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Routing", systemImage: "arrow.triangle.branch")
+                .font(.subheadline.weight(.semibold))
+
+            Picker("", selection: $manager.routeMode) {
+                ForEach(RouteMode.allCases) { m in
+                    Text(m.title).tag(m)
+                }
             }
             .pickerStyle(.segmented)
 
-            if isRegisterMode {
-                TextField("Username", text: $username)
-                    .textFieldStyle(.roundedBorder)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled(true)
+            if manager.routeMode == .split {
+                TextEditor(text: $manager.splitInjectedRoutes)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(minHeight: 60, maxHeight: 100)
+                    .padding(6)
+                    .background(textBg)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                Text("CIDRs: 10.10.0.0/16, 172.16.203.0/24")
+                    .font(.caption2).foregroundStyle(.tertiary)
             }
-
-            TextField("Email", text: $email)
-                .textFieldStyle(.roundedBorder)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled(true)
-
-            SecureField("Password", text: $password)
-                .textFieldStyle(.roundedBorder)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled(true)
-
-            TextField("API Base URL", text: $apiBaseURL)
-                .textFieldStyle(.roundedBorder)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled(true)
-
-            if let info = manager.authInfo {
-                Text(info)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            if let err = manager.authError {
-                Text(err)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            Button {
-                Task {
-                    isAuthLoading = true
-                    if isRegisterMode {
-                        await manager.register(
-                            username: username,
-                            email: email,
-                            password: password,
-                            apiBaseURL: apiBaseURL
-                        )
-                    } else {
-                        await manager.login(
-                            email: email,
-                            password: password,
-                            apiBaseURL: apiBaseURL
-                        )
-                    }
-                    isAuthLoading = false
-                }
-            } label: {
-                Group {
-                    if isAuthLoading {
-                        ProgressView()
-                    } else {
-                        Text(isRegisterMode ? "Register" : "Login")
-                    }
-                }
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(
-                isAuthLoading ||
-                apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                (isRegisterMode && username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            )
-
-            Text("Config pull is disabled for now.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
         }
-        .frame(maxWidth: 460)
-        .frame(maxWidth: .infinity)
-        .padding(20)
-        .background(Color.secondary.opacity(0.08))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .cardStyle()
     }
 
-    private var statusPill: some View {
-        let color: Color = {
-            switch manager.status {
-            case .connected:     return .green
-            case .connecting,
-                 .reasserting:   return .yellow
-            case .disconnecting: return .orange
-            case .disconnected,
-                 .invalid:       return .gray
-            @unknown default:    return .gray
-            }
-        }()
-        return HStack(spacing: 6) {
-            Circle().fill(color).frame(width: 10, height: 10)
-            Text(manager.status.displayString)
-                .font(.subheadline.monospaced())
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(Color.secondary.opacity(0.12))
-        .clipShape(Capsule())
-    }
-
-    private var actionsBar: some View {
-        adaptiveActionsBar
-    }
-
-    private var configPanel: some View {
+    private var configEditorSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             Label("wg-quick config", systemImage: "doc.text")
-                .font(.headline)
+                .font(.subheadline.weight(.semibold))
             TextEditor(text: $manager.configText)
-                .font(.system(.body, design: .monospaced))
-                .padding(8)
-                .background(platformTextBackgroundColor)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        }
-        .panelCardStyle()
-    }
+                .font(.system(.caption, design: .monospaced))
+                .frame(minHeight: 160)
+                .padding(6)
+                .background(textBg)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
 
-    private var statusPanel: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Label("UAPI status (get=1)", systemImage: "antenna.radiowaves.left.and.right")
-                    .font(.headline)
-                Spacer()
-                Button {
-                    copyToClipboard(statusText)
-                } label: {
-                    Label("Copy", systemImage: "doc.on.doc")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(statusText.isEmpty || statusText == "(tunnel not running)")
-            }
-            ScrollView {
-                Text(statusText)
-                    .font(.system(.caption, design: .monospaced))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-                    .padding(8)
-            }
-            .frame(minHeight: 180)
-            .background(platformTextBackgroundColor)
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        }
-        .panelCardStyle()
-    }
-
-    // MARK: - Helpers
-
-    private var platformTextBackgroundColor: Color {
-#if os(macOS)
-        return Color(nsColor: .textBackgroundColor)
-#else
-        return Color(uiColor: .secondarySystemBackground)
-#endif
-    }
-
-    private var regularServerControls: some View {
-        HStack(spacing: 8) {
-            Picker("Server", selection: Binding(
-                get: { manager.selectedProfileID ?? manager.profiles.first?.id ?? UUID() },
-                set: { manager.selectProfile($0) }
-            )) {
-                ForEach(manager.profiles) { profile in
-                    Text(profile.name).tag(profile.id)
-                }
-            }
-            .frame(minWidth: 140, maxWidth: 260)
-            .disabled(manager.profiles.isEmpty)
-
-            TextField("Server name", text: Binding(
-                get: { manager.selectedProfileName },
-                set: { manager.selectedProfileName = $0 }
-            ))
-            .textFieldStyle(.roundedBorder)
-
-            Button("New Server") { manager.addProfile() }
-            Button("Delete") { manager.deleteSelectedProfile() }
-                .disabled(manager.profiles.count <= 1)
-        }
-    }
-
-    @ViewBuilder
-    private var serverControls: some View {
-        if #available(iOS 16.0, macOS 13.0, tvOS 16.0, *) {
-            ViewThatFits(in: .vertical) {
-                regularServerControls
-                compactServerControls
-            }
-        } else {
-            compactServerControls
-        }
-    }
-
-    private var compactServerControls: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Picker("Server", selection: Binding(
-                get: { manager.selectedProfileID ?? manager.profiles.first?.id ?? UUID() },
-                set: { manager.selectProfile($0) }
-            )) {
-                ForEach(manager.profiles) { profile in
-                    Text(profile.name).tag(profile.id)
-                }
-            }
-            .pickerStyle(.menu)
-            .disabled(manager.profiles.isEmpty)
-
-            TextField("Server name", text: Binding(
-                get: { manager.selectedProfileName },
-                set: { manager.selectedProfileName = $0 }
-            ))
-            .textFieldStyle(.roundedBorder)
-
-            HStack(spacing: 8) {
-                Button("New Server") { manager.addProfile() }
-                Button("Delete") { manager.deleteSelectedProfile() }
-                    .disabled(manager.profiles.count <= 1)
-            }
-        }
-    }
-
-    private var regularStorageControls: some View {
-        HStack(spacing: 8) {
-            Text("Storage")
-                .font(.subheadline.weight(.semibold))
-            Picker("Storage", selection: Binding(
-                get: { manager.storageMode },
-                set: { manager.setStorageMode($0) }
-            )) {
-                ForEach(ProfileStorageMode.allCases) { mode in
-                    Text(mode.title).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-            .frame(maxWidth: 320)
-            Spacer(minLength: 0)
-        }
-    }
-
-    private var compactStorageControls: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Storage")
-                .font(.subheadline.weight(.semibold))
-            Picker("Storage", selection: Binding(
-                get: { manager.storageMode },
-                set: { manager.setStorageMode($0) }
-            )) {
-                ForEach(ProfileStorageMode.allCases) { mode in
-                    Text(mode.title).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-        }
-    }
-
-    @ViewBuilder
-    private var storageControls: some View {
-        if #available(iOS 16.0, macOS 13.0, tvOS 16.0, *) {
-            ViewThatFits(in: .vertical) {
-                regularStorageControls
-                compactStorageControls
-            }
-        } else {
-            compactStorageControls
-        }
-    }
-
-    private var regularRoutingControls: some View {
-        HStack(spacing: 8) {
-            Picker("Routing", selection: $manager.routeMode) {
-                ForEach(RouteMode.allCases) { mode in
-                    Text(mode.title).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-
-            Button("Save config") { Task { await manager.saveCurrentProfile() } }
-            Button("Connect") { manager.start() }
-                .disabled(manager.status == .connected || manager.status == .connecting)
-            Button("Disconnect") { manager.stop() }
-                .disabled(manager.status != .connected && manager.status != .connecting)
-        }
-    }
-
-    private var compactRoutingControls: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Picker("Routing", selection: $manager.routeMode) {
-                ForEach(RouteMode.allCases) { mode in
-                    Text(mode.title).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-
-            HStack(spacing: 8) {
+            HStack {
                 Button("Save config") { Task { await manager.saveCurrentProfile() } }
+                    .buttonStyle(.borderedProminent)
                 Button("Connect") { manager.start() }
                     .disabled(manager.status == .connected || manager.status == .connecting)
                 Button("Disconnect") { manager.stop() }
                     .disabled(manager.status != .connected && manager.status != .connecting)
             }
+            .controlSize(.small)
         }
+        .cardStyle()
     }
 
-    @ViewBuilder
-    private var routingControls: some View {
-        if #available(iOS 16.0, macOS 13.0, tvOS 16.0, *) {
-            ViewThatFits(in: .vertical) {
-                regularRoutingControls
-                compactRoutingControls
+    private var uapiStatusSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("UAPI Status", systemImage: "antenna.radiowaves.left.and.right")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Button("Refresh") { Task { await refreshStatus() } }
+                    .controlSize(.mini)
+                    .disabled(manager.status != .connected)
+                Button { copyToClipboard(statusText) } label: {
+                    Image(systemName: "doc.on.doc")
+                }
+                .controlSize(.mini)
             }
-        } else {
-            compactRoutingControls
+            ScrollView {
+                Text(statusText.isEmpty ? "(not connected)" : statusText)
+                    .font(.system(.caption2, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .padding(6)
+            }
+            .frame(minHeight: 100, maxHeight: 180)
+            .background(textBg)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
         }
+        .cardStyle()
     }
 
-    private var regularActionsBar: some View {
-        HStack(spacing: 8) {
-            if let err = manager.lastError {
-                Label(err, systemImage: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.red)
-                    .font(.caption)
-                Spacer()
-            } else {
-                Spacer()
+    private var actionsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("UAPI Demos", systemImage: "wrench.and.screwdriver")
+                .font(.subheadline.weight(.semibold))
+
+            HStack(spacing: 6) {
+                Button("Roam EP") { Task { await sendDemoSet(setEndpointDemo) } }
+                Button("Keepalive=15") { Task { await sendDemoSet(setKeepaliveDemo) } }
+                Button("Add Peer") { Task { await sendDemoSet(addPeerDemo) } }
+                Button("Rm Peer") { Task { await sendDemoSet(removePeerDemo) } }
             }
-            Button("Refresh status now") { Task { await refreshStatus() } }
-                .disabled(manager.status != .connected)
-            Button("Copy status") { copyToClipboard(statusText) }
-                .disabled(statusText.isEmpty || statusText == "(tunnel not running)")
-            Menu("UAPI demos") {
-                Button("Roam endpoint to 192.0.2.5:51820") { Task { await sendDemoSet(setEndpointDemo) } }
-                Button("Set persistent_keepalive=15") { Task { await sendDemoSet(setKeepaliveDemo) } }
-                Divider()
-                Button("Add demo peer") { Task { await sendDemoSet(addPeerDemo) } }
-                Button("Remove demo peer") { Task { await sendDemoSet(removePeerDemo) } }
-            }
+            .controlSize(.mini)
+            .buttonStyle(.bordered)
             .disabled(manager.status != .connected)
         }
+        .cardStyle()
     }
 
-    private var compactActionsBar: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if let err = manager.lastError {
-                Label(err, systemImage: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.red)
-                    .font(.caption)
-            }
-            HStack(spacing: 8) {
-                Button("Refresh") { Task { await refreshStatus() } }
-                    .disabled(manager.status != .connected)
-                Button("Copy") { copyToClipboard(statusText) }
-                    .disabled(statusText.isEmpty || statusText == "(tunnel not running)")
-                Menu("UAPI demos") {
-                    Button("Roam endpoint to 192.0.2.5:51820") { Task { await sendDemoSet(setEndpointDemo) } }
-                    Button("Set persistent_keepalive=15") { Task { await sendDemoSet(setKeepaliveDemo) } }
-                    Divider()
-                    Button("Add demo peer") { Task { await sendDemoSet(addPeerDemo) } }
-                    Button("Remove demo peer") { Task { await sendDemoSet(removePeerDemo) } }
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // MARK: - Login
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    private var loginView: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                Image(systemName: "lock.shield")
+                    .font(.system(size: 44))
+                    .foregroundStyle(.blue)
+                Text("Login Required")
+                    .font(.title3.bold())
+                Text("Register or login to use the VPN.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+
+                Picker("Mode", selection: $isRegisterMode) {
+                    Text("Login").tag(false)
+                    Text("Register").tag(true)
                 }
-                .disabled(manager.status != .connected)
+                .pickerStyle(.segmented)
+
+                if isRegisterMode {
+                    TextField("Username", text: $username)
+                        .textFieldStyle(.roundedBorder)
+                        #if !os(macOS)
+                        .textInputAutocapitalization(.never)
+                        #endif
+                        .autocorrectionDisabled()
+                }
+                TextField("Email", text: $email)
+                    .textFieldStyle(.roundedBorder)
+                    #if !os(macOS)
+                    .textInputAutocapitalization(.never)
+                    #endif
+                    .autocorrectionDisabled()
+                SecureField("Password", text: $password)
+                    .textFieldStyle(.roundedBorder)
+                TextField("API Base URL", text: $apiBaseURL)
+                    .textFieldStyle(.roundedBorder)
+                    #if !os(macOS)
+                    .textInputAutocapitalization(.never)
+                    #endif
+                    .autocorrectionDisabled()
+
+                if let info = manager.authInfo {
+                    Text(info).font(.caption).foregroundStyle(.secondary)
+                }
+                if let err = manager.authError {
+                    Text(err).font(.caption).foregroundStyle(.red)
+                }
+
+                Button {
+                    Task {
+                        isAuthLoading = true
+                        if isRegisterMode {
+                            await manager.register(username: username, email: email,
+                                                   password: password, apiBaseURL: apiBaseURL)
+                        } else {
+                            await manager.login(email: email, password: password,
+                                                apiBaseURL: apiBaseURL)
+                        }
+                        isAuthLoading = false
+                    }
+                } label: {
+                    Group {
+                        if isAuthLoading { ProgressView() }
+                        else { Text(isRegisterMode ? "Register" : "Login") }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 44)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isAuthLoading || apiBaseURL.isEmpty || email.isEmpty || password.isEmpty
+                          || (isRegisterMode && username.isEmpty))
             }
+            .frame(maxWidth: 400)
+            .padding(20)
+            .cardStyle()
+            .padding(16)
         }
     }
 
-    @ViewBuilder
-    private var adaptiveActionsBar: some View {
-        if #available(iOS 16.0, macOS 13.0, tvOS 16.0, *) {
-            ViewThatFits(in: .vertical) {
-                regularActionsBar
-                compactActionsBar
-            }
-        } else {
-            compactActionsBar
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // MARK: - Helpers
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    private var bgColor: Color {
+        #if os(macOS)
+        Color(nsColor: .windowBackgroundColor)
+        #else
+        Color(uiColor: .systemBackground)
+        #endif
+    }
+
+    private var statusColor: Color {
+        switch manager.status {
+        case .connected:                return .green
+        case .connecting, .reasserting: return .yellow
+        case .disconnecting:            return .orange
+        default:                        return .red
         }
+    }
+
+    private var textBg: Color {
+        #if os(macOS)
+        Color(nsColor: .textBackgroundColor)
+        #else
+        Color(uiColor: .secondarySystemBackground)
+        #endif
     }
 
     private func refreshStatus() async {
         guard manager.status == .connected else {
-            statusText = "(tunnel not running)"
+            statusText = ""
             return
         }
-        if let resp = await manager.uapiGet() {
-            statusText = resp
-        } else {
-            statusText = "(no response from extension)"
-        }
+        statusText = await manager.uapiGet() ?? "(no response)"
     }
 
     private func sendDemoSet(_ body: String) async {
         let resp = await manager.uapiSet(body) ?? "(no response)"
-        // Tack the response on top so the user can see what came back.
-        statusText = "── last SET response ──\n" + resp + "\n\n" + statusText
+        statusText = "── SET response ──\n" + resp + "\n\n" + statusText
     }
 
     private func copyToClipboard(_ text: String) {
-#if os(macOS)
+        #if os(macOS)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
-#else
+        #else
         UIPasteboard.general.string = text
-#endif
+        #endif
     }
 }
+
+// MARK: - Flag emoji guesser
+
+private func flagEmoji(for serverName: String) -> String {
+    let low = serverName.lowercased()
+    let map: [(String, String)] = [
+        ("tokyo", "🇯🇵"), ("japan", "🇯🇵"), ("jp", "🇯🇵"),
+        ("us", "🇺🇸"), ("united states", "🇺🇸"), ("america", "🇺🇸"),
+        ("london", "🇬🇧"), ("uk", "🇬🇧"), ("england", "🇬🇧"),
+        ("frankfurt", "🇩🇪"), ("germany", "🇩🇪"), ("de", "🇩🇪"),
+        ("singapore", "🇸🇬"), ("sg", "🇸🇬"),
+        ("sydney", "🇦🇺"), ("australia", "🇦🇺"), ("au", "🇦🇺"),
+        ("canada", "🇨🇦"), ("toronto", "🇨🇦"), ("ca", "🇨🇦"),
+        ("korea", "🇰🇷"), ("seoul", "🇰🇷"), ("kr", "🇰🇷"),
+        ("hong kong", "🇭🇰"), ("hk", "🇭🇰"),
+        ("india", "🇮🇳"), ("mumbai", "🇮🇳"),
+        ("brazil", "🇧🇷"), ("sao paulo", "🇧🇷"),
+        ("france", "🇫🇷"), ("paris", "🇫🇷"),
+        ("home", "🏠"), ("local", "🏠"), ("dev", "🛠"),
+    ]
+    for (keyword, emoji) in map {
+        if low.contains(keyword) { return emoji }
+    }
+    return "🌐"
+}
+
+// MARK: - Card modifier
 
 private extension View {
-    func panelCardStyle() -> some View {
+    func cardStyle() -> some View {
         self
-            .padding(12)
-            .background(Color.secondary.opacity(0.08))
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
-            )
+            .padding(14)
+            .background(.regularMaterial)
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .shadow(color: .black.opacity(0.04), radius: 6, y: 2)
     }
 }
 
-// MARK: - Default config + UAPI demo blobs
+// MARK: - UAPI demo blobs
 
 let defaultConfigText = """
 [Interface]
@@ -653,55 +669,26 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 """
 
-// The peer pubkey from the default config, hex-encoded as
-// wg(8) expects in the UAPI text protocol.
 private let defaultPeerHex =
     "5d71736e30e59f4db2fda59fa36445559fdfa22302fcd128f502970dd93d4979"
-
 private let demoNewPeerHex =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 private var setEndpointDemo: String {
-    """
-    set=1
-    public_key=\(defaultPeerHex)
-    endpoint=192.0.2.5:51820
-
-    """
+    "set=1\npublic_key=\(defaultPeerHex)\nendpoint=192.0.2.5:51820\n\n"
 }
-
 private var setKeepaliveDemo: String {
-    """
-    set=1
-    public_key=\(defaultPeerHex)
-    persistent_keepalive_interval=15
-
-    """
+    "set=1\npublic_key=\(defaultPeerHex)\npersistent_keepalive_interval=15\n\n"
 }
-
 private var addPeerDemo: String {
-    """
-    set=1
-    public_key=\(demoNewPeerHex)
-    endpoint=198.51.100.1:51820
-    allowed_ip=10.99.0.0/24
-    persistent_keepalive_interval=25
-
-    """
+    "set=1\npublic_key=\(demoNewPeerHex)\nendpoint=198.51.100.1:51820\nallowed_ip=10.99.0.0/24\npersistent_keepalive_interval=25\n\n"
 }
-
 private var removePeerDemo: String {
-    """
-    set=1
-    public_key=\(demoNewPeerHex)
-    remove=true
-
-    """
+    "set=1\npublic_key=\(demoNewPeerHex)\nremove=true\n\n"
 }
 
 struct ContentView_Previews: PreviewProvider {
     static var previews: some View {
         ContentView()
-            .frame(width: 800, height: 540)
     }
 }

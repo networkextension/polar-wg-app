@@ -65,8 +65,6 @@ targets:
     type: application
     platform: macOS
     sources:
-      - path: Launch Screen.storyboard
-      - path: Assets.xcassets
       - path: WireGuardSampleApp
         excludes:
           - "*.entitlements"
