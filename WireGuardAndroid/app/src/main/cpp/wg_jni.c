@@ -10,6 +10,7 @@
 
 #include <jni.h>
 #include <string.h>
+#include <netinet/in.h>
 #include <android/log.h>
 #include "wg_session.h"
 
