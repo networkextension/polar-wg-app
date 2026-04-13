@@ -14,12 +14,12 @@ import Foundation
 import SystemExtensions
 import os.log
 
-private let log = OSLog(subsystem: "com.change.wg.mac", category: "sysext")
+private let log = OSLog(subsystem: "com.change.wgsysext", category: "sysext")
 
 @MainActor
 final class SystemExtensionManager: NSObject, ObservableObject {
 
-    static let extensionBundleID = "com.change.wg.mac.tunnel"
+    static let extensionBundleID = "com.change.wgsysext.tunnel"
 
     enum Status: Equatable {
         case unknown

@@ -8,8 +8,8 @@
 #     (no App Store required).
 #
 # Bundle IDs:
-#   host app:  com.change.wg.mac
-#   sysext:    com.change.wg.mac.tunnel
+#   host app:  com.change.wgsysext
+#   sysext:    com.change.wgsysext.tunnel
 #
 # Before building, run `make xcframework` from the repo root.
 # Then: cd WireGuardSysExt && xcodegen generate && open WireGuardSysExt.xcodeproj
@@ -17,7 +17,7 @@
 name: WireGuardSysExt
 
 options:
-  bundleIdPrefix: com.change.wg.mac
+  bundleIdPrefix: com.change.wgsysext
   deploymentTarget:
     macOS: "13.0"
   createIntermediateGroups: true
@@ -54,7 +54,7 @@ targets:
           - "*.entitlements"
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.change.wg.mac
+        PRODUCT_BUNDLE_IDENTIFIER: com.change.wgsysext
         INFOPLIST_FILE: WireGuardApp/Info.plist
         CODE_SIGN_ENTITLEMENTS: WireGuardApp/WireGuardApp.entitlements
         LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
@@ -88,7 +88,7 @@ targets:
       - path: WireGuardTunnelSysExt/main.swift
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.change.wg.mac.tunnel
+        PRODUCT_BUNDLE_IDENTIFIER: com.change.wgsysext.tunnel
         INFOPLIST_FILE: WireGuardTunnelSysExt/Info.plist
         CODE_SIGN_ENTITLEMENTS: WireGuardTunnelSysExt/WireGuardTunnelSysExt.entitlements
         FRAMEWORK_SEARCH_PATHS:

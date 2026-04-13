@@ -29,7 +29,7 @@ final class SysExtTunnelManager: ObservableObject {
 
         let proto = NETunnelProviderProtocol()
         // This bundle ID must match the system extension target
-        proto.providerBundleIdentifier = "com.change.wg.mac.tunnel"
+        proto.providerBundleIdentifier = "com.change.wgsysext.tunnel"
         proto.serverAddress = firstEndpoint(from: config) ?? "wireguard"
         proto.providerConfiguration = [
             "config": config,
