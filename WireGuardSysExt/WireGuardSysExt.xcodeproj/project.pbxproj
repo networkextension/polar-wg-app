@@ -1,0 +1,513 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		1A8187EE233E8D74E8834A31 /* SystemExtensions.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1E73C9381B47B94A818F806C /* SystemExtensions.framework */; };
+		3AB8542DD0A7AC7498786BE3 /* WireGuardCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8C111BC0F5947D6F0AAA1B56 /* WireGuardCore.framework */; };
+		3EC87B4EAC8F4743E7C7E55D /* SystemExtensionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2BCC844CB2B91938FBCB608A /* SystemExtensionManager.swift */; };
+		482B537E24E442FF213C7214 /* PacketTunnelProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2501925540875F4EB525A299 /* PacketTunnelProvider.swift */; };
+		549C58FCE428A2F443347613 /* WireGuardSysExtApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 441FA6912284E69AD1495014 /* WireGuardSysExtApp.swift */; };
+		7E977EBD1124B0063CB829CD /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3BA866D9E3BF506BA8210ADD /* NetworkExtension.framework */; };
+		9A7B7DB7ADC85A8714B5C150 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = D395711C36ABAA2434909318 /* main.swift */; };
+		A3101768AA029B50283922C6 /* SysExtContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 656AF0483D05F8BB6AEC18CE /* SysExtContentView.swift */; };
+		BA6DA0E0795534EA0FB36964 /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 34E80840E3D64031EE610056 /* Network.framework */; };
+		BD9AA94A6897CF9C612935EA /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3BA866D9E3BF506BA8210ADD /* NetworkExtension.framework */; };
+		EC148EEB23E59681C91392A7 /* SysExtTunnelManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7270B12FCA776C8DD1FD2B24 /* SysExtTunnelManager.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		3585C46471CAEAF64737BA02 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A45040628B8C1FB99DE1F374 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 093186BC1E67052D0D80131B;
+			remoteInfo = WireGuardTunnelSysExt;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		1DF1E45D7D871AA822B0DF7C /* WireGuardApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WireGuardApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		1E73C9381B47B94A818F806C /* SystemExtensions.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemExtensions.framework; path = System/Library/Frameworks/SystemExtensions.framework; sourceTree = SDKROOT; };
+		2501925540875F4EB525A299 /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
+		2BA0841609107E2D666E25AB /* WireGuardTunnelSysExt.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = WireGuardTunnelSysExt.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
+		2BCC844CB2B91938FBCB608A /* SystemExtensionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemExtensionManager.swift; sourceTree = "<group>"; };
+		34E80840E3D64031EE610056 /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = System/Library/Frameworks/Network.framework; sourceTree = SDKROOT; };
+		3BA866D9E3BF506BA8210ADD /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = System/Library/Frameworks/NetworkExtension.framework; sourceTree = SDKROOT; };
+		441FA6912284E69AD1495014 /* WireGuardSysExtApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WireGuardSysExtApp.swift; sourceTree = "<group>"; };
+		4A74A65B22DF4840DD2FB6E8 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		656AF0483D05F8BB6AEC18CE /* SysExtContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SysExtContentView.swift; sourceTree = "<group>"; };
+		7270B12FCA776C8DD1FD2B24 /* SysExtTunnelManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SysExtTunnelManager.swift; sourceTree = "<group>"; };
+		8C111BC0F5947D6F0AAA1B56 /* WireGuardCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WireGuardCore.framework; path = "../build/xcframework/WireGuardCore.xcframework/macos-arm64_x86_64/WireGuardCore.framework"; sourceTree = "<group>"; };
+		D395711C36ABAA2434909318 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		38F5673CD2EE3263F4A803B3 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				7E977EBD1124B0063CB829CD /* NetworkExtension.framework in Frameworks */,
+				1A8187EE233E8D74E8834A31 /* SystemExtensions.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		8B2CF74358FE32B191C4E1E7 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BD9AA94A6897CF9C612935EA /* NetworkExtension.framework in Frameworks */,
+				BA6DA0E0795534EA0FB36964 /* Network.framework in Frameworks */,
+				3AB8542DD0A7AC7498786BE3 /* WireGuardCore.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		083F4CF0D1BFFFF083C3E16D /* WireGuardApp */ = {
+			isa = PBXGroup;
+			children = (
+				4A74A65B22DF4840DD2FB6E8 /* Info.plist */,
+				656AF0483D05F8BB6AEC18CE /* SysExtContentView.swift */,
+				7270B12FCA776C8DD1FD2B24 /* SysExtTunnelManager.swift */,
+				2BCC844CB2B91938FBCB608A /* SystemExtensionManager.swift */,
+				441FA6912284E69AD1495014 /* WireGuardSysExtApp.swift */,
+			);
+			path = WireGuardApp;
+			sourceTree = "<group>";
+		};
+		27B612FD46E4DE51329CF3E3 /* NetworkExtension */ = {
+			isa = PBXGroup;
+			children = (
+				31AED92BA302602A67776D15 /* Sources */,
+			);
+			path = NetworkExtension;
+			sourceTree = "<group>";
+		};
+		308A4092616CA316BFB38154 = {
+			isa = PBXGroup;
+			children = (
+				880E05B6BE850ED579816CAB /* wg */,
+				083F4CF0D1BFFFF083C3E16D /* WireGuardApp */,
+				7499FE3455057387721CEF4F /* WireGuardTunnelSysExt */,
+				9D1A0DCF9C7086ED1F4F6AB3 /* Frameworks */,
+				F5E9D8B943151B6261747F7B /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		31AED92BA302602A67776D15 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				2501925540875F4EB525A299 /* PacketTunnelProvider.swift */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		7499FE3455057387721CEF4F /* WireGuardTunnelSysExt */ = {
+			isa = PBXGroup;
+			children = (
+				D395711C36ABAA2434909318 /* main.swift */,
+			);
+			path = WireGuardTunnelSysExt;
+			sourceTree = "<group>";
+		};
+		880E05B6BE850ED579816CAB /* wg */ = {
+			isa = PBXGroup;
+			children = (
+				27B612FD46E4DE51329CF3E3 /* NetworkExtension */,
+			);
+			name = wg;
+			path = ..;
+			sourceTree = "<group>";
+		};
+		9D1A0DCF9C7086ED1F4F6AB3 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				34E80840E3D64031EE610056 /* Network.framework */,
+				3BA866D9E3BF506BA8210ADD /* NetworkExtension.framework */,
+				1E73C9381B47B94A818F806C /* SystemExtensions.framework */,
+				8C111BC0F5947D6F0AAA1B56 /* WireGuardCore.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		F5E9D8B943151B6261747F7B /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				1DF1E45D7D871AA822B0DF7C /* WireGuardApp.app */,
+				2BA0841609107E2D666E25AB /* WireGuardTunnelSysExt.systemextension */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		093186BC1E67052D0D80131B /* WireGuardTunnelSysExt */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AE29CB5481D8AFC7C4E15C45 /* Build configuration list for PBXNativeTarget "WireGuardTunnelSysExt" */;
+			buildPhases = (
+				49070BA5D54312E4DBDBA7D8 /* Sources */,
+				8B2CF74358FE32B191C4E1E7 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = WireGuardTunnelSysExt;
+			packageProductDependencies = (
+			);
+			productName = WireGuardTunnelSysExt;
+			productReference = 2BA0841609107E2D666E25AB /* WireGuardTunnelSysExt.systemextension */;
+			productType = "com.apple.product-type.system-extension";
+		};
+		9A4BE39EF35BECCB276607F4 /* WireGuardApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FCC56234CA24D1CDD66CD3A7 /* Build configuration list for PBXNativeTarget "WireGuardApp" */;
+			buildPhases = (
+				ADE71EE75A7EB687E52CBED8 /* Sources */,
+				38F5673CD2EE3263F4A803B3 /* Frameworks */,
+				5FA028A68F6AE95E54EA4BA2 /* Copy System Extension */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				ED2A716B28D862AD1BF08E87 /* PBXTargetDependency */,
+			);
+			name = WireGuardApp;
+			packageProductDependencies = (
+			);
+			productName = WireGuardApp;
+			productReference = 1DF1E45D7D871AA822B0DF7C /* WireGuardApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A45040628B8C1FB99DE1F374 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					093186BC1E67052D0D80131B = {
+						ProvisioningStyle = Automatic;
+					};
+					9A4BE39EF35BECCB276607F4 = {
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 4D21679856D89FE904738AD3 /* Build configuration list for PBXProject "WireGuardSysExt" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 308A4092616CA316BFB38154;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = F5E9D8B943151B6261747F7B /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				9A4BE39EF35BECCB276607F4 /* WireGuardApp */,
+				093186BC1E67052D0D80131B /* WireGuardTunnelSysExt */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		5FA028A68F6AE95E54EA4BA2 /* Copy System Extension */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Copy System Extension";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "SYSEXT_SRC=\"${BUILT_PRODUCTS_DIR}/WireGuardTunnelSysExt.systemextension\"\nSYSEXT_DST=\"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Library/SystemExtensions/\"\nmkdir -p \"${SYSEXT_DST}\"\nif [ -d \"${SYSEXT_SRC}\" ]; then\n  cp -Rf \"${SYSEXT_SRC}\" \"${SYSEXT_DST}\"\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		49070BA5D54312E4DBDBA7D8 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				482B537E24E442FF213C7214 /* PacketTunnelProvider.swift in Sources */,
+				9A7B7DB7ADC85A8714B5C150 /* main.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		ADE71EE75A7EB687E52CBED8 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A3101768AA029B50283922C6 /* SysExtContentView.swift in Sources */,
+				EC148EEB23E59681C91392A7 /* SysExtTunnelManager.swift in Sources */,
+				3EC87B4EAC8F4743E7C7E55D /* SystemExtensionManager.swift in Sources */,
+				549C58FCE428A2F443347613 /* WireGuardSysExtApp.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		ED2A716B28D862AD1BF08E87 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 093186BC1E67052D0D80131B /* WireGuardTunnelSysExt */;
+			targetProxy = 3585C46471CAEAF64737BA02 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		0961EC94AFAFB11A4AC5FC2B /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = WireGuardApp/WireGuardApp.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = Z9XG3YEP93;
+				INFOPLIST_FILE = WireGuardApp/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
+				PRODUCT_BUNDLE_IDENTIFIER = com.change.wg.mac;
+				SDKROOT = macosx;
+				SYSTEM_EXTENSION_INSTALL_PATH = "$(CONTENTS_FOLDER_PATH)/Library/SystemExtensions";
+			};
+			name = Debug;
+		};
+		6C6C5B33ABD9CE576AD20115 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 0.1.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.9;
+			};
+			name = Release;
+		};
+		BADC0E98D6C729A3EBAC1A0F /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 0.1.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.9;
+			};
+			name = Debug;
+		};
+		CBAF111BD92910B9247AF5DF /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = WireGuardTunnelSysExt/WireGuardTunnelSysExt.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = Z9XG3YEP93;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(SRCROOT)/../build/xcframework/WireGuardCore.xcframework/macos-arm64_x86_64",
+					"\"../build/xcframework/WireGuardCore.xcframework/macos-arm64_x86_64\"",
+				);
+				INFOPLIST_FILE = WireGuardTunnelSysExt/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
+				OTHER_LDFLAGS = (
+					"-framework",
+					WireGuardCore,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.change.wg.mac.tunnel;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		E95DEEC88A370B1475FDD600 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = WireGuardTunnelSysExt/WireGuardTunnelSysExt.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = Z9XG3YEP93;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(SRCROOT)/../build/xcframework/WireGuardCore.xcframework/macos-arm64_x86_64",
+					"\"../build/xcframework/WireGuardCore.xcframework/macos-arm64_x86_64\"",
+				);
+				INFOPLIST_FILE = WireGuardTunnelSysExt/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
+				OTHER_LDFLAGS = (
+					"-framework",
+					WireGuardCore,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.change.wg.mac.tunnel;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		EF192343FF5F4B1CCB79A645 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = WireGuardApp/WireGuardApp.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = Z9XG3YEP93;
+				INFOPLIST_FILE = WireGuardApp/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
+				PRODUCT_BUNDLE_IDENTIFIER = com.change.wg.mac;
+				SDKROOT = macosx;
+				SYSTEM_EXTENSION_INSTALL_PATH = "$(CONTENTS_FOLDER_PATH)/Library/SystemExtensions";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		4D21679856D89FE904738AD3 /* Build configuration list for PBXProject "WireGuardSysExt" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				BADC0E98D6C729A3EBAC1A0F /* Debug */,
+				6C6C5B33ABD9CE576AD20115 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		AE29CB5481D8AFC7C4E15C45 /* Build configuration list for PBXNativeTarget "WireGuardTunnelSysExt" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				CBAF111BD92910B9247AF5DF /* Debug */,
+				E95DEEC88A370B1475FDD600 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		FCC56234CA24D1CDD66CD3A7 /* Build configuration list for PBXNativeTarget "WireGuardApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0961EC94AFAFB11A4AC5FC2B /* Debug */,
+				EF192343FF5F4B1CCB79A645 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A45040628B8C1FB99DE1F374 /* Project object */;
+}

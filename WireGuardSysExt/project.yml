@@ -1,0 +1,105 @@
+# WireGuard macOS System Extension project.
+#
+# Two targets:
+#   - WireGuardApp: host app (SwiftUI), installs + activates the sysext
+#   - WireGuardTunnelSysExt: system extension (.systemextension) that
+#     hosts the PacketTunnelProvider. Runs as a standalone system-managed
+#     process, survives app exit, distributable via Developer ID
+#     (no App Store required).
+#
+# Bundle IDs:
+#   host app:  com.change.wg.mac
+#   sysext:    com.change.wg.mac.tunnel
+#
+# Before building, run `make xcframework` from the repo root.
+# Then: cd WireGuardSysExt && xcodegen generate && open WireGuardSysExt.xcodeproj
+
+name: WireGuardSysExt
+
+options:
+  bundleIdPrefix: com.change.wg.mac
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ""
+    ENABLE_HARDENED_RUNTIME: YES
+  configs:
+    Debug:
+      SWIFT_OPTIMIZATION_LEVEL: -Onone
+      ONLY_ACTIVE_ARCH: YES
+    Release:
+      SWIFT_OPTIMIZATION_LEVEL: -O
+
+schemes:
+  WireGuardApp:
+    build:
+      targets:
+        WireGuardApp: all
+
+targets:
+  WireGuardApp:
+    type: application
+    platform: macOS
+    sources:
+      - path: WireGuardApp
+        excludes:
+          - "*.entitlements"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.change.wg.mac
+        INFOPLIST_FILE: WireGuardApp/Info.plist
+        CODE_SIGN_ENTITLEMENTS: WireGuardApp/WireGuardApp.entitlements
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
+        # System Extension lives in Contents/Library/SystemExtensions/
+        SYSTEM_EXTENSION_INSTALL_PATH: "$(CONTENTS_FOLDER_PATH)/Library/SystemExtensions"
+    dependencies:
+      - target: WireGuardTunnelSysExt
+        embed: false
+        codeSign: true
+      - sdk: NetworkExtension.framework
+      - sdk: SystemExtensions.framework
+
+    # Copy the .systemextension bundle into the correct location
+    postBuildScripts:
+      - name: "Copy System Extension"
+        script: |
+          SYSEXT_SRC="${BUILT_PRODUCTS_DIR}/WireGuardTunnelSysExt.systemextension"
+          SYSEXT_DST="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Library/SystemExtensions/"
+          mkdir -p "${SYSEXT_DST}"
+          if [ -d "${SYSEXT_SRC}" ]; then
+            cp -Rf "${SYSEXT_SRC}" "${SYSEXT_DST}"
+          fi
+
+  WireGuardTunnelSysExt:
+    type: system-extension
+    platform: macOS
+    sources:
+      # Reuse the PacketTunnelProvider from the NE project
+      - path: ../NetworkExtension/Sources/PacketTunnelProvider.swift
+      # System extension entry point
+      - path: WireGuardTunnelSysExt/main.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.change.wg.mac.tunnel
+        INFOPLIST_FILE: WireGuardTunnelSysExt/Info.plist
+        CODE_SIGN_ENTITLEMENTS: WireGuardTunnelSysExt/WireGuardTunnelSysExt.entitlements
+        FRAMEWORK_SEARCH_PATHS:
+          - "$(SRCROOT)/../build/xcframework/WireGuardCore.xcframework/macos-arm64_x86_64"
+        OTHER_LDFLAGS:
+          - "-framework"
+          - "WireGuardCore"
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
+    dependencies:
+      - sdk: NetworkExtension.framework
+      - sdk: Network.framework
+      - framework: ../build/xcframework/WireGuardCore.xcframework/macos-arm64_x86_64/WireGuardCore.framework
+        embed: false
+        codeSign: false
