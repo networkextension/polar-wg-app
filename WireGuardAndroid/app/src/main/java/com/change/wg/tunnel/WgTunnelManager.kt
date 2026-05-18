@@ -9,9 +9,11 @@ import com.wireguard.android.backend.GoBackend
 import com.wireguard.android.backend.Tunnel
 import com.wireguard.config.Config
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.BufferedReader
 import java.io.StringReader
@@ -103,6 +105,106 @@ class WgTunnelManager(private val app: Application) {
         disconnect()
         isSkippedLogin.value = false
         repo.isSkippedLogin = false
+    }
+
+    // ── Polar mesh join (auth + token + pull conf) ──────────────────────
+
+    val meshJoinError = MutableStateFlow<String?>(null)
+    val meshJoinInfo  = MutableStateFlow<String?>(null)
+    val isJoiningMesh = MutableStateFlow(false)
+
+    /**
+     * Onboard this device into a Polar wg-mac mesh.
+     *
+     * The "skip login + paste conf" path is unaffected — this is an
+     * additive flow. Sequence:
+     *
+     *   1. generate a Curve25519 keypair (wireguard-android.KeyPair)
+     *   2. POST /v1/register with {token, pubkey, lan_addrs, ...}
+     *   3. server returns device_ip + peers; render wg-quick conf
+     *   4. save as a new VPNNode (selected); meta sidecar in prefs
+     */
+    private val meshScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + Dispatchers.IO
+    )
+
+    fun joinMesh(token: String, serverUrl: String, listenPort: Int = 51820) {
+        meshJoinError.value = null
+        meshJoinInfo.value  = null
+        isJoiningMesh.value = true
+        meshScope.launch {
+            try {
+                val client = com.change.wg.data.MeshClient(serverUrl.trim())
+                val (privB64, pubB64) = com.change.wg.data.MeshClient.newKeypair()
+
+                val hostname = android.os.Build.MODEL.ifBlank { "android-${android.os.Build.ID}" }
+                val req = com.change.wg.data.MeshRegisterRequest(
+                    token     = token.trim(),
+                    pubkey    = pubB64,
+                    hostname  = hostname,
+                    os        = "android",
+                    arch      = android.os.Build.SUPPORTED_64_BIT_ABIS.firstOrNull() ?: "arm64",
+                    agent_ver = "wg-mac-app-android-${android.os.Build.VERSION.SDK_INT}",
+                    lan_addrs = com.change.wg.data.LanAddrs.enumerate(),
+                    wg_listen = listenPort,
+                )
+                val resp = client.register(req)
+                val conf = com.change.wg.data.MeshConfRenderer.render(resp, privB64, listenPort)
+
+                val shortDev = resp.device_id.takeLast(8)
+                val role = resp.role ?: "device"
+                val node = com.change.wg.data.VPNNode(
+                    name = "mesh-$role-$shortDev",
+                    config = conf,
+                    routeMode = com.change.wg.data.RouteMode.SPLIT,
+                    dnsMode = com.change.wg.data.DNSMode.PLAIN,
+                    splitInjectedRoutes = resp.mesh_cidr ?: "10.88.0.0/16",
+                )
+                withContext(Dispatchers.Main) {
+                    nodes.value = nodes.value + node
+                    selectedNodeId.value = node.id
+                    repo.saveNodes(nodes.value)
+                    repo.saveSelectedId(node.id)
+                    applySelectedToEditor()
+                    // Persist mesh metadata sidecar (token / device_id /
+                    // server) for a future heartbeat agent. NodeRepository
+                    // doesn't have a field for it so use raw prefs keyed
+                    // by node id.
+                    repo.saveMeshMeta(
+                        nodeId = node.id,
+                        deviceId = resp.device_id,
+                        deviceIp = resp.device_ip,
+                        token = resp.token ?: token.trim(),
+                        server = serverUrl.trim(),
+                        role = role,
+                        hubSlug = resp.hub_slug ?: "",
+                        siteId = resp.site_id ?: "",
+                    )
+                    meshJoinInfo.value  = "Joined: $role @ ${resp.device_ip}"
+                }
+            } catch (e: com.change.wg.data.MeshHttpError) {
+                meshJoinError.value = "HTTP ${e.status} — ${e.body.take(180)}"
+            } catch (_: com.change.wg.data.MeshBadUrlError) {
+                meshJoinError.value = "Bad server URL (need https://…)"
+            } catch (e: Throwable) {
+                meshJoinError.value = e.message ?: e.toString()
+            } finally {
+                isJoiningMesh.value = false
+            }
+        }
+    }
+
+    suspend fun leaveMeshAndDeleteSelected() {
+        val id = selectedNodeId.value ?: return
+        val meta = repo.loadMeshMeta(id)
+        if (meta != null) {
+            try {
+                com.change.wg.data.MeshClient(meta.server)
+                    .leave(meta.deviceId, meta.token)
+            } catch (_: Throwable) {}
+            repo.deleteMeshMeta(id)
+        }
+        deleteSelectedNode()
     }
 
     // ── Connect / Disconnect ───────────────────────────────────────────

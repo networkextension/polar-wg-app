@@ -43,8 +43,22 @@ struct ContentView: View {
     @State private var validationMessage = ""
 
     enum AppTab: Hashable {
-        case connection, servers
+        case connection, servers, mesh
     }
+
+    enum MeshTokenKind {
+        case polar, tailscale, unknown
+        static func of(_ raw: String) -> MeshTokenKind {
+            let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if t.hasPrefix("polar_wg_") { return .polar }
+            if t.hasPrefix("tskey-")    { return .tailscale }
+            return .unknown
+        }
+    }
+
+    // Polar mesh join sheet state
+    @State private var meshTokenField: String = ""
+    @State private var showMeshSheet: Bool = false
 
     var body: some View {
         ZStack {
@@ -102,13 +116,14 @@ struct ContentView: View {
 
     private var mainTabs: some View {
         #if os(macOS)
-        // macOS: sidebar navigation (standard Mac pattern)
         NavigationSplitView {
             List(selection: $selectedTab) {
                 Label("Connection", systemImage: "shield.checkered")
                     .tag(AppTab.connection)
                 Label("Servers", systemImage: "server.rack")
                     .tag(AppTab.servers)
+                Label("Mesh Join", systemImage: "person.crop.circle.badge.plus")
+                    .tag(AppTab.mesh)
             }
             .listStyle(.sidebar)
             .navigationTitle("WireGuard")
@@ -117,26 +132,195 @@ struct ContentView: View {
                 switch selectedTab {
                 case .connection: connectionTab
                 case .servers:    serversTab
+                case .mesh:       meshJoinTab
                 }
             }
         }
         .navigationSplitViewColumnWidth(min: 160, ideal: 200, max: 260)
         #else
-        // iPhone / iPad: bottom tab bar (standard iOS pattern)
         TabView(selection: $selectedTab) {
             connectionTab
-                .tabItem {
-                    Label("Connection", systemImage: "shield.checkered")
-                }
+                .tabItem { Label("Connection", systemImage: "shield.checkered") }
                 .tag(AppTab.connection)
-
             serversTab
-                .tabItem {
-                    Label("Servers", systemImage: "server.rack")
-                }
+                .tabItem { Label("Servers", systemImage: "server.rack") }
                 .tag(AppTab.servers)
+            meshJoinTab
+                .tabItem { Label("Mesh", systemImage: "person.crop.circle.badge.plus") }
+                .tag(AppTab.mesh)
         }
         #endif
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // MARK: - Tab 3: Polar Mesh Join
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    private var meshJoinTab: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                VStack(spacing: 4) {
+                    Text("Join Polar Mesh")
+                        .font(.title.bold())
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text("Paste an admin-issued token to onboard this device into a wg-mac mesh. The app generates a Curve25519 keypair locally; the private key never leaves the device.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Server URL").font(.caption).foregroundStyle(.secondary)
+                    TextField("https://zen.4950.store", text: $apiBaseURL)
+                        .textFieldStyle(.roundedBorder)
+                        #if !os(macOS)
+                        .textInputAutocapitalization(.never)
+                        #endif
+                        .autocorrectionDisabled()
+
+                    Text("Mesh Token").font(.caption).foregroundStyle(.secondary)
+                    TextField("polar_wg_…", text: $meshTokenField)
+                        .textFieldStyle(.roundedBorder)
+                        #if !os(macOS)
+                        .textInputAutocapitalization(.never)
+                        #endif
+                        .autocorrectionDisabled()
+                        .font(.system(.body, design: .monospaced))
+                }
+
+                if let info = manager.meshJoinInfo {
+                    Text(info).font(.caption).foregroundStyle(.green)
+                }
+                if let err = manager.meshJoinError {
+                    Text(err).font(.caption).foregroundStyle(.red)
+                }
+
+                let meshTokenKind = MeshTokenKind.of(meshTokenField)
+                if meshTokenKind == .tailscale {
+                    tailscaleRedirectCard
+                }
+
+                Button {
+                    let tok = meshTokenField
+                    let svr = apiBaseURL
+                    Task {
+                        await manager.joinMesh(token: tok, serverURL: svr)
+                        if manager.meshJoinError == nil {
+                            meshTokenField = ""
+                            selectedTab = .connection
+                        }
+                    }
+                } label: {
+                    Group {
+                        if manager.isJoiningMesh {
+                            ProgressView()
+                        } else if meshTokenKind == .tailscale {
+                            Text("Use Tailscale instead ↑")
+                        } else {
+                            Text("Join Mesh")
+                        }
+                    }
+                    .frame(maxWidth: .infinity).frame(height: 44)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(manager.isJoiningMesh
+                          || meshTokenField.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                          || apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                          || meshTokenKind == .tailscale)
+
+                if let id = manager.selectedProfileID,
+                   manager.meshMetadata(for: id) != nil {
+                    Divider()
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Current Mesh Profile").font(.subheadline.bold())
+                        if let meta = manager.meshMetadata(for: id) {
+                            keyVal("role",      meta["role"] ?? "")
+                            keyVal("device_ip", meta["device_ip"] ?? "")
+                            keyVal("device_id", meta["device_id"] ?? "")
+                            keyVal("hub",       meta["hub_slug"] ?? "(none)")
+                            keyVal("site",      meta["site_id"] ?? "")
+                            keyVal("server",    meta["server"] ?? "")
+                        }
+                        Button(role: .destructive) {
+                            Task { await manager.leaveMeshAndDeleteSelected() }
+                        } label: {
+                            Text("Leave + delete profile")
+                                .frame(maxWidth: .infinity).frame(height: 36)
+                        }
+                        .buttonStyle(.bordered)
+                        .padding(.top, 4)
+                    }
+                }
+            }
+            .padding()
+        }
+    }
+
+    private var tailscaleRedirectCard: some View {
+        let token = meshTokenField.trimmingCharacters(in: .whitespacesAndNewlines)
+        let server = apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cmd = "tailscale up --login-server=\(server) --authkey=\(token)"
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("🪶 This is a Tailscale token (tskey-…), not a wg-mac token.")
+                .font(.subheadline.bold())
+            Text("Install the official Tailscale client and run:")
+                .font(.caption).foregroundStyle(.secondary)
+            Text(cmd)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8)
+                .background(Color.secondary.opacity(0.15))
+                .cornerRadius(6)
+            HStack {
+                Button {
+                    copyToClipboard(cmd)
+                } label: {
+                    Label("Copy command", systemImage: "doc.on.doc")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+
+                Link(destination: tailscaleStoreURL) {
+                    Label(tailscaleStoreLabel, systemImage: "arrow.up.right.square")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(12)
+        .background(Color.yellow.opacity(0.15))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.yellow.opacity(0.6), lineWidth: 1)
+        )
+        .cornerRadius(8)
+    }
+
+    private var tailscaleStoreURL: URL {
+        #if os(macOS)
+        return URL(string: "https://tailscale.com/download/mac")!
+        #else
+        return URL(string: "https://apps.apple.com/app/tailscale/id1470499037")!
+        #endif
+    }
+
+    private var tailscaleStoreLabel: String {
+        #if os(macOS)
+        return "Download Tailscale"
+        #else
+        return "Open in App Store"
+        #endif
+    }
+
+    @ViewBuilder
+    private func keyVal(_ k: String, _ v: String) -> some View {
+        HStack(alignment: .top) {
+            Text(k).font(.caption.monospaced()).foregroundStyle(.secondary).frame(width: 80, alignment: .leading)
+            Text(v).font(.caption.monospaced()).foregroundStyle(.primary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

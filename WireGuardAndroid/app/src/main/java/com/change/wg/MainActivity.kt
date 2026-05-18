@@ -1,7 +1,12 @@
 package com.change.wg
 
 import android.app.Activity
+import android.content.ActivityNotFoundException
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -18,6 +23,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material3.LocalTextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import android.widget.Toast
 import com.change.wg.data.flagEmoji
 import com.change.wg.tunnel.WgTunnelManager
 import com.wireguard.android.backend.Tunnel
@@ -204,7 +210,12 @@ fun MainScreen(tm: WgTunnelManager) {
 
         Spacer(Modifier.height(20.dp))
 
-        // Config editor toggle
+        // Polar Mesh join section
+        MeshJoinSection(tm)
+
+        Spacer(Modifier.height(20.dp))
+
+        // Config editor toggle (paste-config path; works without login)
         OutlinedButton(
             onClick = {
                 if (!showConfig) editableConfig = configText
@@ -241,5 +252,164 @@ fun MainScreen(tm: WgTunnelManager) {
         }
 
         Spacer(Modifier.height(32.dp))
+    }
+}
+
+/**
+ * Polar Mesh onboarding section. The skip-login + paste-config path
+ * stays usable above; this is additive. Token is admin-issued; on
+ * submit the manager generates a keypair, calls /v1/register, renders
+ * a wg-quick conf, and adds it as a new VPNNode.
+ */
+private enum class MeshTokenKind { Polar, Tailscale, Unknown }
+
+private fun meshTokenKindOf(raw: String): MeshTokenKind {
+    val t = raw.trim()
+    return when {
+        t.startsWith("polar_wg_") -> MeshTokenKind.Polar
+        t.startsWith("tskey-")    -> MeshTokenKind.Tailscale
+        else                      -> MeshTokenKind.Unknown
+    }
+}
+
+@Composable
+fun MeshJoinSection(tm: WgTunnelManager) {
+    var server by remember { mutableStateOf("https://zen.4950.store") }
+    var token by remember { mutableStateOf("") }
+    val isJoining by tm.isJoiningMesh.collectAsState()
+    val joinErr  by tm.meshJoinError.collectAsState()
+    val joinInfo by tm.meshJoinInfo.collectAsState()
+    var expanded by remember { mutableStateOf(false) }
+    val tokenKind = meshTokenKindOf(token)
+    val ctx = LocalContext.current
+
+    OutlinedButton(
+        onClick = { expanded = !expanded },
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Text(if (expanded) "Hide Mesh Join" else "Join Polar Mesh")
+    }
+    if (!expanded) return
+
+    Spacer(Modifier.height(8.dp))
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Text(
+                "Paste an admin-issued token. The app generates a Curve25519 keypair on this device; the private key never leaves.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = server,
+                onValueChange = { server = it },
+                label = { Text("Server URL") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = token,
+                onValueChange = { token = it },
+                label = { Text("Mesh Token") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+                textStyle = LocalTextStyle.current.copy(fontFamily = FontFamily.Monospace),
+            )
+            Spacer(Modifier.height(8.dp))
+            joinErr?.let {
+                Text(it, color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall)
+            }
+            joinInfo?.let {
+                Text(it, color = MaterialTheme.colorScheme.primary,
+                    style = MaterialTheme.typography.bodySmall)
+            }
+
+            if (tokenKind == MeshTokenKind.Tailscale) {
+                Spacer(Modifier.height(8.dp))
+                TailscaleRedirectCard(ctx = ctx, server = server.trim(), token = token.trim())
+            }
+
+            Button(
+                onClick = { tm.joinMesh(token = token, serverUrl = server) },
+                enabled = !isJoining && token.isNotBlank() && server.isNotBlank()
+                    && tokenKind != MeshTokenKind.Tailscale,
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+            ) {
+                Text(when {
+                    isJoining -> "Joining…"
+                    tokenKind == MeshTokenKind.Tailscale -> "Use Tailscale instead ↑"
+                    else -> "Join"
+                })
+            }
+        }
+    }
+}
+
+@Composable
+private fun TailscaleRedirectCard(ctx: Context, server: String, token: String) {
+    val cmd = "tailscale up --login-server=$server --authkey=$token"
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+            contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+        ),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Text(
+                "🪶 This is a Tailscale token (tskey-…), not a wg-mac token.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Install the official Tailscale app and run:",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Spacer(Modifier.height(6.dp))
+            Surface(
+                color = MaterialTheme.colorScheme.surface,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    cmd,
+                    style = MaterialTheme.typography.bodySmall.copy(
+                        fontFamily = FontFamily.Monospace,
+                    ),
+                    modifier = Modifier.padding(8.dp),
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(modifier = Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = {
+                        val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(ClipData.newPlainText("tailscale up", cmd))
+                        Toast.makeText(ctx, "Command copied", Toast.LENGTH_SHORT).show()
+                    },
+                    modifier = Modifier.weight(1f),
+                ) { Text("Copy command") }
+                Spacer(Modifier.width(8.dp))
+                OutlinedButton(
+                    onClick = { openTailscalePlayStore(ctx) },
+                    modifier = Modifier.weight(1f),
+                ) { Text("Open Play Store") }
+            }
+        }
+    }
+}
+
+private fun openTailscalePlayStore(ctx: Context) {
+    val pkg = "com.tailscale.ipn"
+    val market = Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=$pkg"))
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    try {
+        ctx.startActivity(market)
+    } catch (_: ActivityNotFoundException) {
+        ctx.startActivity(
+            Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=$pkg"))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
     }
 }

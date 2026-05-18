@@ -78,4 +78,10 @@ dependencies {
 
     // JSON serialization
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+
+    // HTTP client. Used by AuthClient + MeshClient against the Polar
+    // control plane (/api/login + /v1/register + /v1/heartbeat). Cookie
+    // jar keeps the session after /api/login so the app can mint mesh
+    // tokens on behalf of the logged-in user later.
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }
