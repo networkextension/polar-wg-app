@@ -8,9 +8,13 @@
 // not need the noise/cookie/allowedips primitives directly — those
 // are implementation details of libwg.a.
 
-module WireGuardCore {
+// Inside a .framework bundle the module declaration must be tagged as
+// `framework module`, otherwise clang's framework-aware lookup refuses
+// to resolve the headers and emits "could not build module ...". The
+// xcframework build script copies this file into the framework's
+// Modules/ directory verbatim, so the qualifier needs to match the
+// final layout (framework module + bare header name).
+framework module WireGuardCore {
     header "wg_session.h"
     export *
-    link "wg"
-    link "swift_crypto"
 }

@@ -17,11 +17,26 @@
 #include "wg_session.h"
 #include "allowedips.h"
 
-#include <arpa/inet.h>
+#include <arpa/inet.h>   /* inet_pton, inet_ntop */
+/* ntohs/htons: on macOS they're in arpa/inet.h; on Android bionic
+ * they may only be in netinet/in.h or require an explicit fallback. */
+#if !defined(ntohs) && (defined(__ANDROID__) || defined(__linux__))
+  #include <endian.h>
+  #ifndef ntohs
+    #if __BYTE_ORDER == __LITTLE_ENDIAN
+      #define ntohs(x) __builtin_bswap16(x)
+      #define htons(x) __builtin_bswap16(x)
+    #else
+      #define ntohs(x) (x)
+      #define htons(x) (x)
+    #endif
+  #endif
+#endif
 #include <errno.h>
 #include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <strings.h>     /* bzero (Android strict C11 needs explicit include) */
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -29,18 +44,23 @@
 #include <string.h>
 #include <time.h>
 
-#include <libkern/OSByteOrder.h>
-#ifndef htole32
-#define htole32(x) OSSwapHostToLittleInt32(x)
-#endif
-#ifndef le32toh
-#define le32toh(x) OSSwapLittleToHostInt32(x)
-#endif
-#ifndef htole64
-#define htole64(x) OSSwapHostToLittleInt64(x)
-#endif
-#ifndef le64toh
-#define le64toh(x) OSSwapLittleToHostInt64(x)
+#if defined(__APPLE__)
+  #include <libkern/OSByteOrder.h>
+  #ifndef htole32
+  #define htole32(x) OSSwapHostToLittleInt32(x)
+  #endif
+  #ifndef le32toh
+  #define le32toh(x) OSSwapLittleToHostInt32(x)
+  #endif
+  #ifndef htole64
+  #define htole64(x) OSSwapHostToLittleInt64(x)
+  #endif
+  #ifndef le64toh
+  #define le64toh(x) OSSwapLittleToHostInt64(x)
+  #endif
+#else
+  /* On Android/Linux, sys/endian.h stub provides these. */
+  #include <sys/endian.h>
 #endif
 
 #include "macos_stubs/sys/mbuf.h"
@@ -953,6 +973,11 @@ wg_session_tick(wg_session_t *s)
         if (!p->active) continue;
 
         if (p->hs_pending && (now - p->hs_sent_at) >= REKEY_TIMEOUT_SEC) {
+            /* Back off BEFORE trying, so even if noise_create_initiation
+             * fails (e.g. CryptoKit rejects the ephemeral key on re-import),
+             * we wait a full REKEY_TIMEOUT before the next attempt instead
+             * of hammering every 1-second tick. */
+            p->hs_sent_at = now;
             if (p->hs_attempts >= MAX_HANDSHAKE_ATTEMPTS) {
                 wgs_log(s, "[hs] giving up after %d attempts", p->hs_attempts);
                 p->hs_pending  = false;
