@@ -36,7 +36,54 @@ class NodeRepository(context: Context) {
     var isSkippedLogin: Boolean
         get() = prefs.getBoolean("skipped_login", false)
         set(value) { prefs.edit().putBoolean("skipped_login", value).apply() }
+
+    // --- Polar mesh-join metadata per node -----------------------------------
+    //
+    // Stored as one JSON blob per node-id key. Lets a (future) heartbeat
+    // agent recover device_id + token to call /v1/heartbeat without
+    // re-running the join flow. Not part of SerializableNode because the
+    // token is sensitive — keep it out of the main blob to keep the
+    // "export this node as wg-quick conf" case from leaking it.
+
+    fun saveMeshMeta(
+        nodeId: String,
+        deviceId: String,
+        deviceIp: String,
+        token: String,
+        server: String,
+        role: String,
+        hubSlug: String,
+        siteId: String,
+    ) {
+        val raw = json.encodeToString(
+            MeshMetaEntry.serializer(),
+            MeshMetaEntry(deviceId, deviceIp, token, server, role, hubSlug, siteId),
+        )
+        prefs.edit().putString("mesh_meta.$nodeId", raw).apply()
+    }
+
+    fun loadMeshMeta(nodeId: String): MeshMetaEntry? {
+        val raw = prefs.getString("mesh_meta.$nodeId", null) ?: return null
+        return try {
+            json.decodeFromString(MeshMetaEntry.serializer(), raw)
+        } catch (_: Exception) { null }
+    }
+
+    fun deleteMeshMeta(nodeId: String) {
+        prefs.edit().remove("mesh_meta.$nodeId").apply()
+    }
 }
+
+@kotlinx.serialization.Serializable
+data class MeshMetaEntry(
+    val deviceId: String,
+    val deviceIp: String,
+    val token: String,
+    val server: String,
+    val role: String,
+    val hubSlug: String,
+    val siteId: String,
+)
 
 /**
  * Kotlinx.serialization-friendly mirror of VPNNode.

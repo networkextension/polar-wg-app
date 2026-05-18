@@ -370,6 +370,144 @@ final class TunnelManager: ObservableObject {
         persistProfilesToKeychain()
     }
 
+    // MARK: - Polar mesh (post-login token-based join)
+
+    /// Result of the last join attempt, surfaced as a banner in the UI.
+    @Published var meshJoinError: String?
+    @Published var meshJoinInfo: String?
+    @Published var isJoiningMesh: Bool = false
+
+    /// Per-profile mesh metadata (device_id + token + server) so a
+    /// future heartbeat agent can keep the profile fresh. Stored next
+    /// to the profile in keychain via persistProfilesToKeychain.
+    /// For now the join flow only writes; the agent is TODO.
+    private static let meshMetaDefaultsPrefix = "meshMeta."
+
+    /// Join the Polar mesh: keypair → POST /v1/register → render conf
+    /// → persist as a new ServerProfile and select it. UI calls this
+    /// from the join sheet with token + serverURL (defaults to apiBase).
+    ///
+    /// Does not auto-connect; the user reviews the profile then taps
+    /// Connect like any other server.
+    func joinMesh(token rawToken: String, serverURL: String? = nil) async {
+        meshJoinError = nil
+        meshJoinInfo = nil
+        isJoiningMesh = true
+        defer { isJoiningMesh = false }
+
+        let token = rawToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else {
+            meshJoinError = "token is empty"
+            return
+        }
+
+        // Server URL: explicit > app's stored API base.
+        let resolvedServer: String = {
+            if let s = serverURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !s.isEmpty { return s }
+            return UserDefaults.standard.string(forKey: "api_base_url") ?? ""
+        }()
+
+        do {
+            let client = try MeshClient.from(serverString: resolvedServer)
+            let (privB64, pubB64) = MeshClient.newKeypair()
+
+            // Hostname: iOS doesn't expose scutil; use ProcessInfo's
+            // hostname (often a generic "iPhone"), let server hash it.
+            let hostname = ProcessInfo.processInfo.hostName
+            let listen = 51820
+            let agentVer = "wg-mac-app-ios-1"
+
+            let resp = try await client.register(
+                token: token,
+                pubkey: pubB64,
+                hostname: hostname,
+                wgListen: listen,
+                lanAddrs: LANAddrs.enumerate(),
+                agentVer: agentVer
+            )
+
+            let conf = MeshConfRenderer.render(
+                response: resp,
+                privateKeyB64: privB64,
+                listenPort: listen
+            )
+
+            // Save as new profile. Name = mesh-<role>-<short device_id>.
+            let shortDev = String(resp.device_id.suffix(8))
+            let role = resp.role ?? "device"
+            let profileName = "mesh-\(role)-\(shortDev)"
+            let profile = VPNNode(
+                id: UUID(),
+                name: profileName,
+                config: conf,
+                source: .manual,
+                country: resp.hub_slug ?? "",
+                routeMode: .split,
+                dnsMode: .plain,
+                splitInjectedRoutes: resp.mesh_cidr ?? "10.88.0.0/16"
+            )
+            profiles.append(profile)
+            selectedProfileID = profile.id
+            applySelectedProfileToEditor()
+            persistProfilesToKeychain()
+
+            // Persist mesh metadata for the future heartbeat agent.
+            let meta: [String: String] = [
+                "device_id":  resp.device_id,
+                "device_ip":  resp.device_ip,
+                "token":      resp.token ?? token,
+                "server":     resolvedServer,
+                "role":       role,
+                "pubkey":     pubB64,
+                "hub_slug":   resp.hub_slug ?? "",
+                "site_id":    resp.site_id ?? "",
+            ]
+            if let encoded = try? JSONSerialization.data(withJSONObject: meta) {
+                UserDefaults.standard.set(encoded,
+                    forKey: Self.meshMetaDefaultsPrefix + profile.id.uuidString)
+            }
+
+            meshJoinInfo = "Joined: \(role) @ \(resp.device_ip)"
+        } catch MeshClientError.http(let code, let body) {
+            meshJoinError = "HTTP \(code) — \(body.prefix(180))"
+        } catch MeshClientError.badServerURL {
+            meshJoinError = "Bad server URL (need https://…)"
+        } catch MeshClientError.decode(let why) {
+            meshJoinError = "decode error: \(why)"
+        } catch {
+            meshJoinError = error.localizedDescription
+        }
+    }
+
+    /// Look up mesh metadata stored at join time (used by /v1/leave + a
+    /// future heartbeat agent). nil if this profile wasn't joined via
+    /// mesh (e.g. user pasted a wg conf manually).
+    func meshMetadata(for profileID: UUID) -> [String: String]? {
+        guard let data = UserDefaults.standard.data(
+                forKey: Self.meshMetaDefaultsPrefix + profileID.uuidString) else {
+            return nil
+        }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: String]
+    }
+
+    /// Best-effort /v1/leave for the selected profile, then delete it
+    /// locally. Wraps deleteSelectedProfile.
+    func leaveMeshAndDeleteSelected() async {
+        guard let id = selectedProfileID, let meta = meshMetadata(for: id),
+              let server = meta["server"], let dev = meta["device_id"],
+              let tok = meta["token"] else {
+            deleteSelectedProfile()
+            return
+        }
+        if let client = try? MeshClient.from(serverString: server) {
+            await client.leave(deviceID: dev, token: tok)
+        }
+        UserDefaults.standard.removeObject(
+            forKey: Self.meshMetaDefaultsPrefix + id.uuidString)
+        deleteSelectedProfile()
+    }
+
     func addProfile(named proposedName: String? = nil) {
         syncCurrentProfileDraft()
         let base = selectedProfile

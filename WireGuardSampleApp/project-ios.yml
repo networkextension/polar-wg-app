@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: MIT
+#
+# xcodegen spec for the iOS variant of WireGuardSampleApp. The macOS
+# variant lives in project.yml — same source tree, different targets,
+# different signing.
+#
+# Build for TestFlight:
+#   cd WireGuardSampleApp
+#   xcodegen --spec project-ios.yml
+#   xcodebuild -project WireGuardSampleApp-iOS.xcodeproj \
+#              -scheme WireGuardSampleApp-iOS \
+#              -configuration Release \
+#              -destination 'generic/platform=iOS' \
+#              -archivePath /tmp/wg-mac-app-ios.xcarchive \
+#              archive
+#   open /tmp/wg-mac-app-ios.xcarchive   # Xcode Organizer → Distribute App
+#
+# Or non-interactive upload (requires ASC API key + issuer ID):
+#   xcodebuild -exportArchive \
+#              -archivePath /tmp/wg-mac-app-ios.xcarchive \
+#              -exportOptionsPlist ExportOptions.plist \
+#              -allowProvisioningUpdates \
+#              -authenticationKeyID <KEY_ID> \
+#              -authenticationKeyIssuerID <ISSUER_ID> \
+#              -authenticationKeyPath ~/.appstoreconnect/private_keys/AuthKey_<KEY_ID>.p8
+
+name: WireGuardSampleApp-iOS
+
+options:
+  bundleIdPrefix: com.change.wg
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    PRODUCT_BUNDLE_IDENTIFIER_PREFIX: com.change.wg
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "0.1.0"
+    # Must monotonically increase; ASC rejects duplicates with
+    # ENTITY_ERROR.ATTRIBUTE.INVALID.DUPLICATE. Server's last known
+    # was 4, so we start at 5.
+    CURRENT_PROJECT_VERSION: "5"
+    CODE_SIGN_STYLE: Automatic
+    # Filled in from Apple Distribution cert "XiangBo Kong (Z9XG3YEP93)"
+    # already in the keychain. Change in Xcode → Signing if needed.
+    DEVELOPMENT_TEAM: "Z9XG3YEP93"
+    ENABLE_HARDENED_RUNTIME: YES
+    SWIFT_STRICT_CONCURRENCY: minimal
+    TARGETED_DEVICE_FAMILY: "1,2"   # iPhone + iPad
+  configs:
+    Debug:
+      SWIFT_OPTIMIZATION_LEVEL: -Onone
+      GCC_OPTIMIZATION_LEVEL: 0
+      ONLY_ACTIVE_ARCH: YES
+    Release:
+      SWIFT_OPTIMIZATION_LEVEL: -O
+      GCC_OPTIMIZATION_LEVEL: s
+
+packages: {}
+
+schemes:
+  WireGuardSampleApp-iOS:
+    build:
+      targets:
+        WireGuardSampleApp-iOS: all
+
+targets:
+  WireGuardSampleApp-iOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: WireGuardSampleApp
+        excludes:
+          - "*.entitlements"
+          - "Info.plist"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.change.wg
+        INFOPLIST_FILE: WireGuardSampleApp-iOS/Info.plist
+        CODE_SIGN_ENTITLEMENTS: WireGuardSampleApp-iOS/WireGuardSampleApp.entitlements
+        ENABLE_PREVIEWS: YES
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/Frameworks"
+    dependencies:
+      - target: WireGuardTunnelExtension-iOS
+        embed: true
+        codeSign: true
+      - sdk: NetworkExtension.framework
+
+  WireGuardTunnelExtension-iOS:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ../NetworkExtension/Sources/PacketTunnelProvider.swift
+      - path: WireGuardTunnelExtension
+        excludes:
+          - "*.entitlements"
+          - "Info.plist"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.change.wg.tunnel
+        INFOPLIST_FILE: WireGuardTunnelExtension-iOS/Info.plist
+        CODE_SIGN_ENTITLEMENTS: WireGuardTunnelExtension-iOS/WireGuardTunnelExtension.entitlements
+        SWIFT_VERSION: "5.9"
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/../../Frameworks"
+    dependencies:
+      - sdk: NetworkExtension.framework
+      - sdk: Network.framework
+      - framework: ../build/xcframework/WireGuardCore.xcframework
+        embed: false
+        codeSign: false
