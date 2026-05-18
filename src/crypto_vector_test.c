@@ -5,6 +5,7 @@
 
 #include "crypto.h"
 #include "wg_noise.h"
+#include "allowedips.h"
 #include <crypto/curve25519.h>
 #include <sys/mbuf.h>
 
@@ -581,6 +582,178 @@ out:
     return rc;
 }
 
+/* ─────────────────────────────────────────────────────────────────────────
+ * allowedips trie tests. Pure data-structure unit tests; no crypto.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+/* Stand-in "peers". The trie only stores opaque pointers, so we use
+ * the address of these globals as cheap unique tags. */
+static int peer_a, peer_b, peer_c, peer_default;
+#define PA (&peer_a)
+#define PB (&peer_b)
+#define PC (&peer_c)
+#define PD (&peer_default)
+
+static int test_aips_v4_basic_lpm(void)
+{
+    struct aips_trie t;
+    aips_init(&t, 32);
+
+    /* 10.0.0.0/8 → A   ; 10.88.0.0/16 → B   ; 10.88.0.2/32 → C */
+    aips_insert_v4(&t, 0x0a000000u,  8, PA);
+    aips_insert_v4(&t, 0x0a580000u, 16, PB);
+    aips_insert_v4(&t, 0x0a580002u, 32, PC);
+
+    struct { uint32_t addr; void *expect; const char *name; } cases[] = {
+        { 0x0a580002u, PC,   "10.88.0.2  /32 exact"   },
+        { 0x0a580003u, PB,   "10.88.0.3  /16 fallback" },
+        { 0x0a000001u, PA,   "10.0.0.1   /8 fallback"  },
+        { 0x0b000000u, NULL, "11.0.0.0   no match"     },
+        { 0x0a570000u, PA,   "10.87.0.0  /8 fallback"  },
+    };
+    int fails = 0;
+    for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+        void *got = aips_lookup_v4(&t, cases[i].addr);
+        if (got != cases[i].expect) {
+            printf("[FAIL] aips v4 LPM: %s — got %p expected %p\n",
+                   cases[i].name, got, cases[i].expect);
+            fails++;
+        }
+    }
+    if (fails == 0)
+        printf("[PASS] allowedips v4 longest-prefix-match (3 CIDRs, 5 lookups)\n");
+    aips_destroy(&t);
+    return fails;
+}
+
+static int test_aips_default_route(void)
+{
+    struct aips_trie t;
+    aips_init(&t, 32);
+
+    aips_insert_v4(&t, 0x00000000u, 0, PD);   /* 0.0.0.0/0 → default */
+    aips_insert_v4(&t, 0x0a000000u, 8, PA);   /* 10.0.0.0/8  → A     */
+
+    int fails = 0;
+    if (aips_lookup_v4(&t, 0x0a000001u) != PA)         { printf("[FAIL] dr: 10/8\n");      fails++; }
+    if (aips_lookup_v4(&t, 0x08080808u) != PD)         { printf("[FAIL] dr: 8.8.8.8\n");   fails++; }
+    if (aips_lookup_v4(&t, 0xffffffffu) != PD)         { printf("[FAIL] dr: 255.x\n");     fails++; }
+    if (fails == 0)
+        printf("[PASS] allowedips default route 0.0.0.0/0\n");
+    aips_destroy(&t);
+    return fails;
+}
+
+static int test_aips_replace_and_remove(void)
+{
+    struct aips_trie t;
+    aips_init(&t, 32);
+
+    aips_insert_v4(&t, 0x0a580002u, 32, PA);
+    if (aips_lookup_v4(&t, 0x0a580002u) != PA) {
+        printf("[FAIL] aips replace: initial insert\n");
+        aips_destroy(&t);
+        return 1;
+    }
+    /* Replace at the same exact CIDR. Entry count must stay 1. */
+    aips_insert_v4(&t, 0x0a580002u, 32, PB);
+    if (aips_lookup_v4(&t, 0x0a580002u) != PB) {
+        printf("[FAIL] aips replace: did not take effect\n");
+        aips_destroy(&t);
+        return 1;
+    }
+    if (t.entries != 1) {
+        printf("[FAIL] aips replace: entries=%zu (want 1)\n", t.entries);
+        aips_destroy(&t);
+        return 1;
+    }
+    /* Remove the exact CIDR — lookup should now return NULL. */
+    if (aips_remove(&t, (const uint8_t *)"\x0a\x58\x00\x02", 32) != 0) {
+        printf("[FAIL] aips remove: returned -1\n");
+        aips_destroy(&t);
+        return 1;
+    }
+    if (aips_lookup_v4(&t, 0x0a580002u) != NULL) {
+        printf("[FAIL] aips remove: lookup still finds peer\n");
+        aips_destroy(&t);
+        return 1;
+    }
+    if (t.entries != 0) {
+        printf("[FAIL] aips remove: entries=%zu (want 0)\n", t.entries);
+        aips_destroy(&t);
+        return 1;
+    }
+    /* Removing again must report -1. */
+    if (aips_remove(&t, (const uint8_t *)"\x0a\x58\x00\x02", 32) != -1) {
+        printf("[FAIL] aips remove: double-remove did not fail\n");
+        aips_destroy(&t);
+        return 1;
+    }
+    printf("[PASS] allowedips replace + remove + double-remove\n");
+    aips_destroy(&t);
+    return 0;
+}
+
+static int test_aips_v6(void)
+{
+    struct aips_trie t;
+    aips_init(&t, 128);
+
+    /* fd9f:ee52:46b8::/48 → A
+     * fd9f:ee52:46b8:1::/64 → B (more specific)
+     * fd9f:ee52:46b8:1::5 /128 → C (most specific)
+     */
+    static const uint8_t a48[16]  = { 0xfd,0x9f,0xee,0x52,0x46,0xb8 };
+    static const uint8_t b64[16]  = { 0xfd,0x9f,0xee,0x52,0x46,0xb8,
+                                      0x00,0x01 };
+    static const uint8_t c128[16] = { 0xfd,0x9f,0xee,0x52,0x46,0xb8,
+                                      0x00,0x01,0,0,0,0,0,0,0,0x05 };
+    static const uint8_t miss[16] = { 0x20,0x01,0x0d,0xb8 };
+
+    aips_insert(&t, a48,  48,  PA);
+    aips_insert(&t, b64,  64,  PB);
+    aips_insert(&t, c128, 128, PC);
+
+    if (aips_lookup(&t, c128) != PC) { printf("[FAIL] v6 /128 exact\n"); aips_destroy(&t); return 1; }
+    /* Address inside /64 but not /128 → should fall back to PB. */
+    uint8_t addr_in_64[16];
+    memcpy(addr_in_64, b64, 16);
+    addr_in_64[15] = 0x07;
+    if (aips_lookup(&t, addr_in_64) != PB) { printf("[FAIL] v6 /64 fallback\n"); aips_destroy(&t); return 1; }
+    /* Address inside /48 but outside /64 → fall back to PA. */
+    uint8_t addr_in_48[16];
+    memcpy(addr_in_48, a48, 16);
+    addr_in_48[7] = 0x09;
+    if (aips_lookup(&t, addr_in_48) != PA) { printf("[FAIL] v6 /48 fallback\n"); aips_destroy(&t); return 1; }
+    /* Outside the /48 → no match. */
+    if (aips_lookup(&t, miss) != NULL) { printf("[FAIL] v6 outside /48\n"); aips_destroy(&t); return 1; }
+
+    printf("[PASS] allowedips v6 longest-prefix-match (/48 /64 /128)\n");
+    aips_destroy(&t);
+    return 0;
+}
+
+static int test_aips_edge_cases(void)
+{
+    struct aips_trie t;
+    int fails = 0;
+
+    /* Empty trie: lookup must return NULL, not crash. */
+    aips_init(&t, 32);
+    if (aips_lookup_v4(&t, 0x01020304u) != NULL) {
+        printf("[FAIL] aips edge: empty trie lookup\n"); fails++;
+    }
+    /* Bad arguments rejected. */
+    if (aips_insert(&t, NULL, 8, PA) == 0)               { printf("[FAIL] insert(NULL)\n"); fails++; }
+    if (aips_insert_v4(&t, 0, 33, PA) == 0)              { printf("[FAIL] insert(/33)\n"); fails++; }
+    if (aips_insert_v4(&t, 0, 0, NULL) == 0)             { printf("[FAIL] insert(NULL peer)\n"); fails++; }
+    aips_destroy(&t);
+
+    if (fails == 0)
+        printf("[PASS] allowedips edge cases (empty / bad args)\n");
+    return fails;
+}
+
 int main(void)
 {
     int fails = 0;
@@ -599,6 +772,12 @@ int main(void)
     fails += test_chacha20_poly1305_roundtrip();
     fails += test_xchacha20_poly1305_roundtrip();
     fails += test_noise_loopback();
+
+    fails += test_aips_v4_basic_lpm();
+    fails += test_aips_default_route();
+    fails += test_aips_replace_and_remove();
+    fails += test_aips_v6();
+    fails += test_aips_edge_cases();
 
     crypto_deinit();
 
