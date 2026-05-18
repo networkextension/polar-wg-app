@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: MIT
+//
+// Module map for the WireGuard C library. Consumed by Swift via
+// `import WireGuardCore` once the xcframework is dropped into an
+// Xcode project (or SwiftPM target).
+//
+// Only the I/O-agnostic wg_session.h surface is exposed. Swift does
+// not need the noise/cookie/allowedips primitives directly — those
+// are implementation details of libwg.a.
+
+// Inside a .framework bundle the module declaration must be tagged as
+// `framework module`, otherwise clang's framework-aware lookup refuses
+// to resolve the headers and emits "could not build module ...". The
+// xcframework build script copies this file into the framework's
+// Modules/ directory verbatim, so the qualifier needs to match the
+// final layout (framework module + bare header name).
+framework module WireGuardCore {
+    header "wg_session.h"
+    export *
+}

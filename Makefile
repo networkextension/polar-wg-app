@@ -38,7 +38,8 @@ SRCS := \
     $(SRCDIR)/wg_cookie.c   \
     $(SRCDIR)/wg_crypto.c   \
     $(SRCDIR)/wg_crypto_impl.c \
-    $(SRCDIR)/allowedips.c
+    $(SRCDIR)/allowedips.c  \
+    $(SRCDIR)/wg_session.c
 
 OBJS := $(patsubst $(SRCDIR)/%.c, $(BUILDDIR)/%.o, $(SRCS))
 
@@ -46,13 +47,26 @@ OBJS := $(patsubst $(SRCDIR)/%.c, $(BUILDDIR)/%.o, $(SRCS))
 # It intentionally has no corresponding FreeBSD source file.
 
 # ── Primary targets ───────────────────────────────────────────────────────────
-.PHONY: all clean help test
+.PHONY: all clean help test xcframework build-ios
 
-all: $(BUILDDIR)/libwg.a $(BUILDDIR)/libswift_crypto.a $(BUILDDIR)/wg_core $(BUILDDIR)/crypto_vector_test
+all: $(BUILDDIR)/libwg.a $(BUILDDIR)/libswift_crypto.a
 
 test: $(BUILDDIR)/crypto_vector_test
 	@echo "  RUN  $<"
 	@$<
+
+# Build the multi-platform xcframework (macOS/iOS/tvOS/visionOS when supported)
+# that Swift NetworkExtension code imports.
+# See scripts/build-xcframework.sh for the full explanation of what
+# this produces and how to consume it from Xcode.
+xcframework:
+	@./scripts/build-xcframework.sh
+
+# Build the xcframework and verify iOS slices are present.
+build-ios: xcframework
+	@test -f build/xcframework/WireGuardCore.xcframework/ios-arm64/WireGuardCore.framework/WireGuardCore
+	@test -f build/xcframework/WireGuardCore.xcframework/ios-arm64_x86_64-simulator/WireGuardCore.framework/WireGuardCore
+	@echo "  OK  iOS slices present in WireGuardCore.xcframework"
 
 $(BUILDDIR)/libwg.a: $(OBJS)
 	$(AR) $(ARFLAGS) $@ $^
@@ -101,7 +115,8 @@ clean:
 
 help:
 	@echo "Targets:"
-	@echo "  all    – build libwg.a + libswift_crypto.a + wg_core  (default)"
+	@echo "  all    – build libwg.a + libswift_crypto.a  (default)"
+	@echo "  build-ios – build xcframework and verify iOS device/simulator slices"
 	@echo "  clean  – remove build artefacts"
 	@echo "  help   – this message"
 	@echo ""

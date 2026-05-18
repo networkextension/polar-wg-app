@@ -6,6 +6,7 @@
 #include "crypto.h"
 #include "wg_noise.h"
 #include "allowedips.h"
+#include "wg_session.h"
 #include <crypto/curve25519.h>
 #include <sys/mbuf.h>
 
@@ -733,6 +734,476 @@ static int test_aips_v6(void)
     return 0;
 }
 
+/* Exercise wg_session_create + wg_session_get_uapi end-to-end. Parses
+ * a small config, pulls the UAPI GET response out, checks a few
+ * canonical fields, and verifies the "NULL/0 first to size" contract. */
+static void uapi_test_log(void *u, const char *m) { (void)u; (void)m; }
+static void uapi_test_send(void *u, const uint8_t *b, size_t l,
+                           const struct sockaddr *a, socklen_t al)
+{
+    (void)u; (void)b; (void)l; (void)a; (void)al;
+}
+static void uapi_test_deliver(void *u, const uint8_t *b, size_t l)
+{
+    (void)u; (void)b; (void)l;
+}
+
+static int test_wg_session_uapi_get(void)
+{
+    static const char cfg[] =
+        "[Interface]\n"
+        "PrivateKey = yPDHiay/NDkJE9OyUT0J8qhuJXpihZw1aD7Xl4JJEVw=\n"
+        "Address    = 10.88.0.2/24\n"
+        "ListenPort = 51822\n"
+        "\n"
+        "[Peer]\n"
+        "PublicKey  = XXFzbjDln02y/aWfo2RFVZ/foiMC/NEo9QKXDdk9SXk=\n"
+        "AllowedIPs = 10.88.0.0/24, fd00::/64\n"
+        "PersistentKeepalive = 25\n";
+
+    wg_session_callbacks cb = {0};
+    cb.send_udp   = uapi_test_send;
+    cb.deliver_ip = uapi_test_deliver;
+    cb.log_line   = uapi_test_log;
+
+    wg_session_t *s = wg_session_create(cfg, sizeof(cfg) - 1, cb);
+    if (!s) { printf("[FAIL] wg_session_create\n"); return 1; }
+
+    /* Introspection sanity. */
+    if (wg_session_peer_count(s) != 1) {
+        printf("[FAIL] peer_count\n"); wg_session_destroy(s); return 1;
+    }
+    if (wg_session_listen_port(s) != 51822) {
+        printf("[FAIL] listen_port=%u\n", wg_session_listen_port(s));
+        wg_session_destroy(s);
+        return 1;
+    }
+    if (wg_session_peer_allowed_count(s, 0) != 2) {
+        printf("[FAIL] allowed_count\n"); wg_session_destroy(s); return 1;
+    }
+
+    /* Size-first query pattern. */
+    int need = wg_session_get_uapi(s, NULL, 0);
+    if (need < 64) {
+        printf("[FAIL] uapi size %d too small\n", need);
+        wg_session_destroy(s);
+        return 1;
+    }
+
+    char *buf = (char *)malloc((size_t)need + 1);
+    int wrote = wg_session_get_uapi(s, buf, (size_t)need + 1);
+    if (wrote != need) {
+        printf("[FAIL] uapi re-size %d != %d\n", wrote, need);
+        free(buf); wg_session_destroy(s);
+        return 1;
+    }
+
+    /* Canonical field presence checks. */
+    const char *required[] = {
+        "private_key=none\n",
+        "listen_port=51822\n",
+        "fwmark=0\n",
+        "public_key=",
+        "preshared_key=0000",
+        "persistent_keepalive_interval=25\n",
+        "allowed_ip=10.88.0.0/24\n",
+        "allowed_ip=fd00::/64\n",
+        "protocol_version=1\n",
+        "errno=0\n",
+    };
+    for (size_t i = 0; i < sizeof(required)/sizeof(required[0]); i++) {
+        if (!strstr(buf, required[i])) {
+            printf("[FAIL] uapi GET missing required field '%s'\n", required[i]);
+            printf("--- response ---\n%s---\n", buf);
+            free(buf);
+            wg_session_destroy(s);
+            return 1;
+        }
+    }
+
+    /* The response MUST end with "\n\n" per the UAPI spec so the
+     * reader knows where the record ends. */
+    if (need < 2 || buf[need - 2] != '\n' || buf[need - 1] != '\n') {
+        printf("[FAIL] uapi GET does not end with \\n\\n\n");
+        free(buf);
+        wg_session_destroy(s);
+        return 1;
+    }
+
+    free(buf);
+    wg_session_destroy(s);
+    printf("[PASS] wg_session_create + UAPI GET round trip\n");
+    return 0;
+}
+
+/* Exercise wg_session_set_uapi: load a config, mutate the peer's
+ * endpoint + keepalive + allowed-ips via a SET request, then re-read
+ * via GET and verify every change took effect. */
+static int test_wg_session_uapi_set(void)
+{
+    static const char cfg[] =
+        "[Interface]\n"
+        "PrivateKey = yPDHiay/NDkJE9OyUT0J8qhuJXpihZw1aD7Xl4JJEVw=\n"
+        "Address    = 10.88.0.2/24\n"
+        "ListenPort = 51823\n"
+        "[Peer]\n"
+        "PublicKey  = XXFzbjDln02y/aWfo2RFVZ/foiMC/NEo9QKXDdk9SXk=\n"
+        "AllowedIPs = 10.88.0.0/24\n"
+        "PersistentKeepalive = 25\n";
+
+    wg_session_callbacks cb = {0};
+    cb.send_udp   = uapi_test_send;
+    cb.deliver_ip = uapi_test_deliver;
+    cb.log_line   = uapi_test_log;
+
+    wg_session_t *s = wg_session_create(cfg, sizeof(cfg) - 1, cb);
+    if (!s) { printf("[FAIL] set: create\n"); return 1; }
+
+    /* The peer pubkey we'll mutate (XXFzbjDln02y/...) hex-encoded. */
+    static const char *peer_hex =
+        "5d71736e30e59f4db2fda59fa36445559fdfa22302fcd128f502970dd93d4979";
+
+    /* SET request: change endpoint, change keepalive, replace
+     * allowed-ips with two new CIDRs. */
+    char setreq[1024];
+    snprintf(setreq, sizeof(setreq),
+             "set=1\n"
+             "public_key=%s\n"
+             "endpoint=192.0.2.5:51820\n"
+             "persistent_keepalive_interval=42\n"
+             "replace_allowed_ips=true\n"
+             "allowed_ip=10.99.0.0/16\n"
+             "allowed_ip=10.99.0.0/24\n"
+             "\n",
+             peer_hex);
+
+    if (wg_session_set_uapi(s, setreq, strlen(setreq)) != 0) {
+        printf("[FAIL] set: wg_session_set_uapi returned non-zero\n");
+        wg_session_destroy(s);
+        return 1;
+    }
+
+    /* Verify via the introspection getters. */
+    char addr[80] = {0};
+    uint16_t port = 0;
+    if (wg_session_peer_endpoint(s, 0, addr, &port) != 0 ||
+        strcmp(addr, "192.0.2.5") != 0 || port != 51820) {
+        printf("[FAIL] set: endpoint not updated (got %s:%u)\n", addr, port);
+        wg_session_destroy(s);
+        return 1;
+    }
+    if (wg_session_peer_keepalive(s, 0) != 42) {
+        printf("[FAIL] set: keepalive=%d\n", wg_session_peer_keepalive(s, 0));
+        wg_session_destroy(s);
+        return 1;
+    }
+    if (wg_session_peer_allowed_count(s, 0) != 2) {
+        printf("[FAIL] set: allowed_count=%d\n",
+               wg_session_peer_allowed_count(s, 0));
+        wg_session_destroy(s);
+        return 1;
+    }
+
+    /* Re-read as UAPI GET and verify the canonical fields reflect the
+     * change. */
+    int need = wg_session_get_uapi(s, NULL, 0);
+    char *out = (char *)malloc((size_t)need + 1);
+    wg_session_get_uapi(s, out, (size_t)need + 1);
+
+    const char *required[] = {
+        "endpoint=192.0.2.5:51820\n",
+        "persistent_keepalive_interval=42\n",
+        "allowed_ip=10.99.0.0/16\n",
+        "allowed_ip=10.99.0.0/24\n",
+    };
+    /* And the OLD allowed-ip must be GONE. */
+    if (strstr(out, "allowed_ip=10.88.0.0/24") != NULL) {
+        printf("[FAIL] set: old allowed_ip still present after replace\n");
+        free(out); wg_session_destroy(s); return 1;
+    }
+    for (size_t i = 0; i < sizeof(required)/sizeof(required[0]); i++) {
+        if (!strstr(out, required[i])) {
+            printf("[FAIL] set: GET response missing '%s'\n", required[i]);
+            printf("--- got ---\n%s---\n", out);
+            free(out); wg_session_destroy(s); return 1;
+        }
+    }
+    free(out);
+
+    /* Restricted fields must be rejected. */
+    char bad[256];
+    snprintf(bad, sizeof(bad),
+             "set=1\n"
+             "private_key=%s\n"
+             "\n", peer_hex);
+    if (wg_session_set_uapi(s, bad, strlen(bad)) == 0) {
+        printf("[FAIL] set: private_key was not rejected\n");
+        wg_session_destroy(s);
+        return 1;
+    }
+
+    /* listen_port is now accepted (the C library does not bind sockets,
+     * so it's just a stored value the Swift host should poll). */
+    snprintf(bad, sizeof(bad), "set=1\nlisten_port=12345\n\n");
+    if (wg_session_set_uapi(s, bad, strlen(bad)) != 0) {
+        printf("[FAIL] set: listen_port should be accepted now\n");
+        wg_session_destroy(s);
+        return 1;
+    }
+    if (wg_session_listen_port(s) != 12345) {
+        printf("[FAIL] set: listen_port not stored (%u)\n",
+               wg_session_listen_port(s));
+        wg_session_destroy(s);
+        return 1;
+    }
+
+    /* Bad-length pubkey must be rejected. (An unknown but
+     * properly-shaped pubkey is now treated as a peer add request,
+     * which the dedicated test_wg_session_peer_add covers.) */
+    snprintf(bad, sizeof(bad),
+             "set=1\n"
+             "public_key=0123456789abcdef\n"
+             "endpoint=1.2.3.4:5\n\n");
+    if (wg_session_set_uapi(s, bad, strlen(bad)) == 0) {
+        printf("[FAIL] set: short-pubkey was not rejected\n");
+        wg_session_destroy(s);
+        return 1;
+    }
+
+    wg_session_destroy(s);
+    printf("[PASS] wg_session_set_uapi (endpoint + keepalive + replace allowed-ips + rejects)\n");
+    return 0;
+}
+
+/* PSK end-to-end: parse PresharedKey from config, verify it shows up in
+ * UAPI GET as the right hex, then mutate via UAPI SET and re-read. */
+static int test_wg_session_psk(void)
+{
+    static const char cfg[] =
+        "[Interface]\n"
+        "PrivateKey = yPDHiay/NDkJE9OyUT0J8qhuJXpihZw1aD7Xl4JJEVw=\n"
+        "[Peer]\n"
+        "PublicKey  = XXFzbjDln02y/aWfo2RFVZ/foiMC/NEo9QKXDdk9SXk=\n"
+        "PresharedKey = AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\n"
+        "AllowedIPs = 10.88.0.0/24\n"
+        "Endpoint   = 192.0.2.1:51820\n";
+
+    wg_session_callbacks cb = {0};
+    cb.send_udp = uapi_test_send;
+    cb.deliver_ip = uapi_test_deliver;
+    cb.log_line = uapi_test_log;
+    wg_session_t *s = wg_session_create(cfg, sizeof(cfg) - 1, cb);
+    if (!s) { printf("[FAIL] psk: create\n"); return 1; }
+
+    int need = wg_session_get_uapi(s, NULL, 0);
+    char *out = (char *)malloc((size_t)need + 1);
+    wg_session_get_uapi(s, out, (size_t)need + 1);
+
+    /* Base64 "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" decodes to
+     * 0x00..0x1f, which hex-encodes to "000102...1f". */
+    if (!strstr(out,
+        "preshared_key=000102030405060708090a0b0c0d0e0f"
+        "101112131415161718191a1b1c1d1e1f\n")) {
+        printf("[FAIL] psk: GET did not include the right PSK hex\n");
+        printf("--- got ---\n%s---\n", out);
+        free(out); wg_session_destroy(s);
+        return 1;
+    }
+    free(out);
+
+    /* Clear PSK via SET (all-zero hex). */
+    static const char *peer_hex =
+        "5d71736e30e59f4db2fda59fa36445559fdfa22302fcd128f502970dd93d4979";
+    char req[1024];
+    snprintf(req, sizeof(req),
+             "set=1\npublic_key=%s\n"
+             "preshared_key=00000000000000000000000000000000"
+                            "00000000000000000000000000000000\n\n",
+             peer_hex);
+    if (wg_session_set_uapi(s, req, strlen(req)) != 0) {
+        printf("[FAIL] psk: SET clear failed\n");
+        wg_session_destroy(s);
+        return 1;
+    }
+    /* Re-read; the PSK line should now be the zero sentinel. */
+    need = wg_session_get_uapi(s, NULL, 0);
+    out = (char *)malloc((size_t)need + 1);
+    wg_session_get_uapi(s, out, (size_t)need + 1);
+    if (strstr(out, "preshared_key=000102") != NULL) {
+        printf("[FAIL] psk: clear didn't take effect\n");
+        free(out); wg_session_destroy(s); return 1;
+    }
+    free(out);
+
+    /* Set a new PSK via SET. */
+    snprintf(req, sizeof(req),
+             "set=1\npublic_key=%s\n"
+             "preshared_key=ffeeddccbbaa99887766554433221100"
+                            "0011223344556677889900aabbccddeeff\n\n",
+             peer_hex);
+    /* Note: that hex is intentionally too long (66 chars) to verify
+     * input validation; it should fail. */
+    if (wg_session_set_uapi(s, req, strlen(req)) == 0) {
+        printf("[FAIL] psk: bad-length hex was accepted\n");
+        wg_session_destroy(s); return 1;
+    }
+
+    /* Real 64-char hex (32 bytes). */
+    snprintf(req, sizeof(req),
+             "set=1\npublic_key=%s\n"
+             "preshared_key=ffeeddccbbaa99887766554433221100"
+                            "11223344556677889900aabbccddeeff\n\n",
+             peer_hex);
+    if (wg_session_set_uapi(s, req, strlen(req)) != 0) {
+        printf("[FAIL] psk: SET valid PSK failed\n");
+        wg_session_destroy(s); return 1;
+    }
+    need = wg_session_get_uapi(s, NULL, 0);
+    out = (char *)malloc((size_t)need + 1);
+    wg_session_get_uapi(s, out, (size_t)need + 1);
+    if (!strstr(out, "preshared_key=ffeeddccbbaa")) {
+        printf("[FAIL] psk: SET roundtrip mismatch\n");
+        printf("--- got ---\n%s---\n", out);
+        free(out); wg_session_destroy(s); return 1;
+    }
+    free(out);
+    wg_session_destroy(s);
+    printf("[PASS] PSK config parse + UAPI GET + SET + clear\n");
+    return 0;
+}
+
+/* Peer add at runtime: start with one peer, SET a new public_key with
+ * an endpoint and allowed-ips, verify it shows up in GET and routes
+ * via the trie. */
+static int test_wg_session_peer_add(void)
+{
+    static const char cfg[] =
+        "[Interface]\n"
+        "PrivateKey = yPDHiay/NDkJE9OyUT0J8qhuJXpihZw1aD7Xl4JJEVw=\n"
+        "[Peer]\n"
+        "PublicKey  = XXFzbjDln02y/aWfo2RFVZ/foiMC/NEo9QKXDdk9SXk=\n"
+        "AllowedIPs = 10.88.0.0/24\n"
+        "Endpoint   = 192.0.2.1:51820\n";
+
+    wg_session_callbacks cb = {0};
+    cb.send_udp = uapi_test_send;
+    cb.deliver_ip = uapi_test_deliver;
+    cb.log_line = uapi_test_log;
+    wg_session_t *s = wg_session_create(cfg, sizeof(cfg) - 1, cb);
+    if (!s) { printf("[FAIL] add: create\n"); return 1; }
+    if (wg_session_peer_count(s) != 1) {
+        printf("[FAIL] add: initial count\n");
+        wg_session_destroy(s); return 1;
+    }
+
+    /* Add a brand-new peer. Pubkey is 32 zero bytes — distinct from
+     * the existing one. */
+    static const char *new_pk_hex =
+        "0123456789abcdef0123456789abcdef"
+        "0123456789abcdef0123456789abcdef";
+    char req[1024];
+    snprintf(req, sizeof(req),
+             "set=1\n"
+             "public_key=%s\n"
+             "endpoint=198.51.100.1:51820\n"
+             "allowed_ip=10.99.0.0/24\n"
+             "persistent_keepalive_interval=15\n\n",
+             new_pk_hex);
+    if (wg_session_set_uapi(s, req, strlen(req)) != 0) {
+        printf("[FAIL] add: SET failed\n");
+        wg_session_destroy(s); return 1;
+    }
+    if (wg_session_peer_count(s) != 2) {
+        printf("[FAIL] add: peer_count=%d (want 2)\n",
+               wg_session_peer_count(s));
+        wg_session_destroy(s); return 1;
+    }
+
+    /* Verify via GET that both peers and the new fields are in there. */
+    int need = wg_session_get_uapi(s, NULL, 0);
+    char *out = (char *)malloc((size_t)need + 1);
+    wg_session_get_uapi(s, out, (size_t)need + 1);
+    if (!strstr(out, "public_key=0123456789abcdef")) {
+        printf("[FAIL] add: new peer not in GET\n"); free(out);
+        wg_session_destroy(s); return 1;
+    }
+    if (!strstr(out, "endpoint=198.51.100.1:51820\n")) {
+        printf("[FAIL] add: new endpoint not in GET\n"); free(out);
+        wg_session_destroy(s); return 1;
+    }
+    if (!strstr(out, "allowed_ip=10.99.0.0/24\n")) {
+        printf("[FAIL] add: new allowed_ip not in GET\n"); free(out);
+        wg_session_destroy(s); return 1;
+    }
+    if (!strstr(out, "persistent_keepalive_interval=15\n")) {
+        printf("[FAIL] add: new keepalive not in GET\n"); free(out);
+        wg_session_destroy(s); return 1;
+    }
+    free(out);
+    wg_session_destroy(s);
+    printf("[PASS] peer add via UAPI SET\n");
+    return 0;
+}
+
+/* Peer remove at runtime: SET remove=true after public_key= for an
+ * existing peer, verify it disappears from GET. */
+static int test_wg_session_peer_remove(void)
+{
+    static const char cfg[] =
+        "[Interface]\n"
+        "PrivateKey = yPDHiay/NDkJE9OyUT0J8qhuJXpihZw1aD7Xl4JJEVw=\n"
+        "[Peer]\n"
+        "PublicKey  = XXFzbjDln02y/aWfo2RFVZ/foiMC/NEo9QKXDdk9SXk=\n"
+        "AllowedIPs = 10.88.0.0/24\n"
+        "Endpoint   = 192.0.2.1:51820\n";
+
+    wg_session_callbacks cb = {0};
+    cb.send_udp = uapi_test_send;
+    cb.deliver_ip = uapi_test_deliver;
+    cb.log_line = uapi_test_log;
+    wg_session_t *s = wg_session_create(cfg, sizeof(cfg) - 1, cb);
+    if (!s) { printf("[FAIL] rm: create\n"); return 1; }
+
+    static const char *peer_hex =
+        "5d71736e30e59f4db2fda59fa36445559fdfa22302fcd128f502970dd93d4979";
+    char req[1024];
+    snprintf(req, sizeof(req),
+             "set=1\npublic_key=%s\nremove=true\n\n", peer_hex);
+    if (wg_session_set_uapi(s, req, strlen(req)) != 0) {
+        printf("[FAIL] rm: SET failed\n"); wg_session_destroy(s); return 1;
+    }
+
+    /* The peer should no longer appear in GET output. */
+    int need = wg_session_get_uapi(s, NULL, 0);
+    char *out = (char *)malloc((size_t)need + 1);
+    wg_session_get_uapi(s, out, (size_t)need + 1);
+    if (strstr(out, "public_key=5d71736e30e59f4db2fda59fa36445559fdfa22302fcd128f502970dd93d4979") != NULL) {
+        printf("[FAIL] rm: removed peer still in GET\n");
+        printf("--- got ---\n%s---\n", out);
+        free(out); wg_session_destroy(s); return 1;
+    }
+    free(out);
+
+    /* Re-add with the same pubkey at the now-tombstoned slot. */
+    snprintf(req, sizeof(req),
+             "set=1\npublic_key=%s\nendpoint=192.0.2.99:51820\n\n",
+             peer_hex);
+    if (wg_session_set_uapi(s, req, strlen(req)) != 0) {
+        printf("[FAIL] rm: re-add failed\n"); wg_session_destroy(s); return 1;
+    }
+    need = wg_session_get_uapi(s, NULL, 0);
+    out = (char *)malloc((size_t)need + 1);
+    wg_session_get_uapi(s, out, (size_t)need + 1);
+    if (!strstr(out, "endpoint=192.0.2.99:51820\n")) {
+        printf("[FAIL] rm: re-added peer endpoint missing\n");
+        free(out); wg_session_destroy(s); return 1;
+    }
+    free(out);
+    wg_session_destroy(s);
+    printf("[PASS] peer remove (tombstone) + re-add via UAPI SET\n");
+    return 0;
+}
+
 static int test_aips_edge_cases(void)
 {
     struct aips_trie t;
@@ -778,6 +1249,11 @@ int main(void)
     fails += test_aips_replace_and_remove();
     fails += test_aips_v6();
     fails += test_aips_edge_cases();
+    fails += test_wg_session_uapi_get();
+    fails += test_wg_session_uapi_set();
+    fails += test_wg_session_psk();
+    fails += test_wg_session_peer_add();
+    fails += test_wg_session_peer_remove();
 
     crypto_deinit();
 

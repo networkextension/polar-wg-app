@@ -12,10 +12,13 @@
  * callout_reset runs before the block executes.
  */
 #pragma once
-#include <dispatch/dispatch.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/mutex.h>  /* struct mtx, mtx_lock/unlock */
+
+#if defined(__APPLE__)
+#include <dispatch/dispatch.h>
+#endif
 
 /* Emulated kernel tick rate (FreeBSD default: 1000 Hz) */
 #ifndef hz
@@ -24,7 +27,9 @@
 
 struct callout {
     struct mtx       *co_lock;
+#if defined(__APPLE__)
     dispatch_queue_t  co_queue;
+#endif
     volatile int      co_generation; /* bumped on each reset/stop */
 };
 
@@ -34,8 +39,10 @@ callout_init_mtx(struct callout *c, struct mtx *lock,
 {
     memset(c, 0, sizeof(*c));
     c->co_lock  = lock;
+#if defined(__APPLE__)
     c->co_queue = dispatch_queue_create("wg.ratelimit.gc",
                                         DISPATCH_QUEUE_SERIAL);
+#endif
 }
 
 static inline int
@@ -61,6 +68,7 @@ callout_reset(struct callout *c, int ticks,
      * and produces a new token that the new block must match. */
     int gen = __atomic_add_fetch(&c->co_generation, 1, __ATOMIC_SEQ_CST);
 
+#if defined(__APPLE__)
     int64_t delay_ns = (int64_t)ticks * (1000000000LL / hz);
 
     /* Capture everything by value so the block is self-contained. */
@@ -85,4 +93,11 @@ callout_reset(struct callout *c, int ticks,
                 cap_fn(cap_arg);
             mtx_unlock(cap_c->co_lock);
         });
+#else
+    /* On Android/Linux, timers are driven externally by
+     * wg_session_tick() — callout_reset is a no-op. The noise
+     * layer calls it but the actual timer scheduling is done by
+     * the Kotlin/Swift host via a 1 Hz tick loop. */
+    (void)ticks; (void)fn; (void)arg; (void)gen;
+#endif
 }

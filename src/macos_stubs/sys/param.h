@@ -1,4 +1,6 @@
-/* FreeBSD sys/param.h → macOS stub: include real macOS header then add extras */
+/* FreeBSD sys/param.h → cross-platform stub.
+ * #include_next skips this file and finds the real system header
+ * (works on macOS, Android NDK, and Linux — all use GCC/Clang). */
 #pragma once
 #include_next <sys/param.h>
 
