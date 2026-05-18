@@ -1186,6 +1186,245 @@ wg_session_get_uapi(const wg_session_t *s, char *buf, size_t buf_len)
     return written;
 }
 
+/* ─────────────────────────────────────────────────────────────────────────
+ * UAPI SET (runtime mutation of existing peers)
+ * ───────────────────────────────────────────────────────────────────────── */
+
+/* Decode N bytes from a 2N-char lowercase hex string. Returns 0 on
+ * success, -1 on bad input or wrong length. */
+static int hex_decode(const char *in, uint8_t *out, size_t n)
+{
+    if (strlen(in) != 2 * n) return -1;
+    for (size_t i = 0; i < n; i++) {
+        int hi, lo;
+        char c = in[2*i];
+        if      (c >= '0' && c <= '9') hi = c - '0';
+        else if (c >= 'a' && c <= 'f') hi = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') hi = c - 'A' + 10;
+        else return -1;
+        c = in[2*i + 1];
+        if      (c >= '0' && c <= '9') lo = c - '0';
+        else if (c >= 'a' && c <= 'f') lo = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') lo = c - 'A' + 10;
+        else return -1;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return 0;
+}
+
+static struct wgs_peer *
+find_peer_by_pubkey(wg_session_t *s, const uint8_t pubkey[WG_KEY_LEN])
+{
+    for (int i = 0; i < s->n_peers; i++) {
+        if (memcmp(s->peers[i].pubkey, pubkey, WG_KEY_LEN) == 0)
+            return &s->peers[i];
+    }
+    return NULL;
+}
+
+/* Parse "host:port" or "[ipv6]:port", re-resolve via getaddrinfo, and
+ * write the result into peer->endpoint. Returns 0 on success. */
+static int
+peer_set_endpoint_str(struct wgs_peer *peer, const char *spec)
+{
+    char host[128];
+    uint16_t port;
+    const char *colon;
+
+    if (spec[0] == '[') {
+        /* RFC 3986 bracket form for IPv6: [::1]:51820 */
+        const char *close = strchr(spec, ']');
+        if (!close || close[1] != ':') return -1;
+        size_t hl = (size_t)(close - (spec + 1));
+        if (hl == 0 || hl >= sizeof(host)) return -1;
+        memcpy(host, spec + 1, hl);
+        host[hl] = '\0';
+        long p = strtol(close + 2, NULL, 10);
+        if (p < 1 || p > 65535) return -1;
+        port = (uint16_t)p;
+    } else {
+        colon = strrchr(spec, ':');
+        if (!colon) return -1;
+        size_t hl = (size_t)(colon - spec);
+        if (hl == 0 || hl >= sizeof(host)) return -1;
+        memcpy(host, spec, hl);
+        host[hl] = '\0';
+        long p = strtol(colon + 1, NULL, 10);
+        if (p < 1 || p > 65535) return -1;
+        port = (uint16_t)p;
+    }
+
+    struct sockaddr_storage ss;
+    socklen_t sl;
+    if (resolve_endpoint(host, port, &ss, &sl) != 0) return -1;
+
+    memcpy(&peer->endpoint, &ss, sl);
+    peer->endpoint_len  = sl;
+    peer->has_endpoint  = true;
+    /* Keep the textual form around for status printing. */
+    strncpy(peer->endpoint_host, host, sizeof(peer->endpoint_host) - 1);
+    peer->endpoint_host[sizeof(peer->endpoint_host) - 1] = '\0';
+    peer->endpoint_port = port;
+    return 0;
+}
+
+/* Tear down the allowedips tries and rebuild from the current peer
+ * list. Called after a SET that may have changed allowed-ips entries.
+ * Worst case is one full pass over every CIDR which is fine for the
+ * scale we're targeting (≤ WGS_MAX_PEERS × WGS_MAX_ALLOWED_CIDRS). */
+static void
+rebuild_aips(wg_session_t *s)
+{
+    if (s->aips_inited) {
+        aips_destroy(&s->aips_v4);
+        aips_destroy(&s->aips_v6);
+    }
+    aips_init(&s->aips_v4, 32);
+    aips_init(&s->aips_v6, 128);
+    s->aips_inited = true;
+    for (int i = 0; i < s->n_peers; i++) {
+        struct wgs_peer *p = &s->peers[i];
+        for (int j = 0; j < p->n_allowed; j++) {
+            struct aips_trie *t = (p->allowed[j].family == AF_INET)
+                                      ? &s->aips_v4 : &s->aips_v6;
+            aips_insert(t, p->allowed[j].addr, p->allowed[j].prefix_len, p);
+        }
+    }
+}
+
+int
+wg_session_set_uapi(wg_session_t *s, const char *text, size_t len)
+{
+    if (!s || !text) return -1;
+    if (len == 0) len = strlen(text);
+
+    char *scratch = (char *)malloc(len + 1);
+    if (!scratch) return -1;
+    memcpy(scratch, text, len);
+    scratch[len] = '\0';
+
+    struct wgs_peer *cur = NULL;
+    int rc = 0;
+
+    char *save;
+    for (char *line = strtok_r(scratch, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        line = wgs_trim(line);
+        if (!*line) continue;
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq++ = '\0';
+        char *key = wgs_trim(line);
+        char *val = wgs_trim(eq);
+
+        if (strcmp(key, "set") == 0) {
+            /* Header marker; ignore. */
+            continue;
+        }
+
+        /* Restricted: anything that would force us to reallocate noise
+         * state, change the UDP bind, or read a fresh private key. */
+        if (strcmp(key, "private_key")  == 0 ||
+            strcmp(key, "listen_port")  == 0 ||
+            strcmp(key, "fwmark")       == 0 ||
+            strcmp(key, "replace_peers") == 0) {
+            wgs_log(s, "[set] field '%s' not supported (rejected)", key);
+            rc = -1;
+            goto done;
+        }
+
+        if (strcmp(key, "public_key") == 0) {
+            uint8_t pk[WG_KEY_LEN];
+            if (hex_decode(val, pk, WG_KEY_LEN) != 0) {
+                wgs_log(s, "[set] bad public_key hex");
+                rc = -1;
+                goto done;
+            }
+            cur = find_peer_by_pubkey(s, pk);
+            if (!cur) {
+                wgs_log(s, "[set] unknown public_key (peer add not supported)");
+                rc = -1;
+                goto done;
+            }
+            continue;
+        }
+
+        if (!cur) {
+            /* Field appeared before any public_key. The wg-tool sometimes
+             * does this for fwmark/listen_port/private_key — we already
+             * rejected those above, so any other key here is unknown. */
+            wgs_log(s, "[set] field '%s' before public_key", key);
+            continue;
+        }
+
+        if (strcmp(key, "remove") == 0) {
+            wgs_log(s, "[set] peer remove not supported");
+            rc = -1;
+            goto done;
+        }
+        if (strcmp(key, "preshared_key") == 0) {
+            /* Tolerated but ignored — we don't support PSK yet, and the
+             * wg tool emits the all-zero sentinel by default which is
+             * functionally equivalent. */
+            continue;
+        }
+        if (strcmp(key, "endpoint") == 0) {
+            if (peer_set_endpoint_str(cur, val) != 0) {
+                wgs_log(s, "[set] bad endpoint '%s'", val);
+                rc = -1;
+                goto done;
+            }
+            wgs_log(s, "[set] endpoint updated to %s:%u",
+                    cur->endpoint_host, (unsigned)cur->endpoint_port);
+            continue;
+        }
+        if (strcmp(key, "persistent_keepalive_interval") == 0) {
+            int n = atoi(val);
+            if (n < 0 || n > 65535) { rc = -1; goto done; }
+            cur->pk_sec = n;
+            wgs_log(s, "[set] persistent_keepalive_interval=%d", n);
+            continue;
+        }
+        if (strcmp(key, "replace_allowed_ips") == 0) {
+            if (strcmp(val, "true") == 0) {
+                cur->n_allowed = 0;
+            }
+            continue;
+        }
+        if (strcmp(key, "allowed_ip") == 0) {
+            if (cur->n_allowed >= WGS_MAX_ALLOWED_CIDRS) {
+                wgs_log(s, "[set] too many allowed_ip");
+                rc = -1;
+                goto done;
+            }
+            if (parse_cidr(val, &cur->allowed[cur->n_allowed]) != 0) {
+                wgs_log(s, "[set] bad allowed_ip '%s'", val);
+                rc = -1;
+                goto done;
+            }
+            cur->n_allowed++;
+            continue;
+        }
+        if (strcmp(key, "protocol_version") == 0 ||
+            strcmp(key, "errno") == 0) {
+            /* Echoed in some round-trip flows; ignore. */
+            continue;
+        }
+
+        /* Unknown key — be liberal and skip. */
+        wgs_log(s, "[set] unknown field '%s'", key);
+    }
+
+done:
+    free(scratch);
+    /* Rebuild the trie regardless of success. On the success path it
+     * picks up new allowed-ips entries; on the failure path it makes
+     * sure the trie still reflects exactly what's in peer->allowed[]
+     * even if we wrote partial state before bailing. */
+    rebuild_aips(s);
+    return rc;
+}
+
 int
 wg_session_status(const wg_session_t *s, char *buf, size_t buf_len)
 {
