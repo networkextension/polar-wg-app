@@ -122,6 +122,9 @@ int wg_session_kick(wg_session_t *s);
  * Introspection (for Swift to set up NEPacketTunnelNetworkSettings)
  * ───────────────────────────────────────────────────────────────────────── */
 
+/* [Interface] ListenPort (0 if ephemeral). */
+uint16_t wg_session_listen_port(const wg_session_t *s);
+
 /* Number of [Interface] Address entries parsed from the config. */
 int wg_session_iface_addr_count(const wg_session_t *s);
 
@@ -151,10 +154,58 @@ int wg_session_peer_allowed_get(const wg_session_t *s, int i, int j,
                                 int *prefix_out,
                                 int *family_out);
 
+/* Format peer i's current endpoint into addr_out (at least 80 bytes)
+ * and *port_out as host-order. Returns 0 if the peer has an endpoint,
+ * -1 if not (responder-only peer that hasn't roamed yet). */
+int wg_session_peer_endpoint(const wg_session_t *s, int i,
+                             char *addr_out, uint16_t *port_out);
+
+/* Persistent-keepalive interval for peer i (0 if disabled). */
+int wg_session_peer_keepalive(const wg_session_t *s, int i);
+
+/* Peer i's running transfer counters. */
+int wg_session_peer_transfer(const wg_session_t *s, int i,
+                             uint64_t *rx_bytes_out,
+                             uint64_t *tx_bytes_out);
+
+/* Age in seconds of peer i's current keypair (i.e. wallclock seconds
+ * since the last successful handshake). -1 if never. */
+int wg_session_peer_handshake_age(const wg_session_t *s, int i);
+
 /* Format a multi-line wg(8)-style status string into buf. Returns the
  * number of bytes that would be written (may exceed buf_len if the
  * buffer was too small, like snprintf). */
 int wg_session_status(const wg_session_t *s, char *buf, size_t buf_len);
+
+/* Serialize the current session state as a canonical WireGuard UAPI
+ * GET response (the text wire format that wg(8) speaks over
+ * /var/run/wireguard/<ifname>.sock). See
+ *
+ *   https://www.wireguard.com/xplatform/#cross-platform-userspace-implementation
+ *
+ * for the spec. Layout:
+ *
+ *   private_key=<hex>\n               (actually we return "none" — NE
+ *                                      extensions should not expose the
+ *                                      private key to host-app code)
+ *   listen_port=<n>\n
+ *   public_key=<hex>\n                (per peer)
+ *   preshared_key=<zero or hex>\n
+ *   endpoint=<addr>:<port>\n          (omitted if no endpoint yet)
+ *   last_handshake_time_sec=<sec>\n
+ *   last_handshake_time_nsec=0\n
+ *   tx_bytes=<n>\n
+ *   rx_bytes=<n>\n
+ *   persistent_keepalive_interval=<n>\n  (omitted if 0)
+ *   allowed_ip=<cidr>\n               (repeated for each CIDR)
+ *   protocol_version=1\n
+ *   errno=0\n
+ *   \n                                (terminator)
+ *
+ * Writes up to buf_len bytes (including trailing NUL). Returns the
+ * number of bytes that would have been written even if buf was too
+ * small (snprintf semantics). Pass NULL/0 first to size the buffer. */
+int wg_session_get_uapi(const wg_session_t *s, char *buf, size_t buf_len);
 
 #ifdef __cplusplus
 }

@@ -129,6 +129,59 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         completionHandler()
     }
 
+    // MARK: - Host app ↔ extension messaging (wg UAPI transport)
+    //
+    // The host app calls NETunnelProviderSession.sendProviderMessage(_:)
+    // with a small request envelope; we route it to the right wg_session
+    // UAPI call and hand back the response. This is the NE-native
+    // equivalent of the unix-socket UAPI that wg(8) speaks on other
+    // platforms — same text wire format, different transport.
+    //
+    // Request format: the first line is "get=1" or "set=1" (matching
+    // the WireGuard cross-platform UAPI spec), followed by the same
+    // key=value body that a unix-socket client would send. Response is
+    // the canonical UAPI GET text (for get), or "errno=0\n\n" for a
+    // successful set.
+    public override func handleAppMessage(
+        _ messageData: Data,
+        completionHandler: ((Data?) -> Void)?
+    ) {
+        guard let request = String(data: messageData, encoding: .utf8) else {
+            completionHandler?(nil)
+            return
+        }
+
+        // Dispatch on the first non-empty line.
+        let firstLine = request.split(whereSeparator: { $0 == "\n" }).first ?? ""
+        let response = dispatchUAPIRequest(firstLine: String(firstLine),
+                                           body: request)
+        completionHandler?(response.data(using: .utf8))
+    }
+
+    private func dispatchUAPIRequest(firstLine: String, body: String) -> String {
+        guard let session = session else {
+            return "errno=19\n\n"   // ENODEV — no active session
+        }
+        if firstLine == "get=1" {
+            // Size first, then fill.
+            let need = Int(wg_session_get_uapi(session, nil, 0))
+            guard need > 0 else { return "errno=5\n\n" }  // EIO
+            var buf = [CChar](repeating: 0, count: need + 1)
+            buf.withUnsafeMutableBufferPointer { p in
+                _ = wg_session_get_uapi(session, p.baseAddress, p.count)
+            }
+            return String(cString: buf)
+        }
+        if firstLine == "set=1" {
+            // SET side not implemented yet — return EPERM so the caller
+            // can tell it's a "capability missing" vs. a "request bad".
+            // Full implementation requires runtime mutation hooks in
+            // wg_session which is the next PR.
+            return "errno=1\n\n"    // EPERM
+        }
+        return "errno=22\n\n"        // EINVAL — unknown request
+    }
+
     // MARK: - NE plumbing
 
     private func buildNetworkSettings(for session: OpaquePointer) -> NEPacketTunnelNetworkSettings {
