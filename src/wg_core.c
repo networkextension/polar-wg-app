@@ -1159,6 +1159,60 @@ utun_apply_inet6(const char *ifname, const struct iface_addr *a)
     return 0;
 }
 
+/* Install a route for every peer's AllowedIPs so matching packets enter the
+ * tunnel — the wg-quick "Table=auto" behaviour. Routing follows AllowedIPs,
+ * NOT the interface Address prefix, so a /32 [Interface] Address no longer
+ * isolates the host: the hub peer's 10.88.0.0/24 (and per-peer /32 host
+ * routes) still get installed. Default routes (0.0.0.0/0, ::/0) are skipped —
+ * full-tunnel needs endpoint-preserving route surgery we don't implement, and
+ * the mesh use case never advertises them. Best-effort: a failed route add is
+ * logged and skipped (delete-first makes it idempotent across kickstarts). */
+static void
+utun_apply_peer_routes(const char *ifname, const struct client_config *cfg)
+{
+    char cmd[256], net[INET6_ADDRSTRLEN];
+    for (int i = 0; i < cfg->n_peers; i++) {
+        const struct peer_state *peer = &cfg->peers[i];
+        for (int j = 0; j < peer->n_allowed; j++) {
+            const struct allowed_cidr *c = &peer->allowed[j];
+            if (c->prefix_len == 0)
+                continue;                   /* skip 0.0.0.0/0 and ::/0 */
+            if (c->family == AF_INET) {
+                struct in_addr a;
+                memcpy(&a, c->addr, 4);
+                uint32_t mask = c->prefix_len >= 32 ? 0xFFFFFFFFu
+                              : htonl(0xFFFFFFFFu << (32 - c->prefix_len));
+                a.s_addr &= mask;           /* parse_cidr stores raw addr */
+                if (!inet_ntop(AF_INET, &a, net, sizeof(net))) continue;
+                snprintf(cmd, sizeof(cmd),
+                         "/sbin/route -q -n delete -net %s/%d >/dev/null 2>&1",
+                         net, c->prefix_len);
+                (void)system(cmd);
+                snprintf(cmd, sizeof(cmd),
+                         "/sbin/route -q -n add -net %s/%d -interface %s",
+                         net, c->prefix_len, ifname);
+                if (system(cmd) != 0)
+                    fprintf(stderr,
+                            "utun_configure: route add %s/%d failed (continuing)\n",
+                            net, c->prefix_len);
+            } else if (c->family == AF_INET6) {
+                if (!inet_ntop(AF_INET6, c->addr, net, sizeof(net))) continue;
+                snprintf(cmd, sizeof(cmd),
+                         "/sbin/route -q -n delete -inet6 %s/%d >/dev/null 2>&1",
+                         net, c->prefix_len);
+                (void)system(cmd);
+                snprintf(cmd, sizeof(cmd),
+                         "/sbin/route -q -n add -inet6 %s/%d -interface %s",
+                         net, c->prefix_len, ifname);
+                if (system(cmd) != 0)
+                    fprintf(stderr,
+                            "utun_configure: route6 add %s/%d failed (continuing)\n",
+                            net, c->prefix_len);
+            }
+        }
+    }
+}
+
 /* Bring the utun up and apply all parsed Address entries. */
 static int
 utun_configure(const char *ifname, const struct client_config *cfg)
@@ -1183,6 +1237,9 @@ utun_configure(const char *ifname, const struct client_config *cfg)
         snprintf(cmd, sizeof(cmd), "/sbin/ifconfig %s mtu 1420 up", ifname);
         (void)system(cmd);
     }
+    /* Routes follow AllowedIPs (wg-quick Table=auto), independent of the
+     * interface Address prefix — so the mesh stays reachable even on /32. */
+    utun_apply_peer_routes(ifname, cfg);
     return 0;
 }
 
