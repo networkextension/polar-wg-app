@@ -202,10 +202,15 @@ listen = os.environ["LISTEN"]
 
 # wgc0.conf
 conf_path = f"/etc/wireguard/{iface}.conf"
+# Address MUST carry the mesh prefix (not /32): wg_core only installs the
+# kernel route when prefix_len < 32 (src/wg_core.c utun_apply_inet4). A /32
+# isolates the device — handshake succeeds but no mesh IP (e.g. the hub
+# 10.88.0.1) is routable. Derive prefix from mesh_cidr, default /24.
+mesh_prefix = (resp.get("mesh_cidr") or "10.88.0.0/24").split("/")[-1]
 lines = [
     "[Interface]",
     f"PrivateKey = {priv}",
-    f"Address    = {resp['device_ip']}/32",
+    f"Address    = {resp['device_ip']}/{mesh_prefix}",
     f"ListenPort = {listen}",
     "",
 ]

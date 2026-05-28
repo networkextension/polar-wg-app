@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  WireGuard launchd template. install.sh substitutes @IFACE@ at deploy time.
+  Drop the resulting file under /Library/LaunchDaemons/, then:
+
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.wireguard.wg-mac.<iface>.plist
+    sudo launchctl kickstart -k system/com.wireguard.wg-mac.<iface>
+
+  Disable / unload:
+    sudo launchctl bootout system /Library/LaunchDaemons/com.wireguard.wg-mac.<iface>.plist
+
+  KeepAlive restarts wg_core if it crashes; ThrottleInterval prevents a
+  hot loop if the config is broken.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.wireguard.wg-mac.@IFACE@</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/wgctl</string>
+        <string>up</string>
+        <string>@IFACE@</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/wireguard.@IFACE@.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/var/log/wireguard.@IFACE@.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

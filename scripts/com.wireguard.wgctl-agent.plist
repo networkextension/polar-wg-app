@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  wgctl-agent — periodic reconciler for wg-mac devices joined to a
+  Polar control plane. One agent per host; works for both hub and
+  device roles (script branches on /etc/wgctl/config.json's "role").
+
+  Install (handled by install.sh / wgctl-agent --install):
+    cp wgctl-agent.sh                            /usr/local/sbin/wgctl-agent
+    cp com.wireguard.wgctl-agent.plist           /Library/LaunchDaemons/
+    launchctl enable    system/com.wireguard.wgctl-agent
+    launchctl bootstrap system /Library/LaunchDaemons/com.wireguard.wgctl-agent.plist
+
+  Disable:
+    launchctl bootout   system/com.wireguard.wgctl-agent
+    rm /Library/LaunchDaemons/com.wireguard.wgctl-agent.plist
+
+  StartInterval = 60 → heartbeat + peer-poll every minute. The server
+  reports its preferred refresh_sec in /v1/register; we ignore that
+  for now (60 s is a reasonable lower bound — server can de-dup via
+  the rev/ETag in /v1/hub/peers if it cares).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.wireguard.wgctl-agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/sbin/wgctl-agent</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/wgctl-agent.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/var/log/wgctl-agent.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
