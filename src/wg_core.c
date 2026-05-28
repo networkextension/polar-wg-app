@@ -16,6 +16,7 @@
 #include <sys/sys_domain.h>
 #include <sys/time.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <net/if.h>
 #include <net/if_utun.h>
 #include <unistd.h>
@@ -1213,6 +1214,70 @@ utun_apply_peer_routes(const char *ifname, const struct client_config *cfg)
     }
 }
 
+/* Run /etc/wireguard/<iface>.postup if executable, passing the iface
+ * name, conf path, and the live utun unit. This is the wg-quick
+ * `PostUp = …` hook — script-level safety net for the route-loss case
+ * (macOS occasionally flushes utun routes on sleep/wake or primary
+ * interface flip; the default postup re-installs the AllowedIPs routes
+ * idempotently). No-op if the file doesn't exist or isn't executable.
+ *
+ * The iface name is derived from the conf path's basename (strip dir +
+ * `.conf` suffix), so e.g. /etc/wireguard/wgc0.conf → wgc0.postup.
+ *
+ * Forked, not exec'd: wg_core stays in the foreground for launchd's
+ * KeepAlive. Briefly waits on the child so logs are sequenced — 5 s
+ * cap, then continues (no postup script should take longer). */
+static void
+run_postup_hook(const char *conf_path, const char *utun_name)
+{
+    char hook[256], iface[64];
+    if (!conf_path || !*conf_path) return;
+
+    const char *slash = strrchr(conf_path, '/');
+    const char *base  = slash ? slash + 1 : conf_path;
+    size_t blen = strlen(base);
+    if (blen > 5 && strcmp(base + blen - 5, ".conf") == 0)
+        blen -= 5;
+    if (blen == 0 || blen >= sizeof(iface)) return;
+    memcpy(iface, base, blen); iface[blen] = '\0';
+
+    snprintf(hook, sizeof(hook), "/etc/wireguard/%s.postup", iface);
+    if (access(hook, X_OK) != 0)
+        return;                              /* hook not installed → no-op */
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* child: replace into the hook. Args: <iface> <conf> <utun> */
+        execl(hook, hook, iface,
+              conf_path,
+              utun_name ? utun_name : "",
+              (char *)NULL);
+        fprintf(stderr, "[postup] execl %s: %s\n", hook, strerror(errno));
+        _exit(127);
+    } else if (pid < 0) {
+        fprintf(stderr, "[postup] fork: %s\n", strerror(errno));
+        return;
+    }
+    /* parent: wait up to ~5 s, then move on. */
+    for (int i = 0; i < 50; i++) {
+        int status = 0;
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid) {
+            if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+                fprintf(stderr, "[postup] %s exited %d\n",
+                        hook, WEXITSTATUS(status));
+            return;
+        }
+        if (r < 0 && errno != EINTR) {
+            fprintf(stderr, "[postup] waitpid: %s\n", strerror(errno));
+            return;
+        }
+        struct timespec ts = {0, 100000000L};   /* 100 ms */
+        nanosleep(&ts, NULL);
+    }
+    fprintf(stderr, "[postup] %s still running after 5s; detaching\n", hook);
+}
+
 /* Bring the utun up and apply all parsed Address entries. */
 static int
 utun_configure(const char *ifname, const struct client_config *cfg)
@@ -2158,6 +2223,12 @@ int main(int argc, char *argv[])
         fprintf(stderr, "[tunnel] no Interface.Address in config; "
                         "configure %s manually if needed\n", utun_name);
     }
+
+    /* PostUp hook: lets operators inject extra routes / firewall rules,
+     * and (more importantly) re-installs the per-peer AllowedIPs routes
+     * via the shipped /usr/local/libexec/wg-mac/postup.sh — the
+     * defense-in-depth for the route-flushed-after-bring-up case. */
+    run_postup_hook(config_path, utun_name);
 
     /* Send one keepalive on the first endpointed peer so the server
      * refreshes its endpoint view for this source port. */
