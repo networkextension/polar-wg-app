@@ -53,16 +53,15 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+/**
+ * Top-level navigation. Mirrors iOS's TabView: Connection is the home
+ * screen; Mesh is a dedicated token-join page (iOS `meshJoinTab`).
+ */
+private enum class AppTab { CONNECTION, MESH }
+
 @Composable
 fun MainScreen(tm: WgTunnelManager) {
-    val nodes by tm.nodes.collectAsState()
-    val selectedId by tm.selectedNodeId.collectAsState()
-    val state by tm.tunnelState.collectAsState()
-    val error by tm.lastError.collectAsState()
     val isSkipped by tm.isSkippedLogin.collectAsState()
-    val configText by tm.configText.collectAsState()
-    var showConfig by remember { mutableStateOf(false) }
-    var editableConfig by remember { mutableStateOf("") }
 
     if (!isSkipped) {
         // Simple skip-login screen
@@ -81,6 +80,45 @@ fun MainScreen(tm: WgTunnelManager) {
         }
         return
     }
+
+    var tab by remember { mutableStateOf(AppTab.CONNECTION) }
+
+    Scaffold(
+        bottomBar = {
+            NavigationBar {
+                NavigationBarItem(
+                    selected = tab == AppTab.CONNECTION,
+                    onClick = { tab = AppTab.CONNECTION },
+                    icon = { Text("🛡️") },
+                    label = { Text("Connection") },
+                )
+                NavigationBarItem(
+                    selected = tab == AppTab.MESH,
+                    onClick = { tab = AppTab.MESH },
+                    icon = { Text("🕸️") },
+                    label = { Text("Mesh") },
+                )
+            }
+        }
+    ) { padding ->
+        Box(modifier = Modifier.padding(padding)) {
+            when (tab) {
+                AppTab.CONNECTION -> ConnectionScreen(tm)
+                AppTab.MESH -> MeshJoinScreen(tm, onJoined = { tab = AppTab.CONNECTION })
+            }
+        }
+    }
+}
+
+@Composable
+private fun ConnectionScreen(tm: WgTunnelManager) {
+    val nodes by tm.nodes.collectAsState()
+    val selectedId by tm.selectedNodeId.collectAsState()
+    val state by tm.tunnelState.collectAsState()
+    val error by tm.lastError.collectAsState()
+    val configText by tm.configText.collectAsState()
+    var showConfig by remember { mutableStateOf(false) }
+    var editableConfig by remember { mutableStateOf("") }
 
     val selected = nodes.find { it.id == selectedId }
     val isConnected = state == Tunnel.State.UP
@@ -210,11 +248,6 @@ fun MainScreen(tm: WgTunnelManager) {
 
         Spacer(Modifier.height(20.dp))
 
-        // Polar Mesh join section
-        MeshJoinSection(tm)
-
-        Spacer(Modifier.height(20.dp))
-
         // Config editor toggle (paste-config path; works without login)
         OutlinedButton(
             onClick = {
@@ -256,10 +289,13 @@ fun MainScreen(tm: WgTunnelManager) {
 }
 
 /**
- * Polar Mesh onboarding section. The skip-login + paste-config path
- * stays usable above; this is additive. Token is admin-issued; on
- * submit the manager generates a keypair, calls /v1/register, renders
- * a wg-quick conf, and adds it as a new VPNNode.
+ * Polar Mesh onboarding — a dedicated page, mirroring iOS's Mesh tab.
+ * The skip-login + paste-config path on the Connection tab stays usable;
+ * this is additive. Token is admin-issued; on submit the manager
+ * generates a keypair, calls /v1/register, renders a wg-quick conf, and
+ * adds it as a new VPNNode. After a successful join we surface the
+ * "Current Mesh Profile" panel (role / device_ip / … + Leave button) and
+ * hand control back to the Connection tab via [onJoined].
  */
 private enum class MeshTokenKind { Polar, Tailscale, Unknown }
 
@@ -273,77 +309,133 @@ private fun meshTokenKindOf(raw: String): MeshTokenKind {
 }
 
 @Composable
-fun MeshJoinSection(tm: WgTunnelManager) {
-    var server by remember { mutableStateOf("https://zen.4950.store") }
+fun MeshJoinScreen(tm: WgTunnelManager, onJoined: () -> Unit) {
+    var server by remember { mutableStateOf("https://wg.4950.store:2443") }
     var token by remember { mutableStateOf("") }
     val isJoining by tm.isJoiningMesh.collectAsState()
     val joinErr  by tm.meshJoinError.collectAsState()
     val joinInfo by tm.meshJoinInfo.collectAsState()
-    var expanded by remember { mutableStateOf(false) }
+    val meshMeta by tm.meshMeta.collectAsState()
     val tokenKind = meshTokenKindOf(token)
     val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
 
-    OutlinedButton(
-        onClick = { expanded = !expanded },
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Text(if (expanded) "Hide Mesh Join" else "Join Polar Mesh")
+    // Navigate back to the Connection tab once a join succeeds (matches
+    // iOS, which clears the token field then switches to .connection).
+    // Keyed on the joining→done transition rather than joinInfo so it
+    // fires exactly once per join and never on re-entering the tab.
+    var wasJoining by remember { mutableStateOf(false) }
+    LaunchedEffect(isJoining) {
+        if (wasJoining && !isJoining && joinErr == null) {
+            token = ""
+            onJoined()
+        }
+        wasJoining = isJoining
     }
-    if (!expanded) return
 
-    Spacer(Modifier.height(8.dp))
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(12.dp)) {
-            Text(
-                "Paste an admin-issued token. The app generates a Curve25519 keypair on this device; the private key never leaves.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+    Column(
+        modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState())
+    ) {
+        Text("Join Polar Mesh", style = MaterialTheme.typography.headlineMedium)
+        Text(
+            "Paste an admin-issued token to onboard this device into a wg-mac mesh. The app generates a Curve25519 keypair locally; the private key never leaves the device.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(16.dp))
+
+        OutlinedTextField(
+            value = server,
+            onValueChange = { server = it },
+            label = { Text("Server URL") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = token,
+            onValueChange = { token = it },
+            label = { Text("Mesh Token") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+            textStyle = LocalTextStyle.current.copy(fontFamily = FontFamily.Monospace),
+        )
+        Spacer(Modifier.height(8.dp))
+        joinErr?.let {
+            Text(it, color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall)
+        }
+        joinInfo?.let {
+            Text(it, color = MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.bodySmall)
+        }
+
+        if (tokenKind == MeshTokenKind.Tailscale) {
             Spacer(Modifier.height(8.dp))
-            OutlinedTextField(
-                value = server,
-                onValueChange = { server = it },
-                label = { Text("Server URL") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
+            TailscaleRedirectCard(ctx = ctx, server = server.trim(), token = token.trim())
+        }
+
+        Button(
+            onClick = { tm.joinMesh(token = token, serverUrl = server) },
+            enabled = !isJoining && token.isNotBlank() && server.isNotBlank()
+                && tokenKind != MeshTokenKind.Tailscale,
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+        ) {
+            Text(when {
+                isJoining -> "Joining…"
+                tokenKind == MeshTokenKind.Tailscale -> "Use Tailscale instead ↑"
+                else -> "Join Mesh"
+            })
+        }
+
+        // Current mesh profile (shown when the selected node was joined
+        // via a token). Mirrors iOS's "Current Mesh Profile" section.
+        meshMeta?.let { meta ->
+            Spacer(Modifier.height(20.dp))
+            Divider()
+            Spacer(Modifier.height(12.dp))
+            Text("Current Mesh Profile", style = MaterialTheme.typography.titleSmall)
             Spacer(Modifier.height(8.dp))
-            OutlinedTextField(
-                value = token,
-                onValueChange = { token = it },
-                label = { Text("Mesh Token") },
-                singleLine = true,
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    MeshMetaRow("role", meta.role)
+                    MeshMetaRow("device_ip", meta.deviceIp)
+                    MeshMetaRow("device_id", meta.deviceId)
+                    MeshMetaRow("hub", meta.hubSlug.ifBlank { "(none)" })
+                    MeshMetaRow("site", meta.siteId.ifBlank { "(none)" })
+                    MeshMetaRow("server", meta.server)
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = { scope.launch { tm.leaveMeshAndDeleteSelected() } },
                 modifier = Modifier.fillMaxWidth(),
-                textStyle = LocalTextStyle.current.copy(fontFamily = FontFamily.Monospace),
-            )
-            Spacer(Modifier.height(8.dp))
-            joinErr?.let {
-                Text(it, color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall)
-            }
-            joinInfo?.let {
-                Text(it, color = MaterialTheme.colorScheme.primary,
-                    style = MaterialTheme.typography.bodySmall)
-            }
-
-            if (tokenKind == MeshTokenKind.Tailscale) {
-                Spacer(Modifier.height(8.dp))
-                TailscaleRedirectCard(ctx = ctx, server = server.trim(), token = token.trim())
-            }
-
-            Button(
-                onClick = { tm.joinMesh(token = token, serverUrl = server) },
-                enabled = !isJoining && token.isNotBlank() && server.isNotBlank()
-                    && tokenKind != MeshTokenKind.Tailscale,
-                modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = MaterialTheme.colorScheme.error
+                )
             ) {
-                Text(when {
-                    isJoining -> "Joining…"
-                    tokenKind == MeshTokenKind.Tailscale -> "Use Tailscale instead ↑"
-                    else -> "Join"
-                })
+                Text("Leave + delete profile")
             }
         }
+
+        Spacer(Modifier.height(32.dp))
+    }
+}
+
+@Composable
+private fun MeshMetaRow(key: String, value: String) {
+    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+        Text(
+            key,
+            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.width(96.dp)
+        )
+        Text(
+            value,
+            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+            modifier = Modifier.weight(1f)
+        )
     }
 }
 

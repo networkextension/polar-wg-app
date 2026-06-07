@@ -80,7 +80,7 @@ data class MeshRegisterRequest(
     val arch: String = "arm64",
     val agent_ver: String = "wg-mac-app-android-1",
     val lan_addrs: List<LanAddr> = emptyList(),
-    val wg_listen: Int = 51820,
+    val wg_listen: Int = 1632,
     val site_slug: String = "",
 )
 
