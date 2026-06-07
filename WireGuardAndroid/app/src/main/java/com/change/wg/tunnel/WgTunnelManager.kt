@@ -113,6 +113,11 @@ class WgTunnelManager(private val app: Application) {
     val meshJoinInfo  = MutableStateFlow<String?>(null)
     val isJoiningMesh = MutableStateFlow(false)
 
+    // Mesh metadata for the currently selected node (null if it wasn't
+    // joined via a token). Mirrors iOS's meshMetadata(for:) lookup that
+    // backs the "Current Mesh Profile" panel + Leave button.
+    val meshMeta = MutableStateFlow<MeshMetaEntry?>(null)
+
     /**
      * Onboard this device into a Polar wg-mac mesh.
      *
@@ -128,7 +133,7 @@ class WgTunnelManager(private val app: Application) {
         kotlinx.coroutines.SupervisorJob() + Dispatchers.IO
     )
 
-    fun joinMesh(token: String, serverUrl: String, listenPort: Int = 51820) {
+    fun joinMesh(token: String, serverUrl: String, listenPort: Int = 1632) {
         meshJoinError.value = null
         meshJoinInfo.value  = null
         isJoiningMesh.value = true
@@ -180,6 +185,7 @@ class WgTunnelManager(private val app: Application) {
                         hubSlug = resp.hub_slug ?: "",
                         siteId = resp.site_id ?: "",
                     )
+                    meshMeta.value = repo.loadMeshMeta(node.id)
                     meshJoinInfo.value  = "Joined: $role @ ${resp.device_ip}"
                 }
             } catch (e: com.change.wg.data.MeshHttpError) {
@@ -286,6 +292,7 @@ class WgTunnelManager(private val app: Application) {
         dnsMode.value = node.dnsMode
         splitInjectedRoutes.value = node.splitInjectedRoutes
         nodeName.value = node.name
+        meshMeta.value = repo.loadMeshMeta(node.id)
     }
 
     private fun syncEditorToNode() {
