@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -13,9 +14,11 @@
 #include <sys/kern_control.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/sys_domain.h>
 #include <sys/time.h>
 #include <sys/uio.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <net/if.h>
 #include <net/if_utun.h>
@@ -56,6 +59,8 @@
 /* Protocol timers (RFC, also see wg_noise.h). All in seconds. */
 #define REKEY_TIMEOUT_SEC      5    /* retransmit pending initiation */
 #define REKEY_AFTER_TIME_SEC   120  /* trigger rekey */
+#define REKEY_JITTER_MAX_SEC   30   /* random extra delay on rekey to
+                                     * decorrelate two-sided initiators */
 #define REJECT_AFTER_TIME_SEC  180  /* keypair becomes unusable */
 #define KEEPALIVE_TIMEOUT_SEC  10
 #define MAX_HANDSHAKE_ATTEMPTS 18   /* ~REJECT_AFTER_TIME / REKEY_TIMEOUT */
@@ -158,7 +163,8 @@ _Static_assert(sizeof(struct wg_pkt_data_hdr)   == 16,  "wg_pkt_data_hdr size");
 
 #define WG_MAX_ALLOWED_CIDRS 16
 #define WG_MAX_IFACE_ADDRS    4
-#define WG_MAX_PEERS          8
+#define WG_MAX_PEERS          64    /* mesh size cap. Each peer_state is
+                                     * ~600 B, so 64 ≈ 40 KiB — fine. */
 
 struct allowed_cidr {
     int     family;     /* AF_INET or AF_INET6 */
@@ -209,6 +215,12 @@ struct peer_state {
     /* Keypair lifetime */
     time_t    keypair_birth;
     time_t    last_authd_tx;
+    /* Random jitter added to REKEY_AFTER_TIME for THIS keypair, rerolled
+     * on every keypair install. Keeps both peers in a two-initiator setup
+     * from firing rekey at the exact same instant — the simultaneous-init
+     * collision is "harmless but wasteful" (see tunnel_consume_initiation
+     * comment), so we just lower its probability. */
+    int       rekey_jitter_sec;
 
     /* Stats */
     uint64_t  tx_pkts, tx_bytes, rx_pkts, rx_bytes;
@@ -1105,7 +1117,10 @@ utun_write(int fd, const uint8_t *pkt, size_t len)
     return 0;
 }
 
-/* Apply a single IPv4 Address entry to the utun. */
+/* Apply a single IPv4 Address entry to the utun. Idempotent: clears
+ * any pre-existing route for the same /N before adding ours, so a
+ * second wg_core (same Address, different iface unit after kickstart)
+ * doesn't silently leave the kernel pointing at a dead utun. */
 static int
 utun_apply_inet4(const char *ifname, const struct iface_addr *a)
 {
@@ -1118,8 +1133,6 @@ utun_apply_inet4(const char *ifname, const struct iface_addr *a)
         fprintf(stderr, "utun_configure: '%s' failed\n", cmd);
         return -1;
     }
-    /* Add a route for the whole tunnel subnet via this interface. For a
-     * /32 prefix we skip this step. */
     if (a->prefix_len < 32) {
         uint32_t mask = a->prefix_len == 0 ? 0
                                             : (0xFFFFFFFFu << (32 - a->prefix_len));
@@ -1129,8 +1142,17 @@ utun_apply_inet4(const char *ifname, const struct iface_addr *a)
         addr.s_addr &= htonl(mask);
         char net[64];
         inet_ntop(AF_INET, &addr, net, sizeof(net));
+        /* Delete first (silent if nothing was there), then add. macOS
+         * `route add` returns failure with "File exists" when a route
+         * for that prefix is already installed against a dead utun —
+         * which is exactly what we see across launchctl kickstart -k
+         * cycles. */
         snprintf(cmd, sizeof(cmd),
-                 "/sbin/route -q add -net %s/%d -interface %s",
+                 "/sbin/route -q -n delete -net %s/%d >/dev/null 2>&1",
+                 net, a->prefix_len);
+        (void)system(cmd);
+        snprintf(cmd, sizeof(cmd),
+                 "/sbin/route -q -n add -net %s/%d -interface %s",
                  net, a->prefix_len, ifname);
         if (system(cmd) != 0)
             fprintf(stderr, "utun_configure: v4 route add failed (continuing)\n");
@@ -1214,42 +1236,30 @@ utun_apply_peer_routes(const char *ifname, const struct client_config *cfg)
     }
 }
 
-/* Run /etc/wireguard/<iface>.postup if executable, passing the iface
- * name, conf path, and the live utun unit. This is the wg-quick
+/* Run /etc/wireguard/<logical>.postup if executable, passing the logical
+ * iface name, conf path, and the live utun unit. This is the wg-quick
  * `PostUp = …` hook — script-level safety net for the route-loss case
  * (macOS occasionally flushes utun routes on sleep/wake or primary
  * interface flip; the default postup re-installs the AllowedIPs routes
  * idempotently). No-op if the file doesn't exist or isn't executable.
  *
- * The iface name is derived from the conf path's basename (strip dir +
- * `.conf` suffix), so e.g. /etc/wireguard/wgc0.conf → wgc0.postup.
- *
  * Forked, not exec'd: wg_core stays in the foreground for launchd's
  * KeepAlive. Briefly waits on the child so logs are sequenced — 5 s
  * cap, then continues (no postup script should take longer). */
 static void
-run_postup_hook(const char *conf_path, const char *utun_name)
+run_postup_hook(const char *logical, const char *conf_path, const char *utun_name)
 {
-    char hook[256], iface[64];
-    if (!conf_path || !*conf_path) return;
-
-    const char *slash = strrchr(conf_path, '/');
-    const char *base  = slash ? slash + 1 : conf_path;
-    size_t blen = strlen(base);
-    if (blen > 5 && strcmp(base + blen - 5, ".conf") == 0)
-        blen -= 5;
-    if (blen == 0 || blen >= sizeof(iface)) return;
-    memcpy(iface, base, blen); iface[blen] = '\0';
-
-    snprintf(hook, sizeof(hook), "/etc/wireguard/%s.postup", iface);
+    char hook[256];
+    if (!logical || !*logical) return;
+    snprintf(hook, sizeof(hook), "/etc/wireguard/%s.postup", logical);
     if (access(hook, X_OK) != 0)
         return;                              /* hook not installed → no-op */
 
     pid_t pid = fork();
     if (pid == 0) {
         /* child: replace into the hook. Args: <iface> <conf> <utun> */
-        execl(hook, hook, iface,
-              conf_path,
+        execl(hook, hook, logical,
+              conf_path ? conf_path : "",
               utun_name ? utun_name : "",
               (char *)NULL);
         fprintf(stderr, "[postup] execl %s: %s\n", hook, strerror(errno));
@@ -1394,6 +1404,13 @@ typedef struct {
     int utun_fd;
     char if_name[IFNAMSIZ];
 
+    /* Logical name (e.g. "wg0") for /var/run/wireguard/<name>.{pid,name,sock}.
+     * Empty string means: no PID/socket files written, no IPC server. */
+    char logical_name[32];
+
+    /* Status-query UNIX socket (SOCK_STREAM, listening). -1 if disabled. */
+    int status_listen_fd;
+
     /* Shared (per-local) state */
     struct noise_local    *local;
     struct cookie_checker *cookie_checker;
@@ -1478,14 +1495,15 @@ fmt_human_age(time_t age_sec, char *out, size_t out_len)
 }
 
 static void
-print_status_snapshot(const tunnel_ctx *ctx)
+dump_status_snapshot(const tunnel_ctx *ctx, FILE *out)
 {
     time_t now = time(NULL);
 
-    fprintf(stderr, "\n");
-    fprintf(stderr, "interface: %s\n", ctx->if_name[0] ? ctx->if_name : "(unknown)");
-    fprintf(stderr, "  peers: %d\n", ctx->n_peers);
-    fprintf(stderr, "\n");
+    fprintf(out, "interface: %s\n", ctx->if_name[0] ? ctx->if_name : "(unknown)");
+    if (ctx->logical_name[0])
+        fprintf(out, "  logical: %s\n", ctx->logical_name);
+    fprintf(out, "  peers: %d\n", ctx->n_peers);
+    fprintf(out, "\n");
 
     for (int i = 0; i < ctx->n_peers; i++) {
         const struct peer_state *peer = &ctx->peers[i];
@@ -1503,35 +1521,42 @@ print_status_snapshot(const tunnel_ctx *ctx)
         fmt_human_age(peer->keypair_birth ? (now - peer->keypair_birth) : -1,
                       hs_age, sizeof(hs_age));
 
-        fprintf(stderr, "peer #%d: %s\n", i, pub_b64);
-        fprintf(stderr, "  endpoint: %s\n", endpoint);
+        fprintf(out, "peer #%d: %s\n", i, pub_b64);
+        fprintf(out, "  endpoint: %s\n", endpoint);
         if (peer->n_allowed > 0) {
-            fprintf(stderr, "  allowed ips: ");
+            fprintf(out, "  allowed ips: ");
             for (int j = 0; j < peer->n_allowed; j++) {
                 char buf[64];
                 fmt_cidr(&peer->allowed[j], buf, sizeof(buf));
-                fprintf(stderr, "%s%s", buf,
+                fprintf(out, "%s%s", buf,
                         (j + 1 < peer->n_allowed) ? ", " : "\n");
             }
         } else {
-            fprintf(stderr, "  allowed ips: (none)\n");
+            fprintf(out, "  allowed ips: (none)\n");
         }
-        fprintf(stderr, "  latest handshake: %s\n", hs_age);
-        fprintf(stderr, "  transfer: %s received, %s sent\n", rx_h, tx_h);
-        fprintf(stderr, "  packets: rx=%llu tx=%llu  rx_dropped_aips=%llu\n",
+        fprintf(out, "  latest handshake: %s\n", hs_age);
+        fprintf(out, "  transfer: %s received, %s sent\n", rx_h, tx_h);
+        fprintf(out, "  packets: rx=%llu tx=%llu  rx_dropped_aips=%llu\n",
                 (unsigned long long)peer->rx_pkts,
                 (unsigned long long)peer->tx_pkts,
                 (unsigned long long)peer->rx_dropped_aips);
         if (peer->pk_sec > 0)
-            fprintf(stderr, "  persistent keepalive: every %d seconds\n",
+            fprintf(out, "  persistent keepalive: every %d seconds\n",
                     peer->pk_sec);
-        fprintf(stderr, "  handshake state: %s",
+        fprintf(out, "  handshake state: %s",
                 peer->hs_pending ? "pending" : "idle");
         if (peer->hs_pending)
-            fprintf(stderr, " (attempt %d, sent %lds ago)",
+            fprintf(out, " (attempt %d, sent %lds ago)",
                     peer->hs_attempts, (long)(now - peer->hs_sent_at));
-        fprintf(stderr, "\n\n");
+        fprintf(out, "\n\n");
     }
+}
+
+static void
+print_status_snapshot(const tunnel_ctx *ctx)
+{
+    fprintf(stderr, "\n");
+    dump_status_snapshot(ctx, stderr);
 }
 
 /* Send a fresh handshake initiation for a specific peer. Used for both
@@ -1555,6 +1580,17 @@ tunnel_send_initiation(tunnel_ctx *ctx, struct peer_state *peer,
     return 0;
 }
 
+/* Stamp keypair_birth + last_authd_tx + a fresh jitter, in one place so
+ * the three call sites (responder install, initiator install, probe-mode
+ * install) can't drift apart. */
+static void
+peer_stamp_keypair(struct peer_state *peer, time_t now)
+{
+    peer->keypair_birth     = now;
+    peer->last_authd_tx     = now;
+    peer->rekey_jitter_sec  = (int)arc4random_uniform(REKEY_JITTER_MAX_SEC);
+}
+
 /* Per-tick housekeeping for ONE peer. */
 static void
 tunnel_tick_peer(tunnel_ctx *ctx, struct peer_state *peer, time_t now)
@@ -1573,13 +1609,26 @@ tunnel_tick_peer(tunnel_ctx *ctx, struct peer_state *peer, time_t now)
         }
     }
 
-    /* 2. Proactive rekey when current keypair is REKEY_AFTER_TIME old.
-     *    Skip for peers without an endpoint (pure-responder; peer drives
-     *    rekey). */
-    if (!peer->hs_pending && peer->keypair_birth && peer->endpoint_len > 0 &&
-        (now - peer->keypair_birth) >= REKEY_AFTER_TIME_SEC) {
-        peer->hs_attempts = 0;
-        (void)tunnel_send_initiation(ctx, peer, now, "rekey");
+    /* 2. Initial / rekey handshake.
+     *    has_endpoint == false → pure responder, never initiate.
+     *    keypair_birth == 0    → never handshaked yet, send initial NOW.
+     *    keypair_birth > 0     → send rekey at REKEY_AFTER_TIME + jitter.
+     *
+     *    Using has_endpoint (configured) instead of endpoint_len > 0
+     *    (runtime) keeps a pure-responder peer that has learned an
+     *    endpoint from inbound traffic from also initiating, which would
+     *    produce simultaneous-init races at every REKEY_AFTER_TIME
+     *    boundary. The jitter further decorrelates two-initiator setups. */
+    if (!peer->hs_pending && peer->has_endpoint) {
+        bool needs_initial = (peer->keypair_birth == 0);
+        bool needs_rekey   = (peer->keypair_birth > 0 &&
+                              (now - peer->keypair_birth) >=
+                                  (REKEY_AFTER_TIME_SEC + peer->rekey_jitter_sec));
+        if (needs_initial || needs_rekey) {
+            peer->hs_attempts = 0;
+            (void)tunnel_send_initiation(ctx, peer, now,
+                                          needs_initial ? "initial" : "rekey");
+        }
     }
 
     /* 3. Persistent keepalive. */
@@ -1667,12 +1716,20 @@ tunnel_consume_initiation(tunnel_ctx *ctx,
     }
     noise_remote_put(matched);
 
-    /* Update peer addr (roaming on initiation) and stamp new keypair. */
+    /* Update peer addr (roaming on initiation) and stamp new keypair.
+     * NOTE: do NOT clear peer->hs_pending here. In a two-initiator setup,
+     * if our own initiation crosses the wire with peer's initiation, the
+     * peer's response to OUR initiation is still in flight. Clearing
+     * hs_pending makes find_peer_pending_response() reject that response
+     * with "no matching pending peer", causing 5-second handshake stalls
+     * on every collision. Leaving hs_pending=true means our own retransmit
+     * timer keeps ticking until either (a) peer's response lands and we
+     * clear it via tunnel_consume_response, or (b) we time out and
+     * retransmit — both are harmless because peer already installed a
+     * keypair from this initiation we just processed. */
     memcpy(&peer->endpoint, from, from_len);
-    peer->endpoint_len  = from_len;
-    peer->keypair_birth = time(NULL);
-    peer->last_authd_tx = peer->keypair_birth;
-    peer->hs_pending    = false;
+    peer->endpoint_len = from_len;
+    peer_stamp_keypair(peer, time(NULL));
     fprintf(stderr, "[hs] responded to incoming initiation, keypair installed\n");
     return 0;
 }
@@ -1723,15 +1780,143 @@ tunnel_consume_response(tunnel_ctx *ctx, const uint8_t *buf, size_t len)
     }
     noise_remote_put(matched);
 
-    peer->hs_pending    = false;
-    peer->hs_attempts   = 0;
-    peer->keypair_birth = time(NULL);
+    peer->hs_pending  = false;
+    peer->hs_attempts = 0;
+    peer_stamp_keypair(peer, time(NULL));
     fprintf(stderr, "[hs] rekey complete, new keypair active\n");
     return 0;
 }
 
+/* ─────────────────────────────────────────────────────────────────────────
+ * Runtime dir + status socket
+ *
+ * When wg_core is started with --logical-name <name>, we write three files
+ * under /var/run/wireguard/:
+ *
+ *   <name>.pid    — pid of this process, for `wgctl down` to signal
+ *   <name>.name   — kernel-assigned utun device (e.g. "utun5"); lets
+ *                   wgctl show / scripts find the real interface
+ *   <name>.sock   — SOCK_STREAM UNIX socket; any connect+read writes one
+ *                   wg-show-style text dump and closes
+ *
+ * Files are unlinked on graceful exit. The directory must already exist
+ * (install.sh creates it, mode 0755 owned by root).
+ * ───────────────────────────────────────────────────────────────────────── */
+#define WG_RUNTIME_DIR "/var/run/wireguard"
+
+/* Set by main() so the cleanup path can unlink without re-deriving paths. */
+static char g_pid_path[256];
+static char g_name_path[256];
+static char g_sock_path[256];
+
+static void
+runtime_paths(const char *logical, char pid_p[256], char name_p[256], char sock_p[256])
+{
+    snprintf(pid_p,  256, "%s/%s.pid",  WG_RUNTIME_DIR, logical);
+    snprintf(name_p, 256, "%s/%s.name", WG_RUNTIME_DIR, logical);
+    snprintf(sock_p, 256, "%s/%s.sock", WG_RUNTIME_DIR, logical);
+}
+
+static int
+ensure_runtime_dir(void)
+{
+    /* mkdir is idempotent; ignore EEXIST. */
+    if (mkdir(WG_RUNTIME_DIR, 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "mkdir %s: %s\n", WG_RUNTIME_DIR, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int
+write_text_file(const char *path, const char *content, mode_t mode)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (fd < 0) {
+        fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    size_t len = strlen(content);
+    ssize_t n  = write(fd, content, len);
+    close(fd);
+    if (n != (ssize_t)len) {
+        fprintf(stderr, "write %s: short write\n", path);
+        return -1;
+    }
+    return 0;
+}
+
+/* Bind /var/run/wireguard/<logical>.sock for status dumps. Returns the
+ * listening fd, or -1 on failure. */
+static int
+status_socket_open(const char *sock_path)
+{
+    int fd;
+    struct sockaddr_un un;
+
+    if (strlen(sock_path) >= sizeof(un.sun_path)) {
+        fprintf(stderr, "status socket path too long: %s\n", sock_path);
+        return -1;
+    }
+
+    (void)unlink(sock_path);  /* clean up stale from a crashed previous run */
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) { perror("socket(AF_UNIX)"); return -1; }
+
+    memset(&un, 0, sizeof(un));
+    un.sun_family = AF_UNIX;
+    strncpy(un.sun_path, sock_path, sizeof(un.sun_path) - 1);
+
+    if (bind(fd, (struct sockaddr *)&un, sizeof(un)) < 0) {
+        perror("bind(status sock)");
+        close(fd);
+        return -1;
+    }
+    /* Root-only: don't leak peer pubkeys to other users. */
+    (void)chmod(sock_path, 0600);
+
+    if (listen(fd, 4) < 0) {
+        perror("listen(status sock)");
+        close(fd);
+        (void)unlink(sock_path);
+        return -1;
+    }
+    return fd;
+}
+
+/* Accept one client on the status socket, dump status, close. The protocol
+ * is "one connect = one dump"; clients don't need to send anything. */
+static void
+status_socket_accept(tunnel_ctx *ctx)
+{
+    int cfd = accept(ctx->status_listen_fd, NULL, NULL);
+    if (cfd < 0) {
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+            perror("accept(status sock)");
+        return;
+    }
+    /* fdopen lets us reuse the FILE*-based dump helper. */
+    FILE *out = fdopen(cfd, "w");
+    if (!out) {
+        close(cfd);
+        return;
+    }
+    dump_status_snapshot(ctx, out);
+    fclose(out);  /* also closes cfd */
+}
+
+static void
+runtime_cleanup(void)
+{
+    if (g_pid_path[0])  (void)unlink(g_pid_path);
+    if (g_sock_path[0]) (void)unlink(g_sock_path);
+    if (g_name_path[0]) (void)unlink(g_name_path);
+}
+
 static int
 run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
+           const char *logical_name,
            struct noise_local *local, struct cookie_checker *checker,
            const struct aips_set *aips,
            struct peer_state *peers, int n_peers)
@@ -1742,16 +1927,26 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
     time_t last_stats;
 
     memset(&ctx, 0, sizeof(ctx));
-    ctx.udp_fd         = udp_fd;
-    ctx.utun_fd        = utun_fd;
-    ctx.local          = local;
-    ctx.cookie_checker = checker;
-    ctx.aips           = aips;
-    ctx.peers          = peers;
-    ctx.n_peers        = n_peers;
+    ctx.udp_fd          = udp_fd;
+    ctx.utun_fd         = utun_fd;
+    ctx.local           = local;
+    ctx.cookie_checker  = checker;
+    ctx.aips            = aips;
+    ctx.peers           = peers;
+    ctx.n_peers         = n_peers;
+    ctx.status_listen_fd = -1;
     if (utun_name) {
         strncpy(ctx.if_name, utun_name, sizeof(ctx.if_name) - 1);
         ctx.if_name[sizeof(ctx.if_name) - 1] = '\0';
+    }
+    if (logical_name && *logical_name) {
+        strncpy(ctx.logical_name, logical_name, sizeof(ctx.logical_name) - 1);
+        ctx.logical_name[sizeof(ctx.logical_name) - 1] = '\0';
+        ctx.status_listen_fd = status_socket_open(g_sock_path);
+        if (ctx.status_listen_fd < 0)
+            fprintf(stderr, "[runtime] status socket disabled\n");
+        else
+            fprintf(stderr, "[runtime] status socket at %s\n", g_sock_path);
     }
 
     last_stats = time(NULL);
@@ -1800,6 +1995,10 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
         FD_SET(udp_fd,  &rfds);
         FD_SET(utun_fd, &rfds);
         maxfd = (udp_fd > utun_fd) ? udp_fd : utun_fd;
+        if (ctx.status_listen_fd >= 0) {
+            FD_SET(ctx.status_listen_fd, &rfds);
+            if (ctx.status_listen_fd > maxfd) maxfd = ctx.status_listen_fd;
+        }
 
         tv.tv_sec  = 1;
         tv.tv_usec = 0;
@@ -1817,6 +2016,12 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
             sig_info = 0;
             print_status_snapshot(&ctx);
         }
+
+        /* Status socket — serve a one-shot snapshot to whichever client
+         * connected. Doing this in-line keeps the implementation single-
+         * threaded; dumps are O(n_peers) and bounded. */
+        if (ctx.status_listen_fd >= 0 && FD_ISSET(ctx.status_listen_fd, &rfds))
+            status_socket_accept(&ctx);
 
         if (rc == 0) {
             if (now - last_stats >= 10) {
@@ -1970,6 +2175,9 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
         }
     }
 
+    if (ctx.status_listen_fd >= 0)
+        close(ctx.status_listen_fd);
+
     {
         uint64_t tot_tx_p = 0, tot_tx_b = 0, tot_rx_p = 0, tot_rx_b = 0, tot_drop = 0;
         for (int i = 0; i < ctx.n_peers; i++) {
@@ -1997,7 +2205,8 @@ static int send_keepalive_data(int udp_fd, struct peer_state *peer)
 
 int main(int argc, char *argv[])
 {
-    const char *config_path = "test.ini";
+    const char *config_path  = "test.ini";
+    const char *logical_name = NULL;        /* e.g. "wg0" */
     int want_tunnel = 0;
     struct client_config cfg;
     struct noise_local *local = NULL;
@@ -2011,17 +2220,35 @@ int main(int argc, char *argv[])
     int ret = 1;
 
     signal(SIGPIPE, SIG_IGN);
+    /* Install termination handlers up-front so probe-mode (which can block
+     * for up to ~45 s across 5 handshake attempts) cleans up promptly on
+     * SIGTERM. run_tunnel installs them again, which is harmless. */
+    signal(SIGINT,  on_quit);
+    signal(SIGTERM, on_quit);
 
-    /* Usage: wg_core [--tunnel] [config_path]
-     *   without --tunnel: run the one-shot handshake + keepalive probe.
-     *   with    --tunnel: after handshake, open utun, configure it, and
-     *                     enter the bidirectional forwarding loop. */
+    /* Usage: wg_core [--tunnel] [--logical-name NAME] [config_path]
+     *   --tunnel             after handshake, open utun and run the
+     *                        forwarding loop (otherwise: one-shot probe)
+     *   --logical-name NAME  publish /var/run/wireguard/NAME.{pid,name,sock}
+     *                        for wgctl up/down/show to track this instance */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--tunnel") == 0 || strcmp(argv[i], "-t") == 0) {
             want_tunnel = 1;
+        } else if ((strcmp(argv[i], "--logical-name") == 0 ||
+                    strcmp(argv[i], "-n") == 0) && i + 1 < argc) {
+            logical_name = argv[++i];
         } else {
             config_path = argv[i];
         }
+    }
+
+    if (logical_name) {
+        runtime_paths(logical_name, g_pid_path, g_name_path, g_sock_path);
+        if (ensure_runtime_dir() != 0)
+            return 1;
+        /* Best-effort cleanup on exit — atexit covers normal returns;
+         * signal handlers run runtime_cleanup explicitly via on_quit. */
+        atexit(runtime_cleanup);
     }
 
     printf("[info] pkt sizes: initiation=%zu response=%zu\n",
@@ -2151,30 +2378,52 @@ int main(int argc, char *argv[])
 
     /* Probe mode: drive the initial handshake against the FIRST peer with
      * an endpoint, send one keepalive, exit. Multi-peer probe is not very
-     * useful — operators should use --tunnel for the real thing. */
+     * useful — operators should use --tunnel for the real thing.
+     *
+     * Skip probe entirely when --tunnel is set: when BOTH ends initiate
+     * (has_endpoint on each side), probe mode's wait_for_response()
+     * synchronously rejects the peer's incoming INITIATION as "unexpected
+     * packet type/size", and both sides hit "[handshake] failed after
+     * retries" and goto out. run_tunnel handles bidirectional initiation
+     * correctly via tunnel_consume_initiation. */
     struct peer_state *first_initiator = NULL;
-    for (int i = 0; i < cfg.n_peers; i++) {
-        if (cfg.peers[i].has_endpoint) { first_initiator = &cfg.peers[i]; break; }
+    if (!want_tunnel) {
+        for (int i = 0; i < cfg.n_peers; i++) {
+            if (cfg.peers[i].has_endpoint) {
+                first_initiator = &cfg.peers[i];
+                break;
+            }
+        }
     }
 
     if (first_initiator) {
-        for (int attempt = 1; attempt <= 5; ++attempt) {
+        for (int attempt = 1; attempt <= 5 && !sig_quit; ++attempt) {
             uint32_t s_idx = 0;
             int w;
             printf("[handshake] attempt %d\n", attempt);
             if (send_initiation(udp_fd, first_initiator, &s_idx) != 0) {
-                sleep(REKEY_TIMEOUT_SEC);
+                /* nanosleep is EINTR-aware, so SIGTERM during the back-off
+                 * pops us out and the loop's sig_quit check exits cleanly.
+                 * sleep(3) on macOS is also SIGRT-restartable per POSIX —
+                 * but using nanosleep avoids that ambiguity. */
+                struct timespec ts = { REKEY_TIMEOUT_SEC, 0 };
+                (void)nanosleep(&ts, NULL);
                 continue;
             }
             w = wait_for_response(udp_fd, local, first_initiator, s_idx);
             if (w == 0) {
                 printf("[handshake] success\n");
-                first_initiator->keypair_birth = time(NULL);
-                first_initiator->last_authd_tx = first_initiator->keypair_birth;
+                peer_stamp_keypair(first_initiator, time(NULL));
                 ret = 0;
                 break;
             }
-            sleep(REKEY_TIMEOUT_SEC);
+            struct timespec ts = { REKEY_TIMEOUT_SEC, 0 };
+            (void)nanosleep(&ts, NULL);
+        }
+        if (sig_quit) {
+            fprintf(stderr, "[handshake] interrupted by signal\n");
+            ret = 0;
+            goto out;
         }
         if (ret != 0) {
             fprintf(stderr, "[handshake] failed after retries\n");
@@ -2204,6 +2453,19 @@ int main(int argc, char *argv[])
     }
     printf("[tunnel] opened %s (fd=%d)\n", utun_name, utun_fd);
 
+    /* Publish runtime files NOW that we know utun_name + our pid. wgctl
+     * down reads <logical>.pid; wgctl show reads <logical>.name to find
+     * the actual utun device name. */
+    if (logical_name) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%d\n", (int)getpid());
+        if (write_text_file(g_pid_path, buf, 0644) != 0)
+            fprintf(stderr, "[runtime] failed to write %s\n", g_pid_path);
+        snprintf(buf, sizeof(buf), "%s\n", utun_name);
+        if (write_text_file(g_name_path, buf, 0644) != 0)
+            fprintf(stderr, "[runtime] failed to write %s\n", g_name_path);
+    }
+
     if (cfg.n_if_addrs > 0) {
         if (utun_configure(utun_name, &cfg) != 0) {
             fprintf(stderr, "utun_configure failed, continuing unconfigured\n");
@@ -2228,14 +2490,14 @@ int main(int argc, char *argv[])
      * and (more importantly) re-installs the per-peer AllowedIPs routes
      * via the shipped /usr/local/libexec/wg-mac/postup.sh — the
      * defense-in-depth for the route-flushed-after-bring-up case. */
-    run_postup_hook(config_path, utun_name);
+    run_postup_hook(logical_name, config_path, utun_name);
 
     /* Send one keepalive on the first endpointed peer so the server
      * refreshes its endpoint view for this source port. */
     if (first_initiator)
         (void)send_keepalive_data(udp_fd, first_initiator);
 
-    ret = run_tunnel(udp_fd, utun_fd, utun_name,
+    ret = run_tunnel(udp_fd, utun_fd, utun_name, logical_name,
                      local, &checker, &aips,
                      cfg.peers, cfg.n_peers);
 

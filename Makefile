@@ -3,7 +3,10 @@
 
 # ── Toolchain ────────────────────────────────────────────────────────────────
 CC      := cc
-AR      := ar
+# Pin to Apple's ar — Homebrew binutils' ar may shadow it on $PATH and
+# produces GNU-format archives that the Apple linker rejects ("archive
+# member '/' not a mach-o file").
+AR      := /usr/bin/ar
 ARFLAGS := rcs
 SWIFTC  := swiftc
 
@@ -47,9 +50,9 @@ OBJS := $(patsubst $(SRCDIR)/%.c, $(BUILDDIR)/%.o, $(SRCS))
 # It intentionally has no corresponding FreeBSD source file.
 
 # ── Primary targets ───────────────────────────────────────────────────────────
-.PHONY: all clean help test xcframework build-ios
+.PHONY: all clean help test xcframework build-ios install uninstall
 
-all: $(BUILDDIR)/libwg.a $(BUILDDIR)/libswift_crypto.a
+all: $(BUILDDIR)/libwg.a $(BUILDDIR)/libswift_crypto.a $(BUILDDIR)/wg_core $(BUILDDIR)/wgctl
 
 test: $(BUILDDIR)/crypto_vector_test
 	@echo "  RUN  $<"
@@ -90,6 +93,45 @@ $(BUILDDIR)/wg_core: $(SRCDIR)/wg_core.c $(BUILDDIR)/libwg.a $(BUILDDIR)/libswif
 	    -framework Foundation -framework CryptoKit \
 	    -L/usr/lib/swift \
 	    -o $@
+
+# ── wgctl: user-facing CLI (genkey/pubkey/genpsk/up/down/show) ───────────────
+# Only needs libswift_crypto for Curve25519 (genkey/pubkey). Linking libwg.a
+# anyway keeps a single set of link flags and lets future subcommands reuse
+# the noise/cookie code without rewiring the Makefile.
+$(BUILDDIR)/wgctl: $(SRCDIR)/wgctl.c $(BUILDDIR)/libwg.a $(BUILDDIR)/libswift_crypto.a
+	@echo "  CC/LD  $@"
+	$(CC) $(CFLAGS) $(SRCDIR)/wgctl.c \
+	    -L$(BUILDDIR) -lwg -lswift_crypto \
+	    -lpthread \
+	    -framework Foundation -framework CryptoKit \
+	    -L/usr/lib/swift \
+	    -o $@
+
+# ── Install / uninstall ──────────────────────────────────────────────────────
+PREFIX  ?= /usr/local
+BINDIR  ?= $(PREFIX)/bin
+CONFDIR ?= /etc/wireguard
+RUNDIR  ?= /var/run/wireguard
+LOGDIR  ?= /var/log
+
+install: all
+	@if [ "$$(id -u)" != "0" ]; then \
+	    echo "install: must run as root (sudo)"; exit 1; fi
+	install -d $(BINDIR) $(CONFDIR) $(RUNDIR) $(LOGDIR)
+	install -m 0755 $(BUILDDIR)/wgctl   $(BINDIR)/wgctl
+	install -m 0755 $(BUILDDIR)/wg_core $(BINDIR)/wg_core
+	@chmod 0700 $(CONFDIR) $(RUNDIR)
+	@echo ""
+	@echo "  Installed wgctl + wg_core to $(BINDIR)"
+	@echo "  Put your wg-quick-style config at $(CONFDIR)/wg0.conf"
+	@echo "  Then run:  sudo wgctl up wg0   (or use scripts/install.sh"
+	@echo "             for launchd auto-start)"
+
+uninstall:
+	@if [ "$$(id -u)" != "0" ]; then \
+	    echo "uninstall: must run as root (sudo)"; exit 1; fi
+	rm -f $(BINDIR)/wgctl $(BINDIR)/wg_core
+	@echo "  Removed wgctl + wg_core. Configs in $(CONFDIR) left in place."
 
 # ── crypto_vector_test: KAT suite (blake2s / curve25519 / chacha20-poly1305) ─
 $(BUILDDIR)/crypto_vector_test: $(SRCDIR)/crypto_vector_test.c $(BUILDDIR)/libwg.a $(BUILDDIR)/libswift_crypto.a
