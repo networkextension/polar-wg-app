@@ -21,7 +21,7 @@
 #
 # Optional args:
 #   --hostname=NAME   override the registered hostname (default: hostname -s)
-#   --listen=PORT     wg UDP listen port (default: 51820)
+#   --listen=PORT     wg UDP listen port (default: 1632, matches the mesh)
 #   --iface=NAME      logical iface name (default: wgc0)
 #   --reinstall       re-register even if /etc/wgctl/<iface>.json exists
 
@@ -32,7 +32,11 @@ SERVER="__SERVER_PLACEHOLDER__"
 TOKEN=""
 HOSTNAME_OVERRIDE=""
 SITE_SLUG=""
-WG_LISTEN=51820
+# Mesh-wide UDP port. The control plane advertises each node's endpoint as
+# <ip>:<wg_listen>, so this MUST match what peers are told to dial — the macOS
+# join.sh uses 1632, so Linux nodes do too. A mismatch (e.g. the old 51820
+# default) means peers dial a port nothing listens on → handshake never lands.
+WG_LISTEN=1632
 IFACE="wgc0"
 REINSTALL=0
 
@@ -94,6 +98,7 @@ STATE_FILE="$STATE_DIR/$IFACE.json"
 CONF="/etc/wireguard/$IFACE.conf"
 RENDER_HELPER=/usr/local/sbin/wgctl-render-linux
 REFRESH_HELPER=/usr/local/sbin/wgctl-refresh-linux
+HB_HELPER=/usr/local/sbin/wgctl-hb-linux
 
 # Honor existing install unless --reinstall. Per-iface, so a second iface
 # joins cleanly without touching the first (unlike macOS join.sh).
@@ -206,18 +211,25 @@ lines = [
     "",
 ]
 for p in resp.get("peers", []):
-    extras = p.get("allowed_extra", []) or []
-    aips = ([p["wg_ip"] + "/32"] if p.get("wg_ip") else []) + extras
+    # wg_ip arrives bare from /v1/peers ("10.88.5.3") but prefixed from
+    # /v1/hub/peers ("10.88.1.2/32") — normalize to a single /32 host route.
+    wg_ip = p.get("wg_ip")
+    host = (wg_ip if "/" in wg_ip else wg_ip + "/32") if wg_ip else ""
+    aips = ([host] if host else []) + (p.get("allowed_extra") or [])
     if not aips:
         continue
-    lines += [
-        "[Peer]",
-        f"PublicKey  = {p['pubkey']}",
-        f"Endpoint   = {p['endpoint']}",
-        f"AllowedIPs = {', '.join(aips)}",
-        f"PersistentKeepalive = {ka}",
-        "",
-    ]
+    block = ["[Peer]", f"PublicKey  = {p['pubkey']}"]
+    # Roaming spokes (the hub's /v1/hub/peers view) carry no endpoint: the hub
+    # only responds, it never dials them, so emit neither Endpoint nor
+    # keepalive. Peers we DO dial (hub, LAN-direct) carry one → add both.
+    ep = p.get("endpoint")
+    if ep:
+        block.append(f"Endpoint   = {ep}")
+    block.append(f"AllowedIPs = {', '.join(aips)}")
+    if ep:
+        block.append(f"PersistentKeepalive = {ka}")
+    block.append("")
+    lines += block
 
 conf = f"/etc/wireguard/{iface}.conf"
 d = os.path.dirname(conf)
@@ -229,6 +241,109 @@ os.chmod(tmp, 0o600)
 os.replace(tmp, conf)
 RENDER
 chmod 0755 "$RENDER_HELPER"
+
+# Heartbeat body builder — prints the /v1/heartbeat JSON for <iface>, built
+# from `wg show <iface> dump` + host facts. Mirrors the macOS wgctl-agent
+# status block (doc/hub-status.md): for a hub the per-peer roster is the
+# authoritative "who's online" view of the whole mesh.
+cat > "$HB_HELPER" <<'HB'
+#!/usr/bin/env python3
+import json, os, subprocess, sys, time
+
+iface = sys.argv[1]
+try:
+    state = json.load(open(f"/etc/wgctl/{iface}.json"))
+except Exception:
+    state = {}
+role      = state.get("role", "device")
+wg_listen = int(state.get("listen", 0) or 0)
+
+def run(*a):
+    try:
+        return subprocess.run(a, capture_output=True, text=True, timeout=8).stdout
+    except Exception:
+        return ""
+
+# `wg show <iface> dump` is TAB-separated:
+#   line 0: privkey  pubkey  listen-port  fwmark            (interface)
+#   line N: pubkey  psk  endpoint  allowed-ips  hs  rx  tx  keepalive  (peer)
+now   = int(time.time())
+dump  = run("wg", "show", iface, "dump").splitlines()
+iface_up = bool(dump)
+peers = []
+for ln in dump[1:]:
+    f = ln.split("\t")
+    if len(f) < 8:
+        continue
+    pub, _psk, endpoint, aips, hs, rx, tx, _ka = f[:8]
+    hs   = int(hs or 0)
+    last = (now - hs) if hs else None
+    wg_ip = ""
+    for a in aips.split(","):
+        a = a.strip()
+        if a and a not in ("(none)", "none"):
+            wg_ip = a.split("/")[0]; break
+    peers.append({
+        "pubkey": pub,
+        "wg_ip": wg_ip,
+        "endpoint": None if endpoint in ("(none)", "") else endpoint,
+        "last_handshake_sec": last,
+        "rx_bytes": int(rx or 0),
+        "tx_bytes": int(tx or 0),
+        "online": last is not None and last < 180,
+    })
+
+# lan_addrs — skip loopback / link-local / mesh ranges.
+lan = []
+for ln in run("ip", "-o", "-4", "addr", "show", "scope", "global").splitlines():
+    p = ln.split()
+    if len(p) < 4 or p[2] != "inet":
+        continue
+    dev, cidr = p[1], p[3]
+    if dev.startswith("wg"):
+        continue
+    if cidr.split("/")[0].startswith(("127.", "169.254.", "10.88.", "100.64.")):
+        continue
+    lan.append({"iface": dev, "cidr": cidr})
+
+# public egress IP for wg_endpoint (best-effort, via the default route NIC).
+r = run("ip", "route", "show", "default").split()
+def_if = r[r.index("dev") + 1] if "dev" in r else ""
+pub_ip = ""
+for ln in run("ip", "-o", "-4", "addr", "show", def_if).splitlines():
+    p = ln.split()
+    if len(p) >= 4 and p[2] == "inet":
+        pub_ip = p[3].split("/")[0]; break
+
+try:
+    uptime = int(float(open("/proc/uptime").read().split()[0]))
+except Exception:
+    uptime = None
+arch = run("uname", "-m").strip()
+arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(arch, arch)
+
+ages = [p["last_handshake_sec"] for p in peers if p["last_handshake_sec"] is not None]
+stats = {
+    "rx_bytes": sum(p["rx_bytes"] for p in peers),
+    "tx_bytes": sum(p["tx_bytes"] for p in peers),
+    "last_handshake_sec": min(ages) if ages else 0,
+}
+status = {
+    "schema": 1, "role": role, "os": "linux", "arch": arch,
+    "agent_ver": "join-linux", "iface": iface, "iface_up": iface_up,
+    "uptime_sec": uptime, "wg_listen": wg_listen,
+    "peer_count": len(peers),
+    "peers_online": sum(1 for p in peers if p["online"]),
+    "peers": peers,
+}
+print(json.dumps({
+    "lan_addrs":   lan,
+    "wg_endpoint": f"{pub_ip}:{wg_listen}" if pub_ip and wg_listen else "",
+    "stats":       stats,
+    "status":      status,
+}))
+HB
+chmod 0755 "$HB_HELPER"
 
 cat > "$REFRESH_HELPER" <<REFRESH
 #!/bin/bash
@@ -255,16 +370,14 @@ case "\$ROLE" in
     *)   PEER_URL="\$SERVER/v1/peers" ;;
 esac
 
-# Best-effort heartbeat so the node shows online + last-seen in admin (the macOS
-# agent already does this; Linux didn't). Minimal body; any failure is ignored —
-# the peer refresh below is the part that matters.
-DEF_IF=\$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(\$i=="dev"){print \$(i+1); exit}}')
-PUB_IP=\$(ip -o -4 addr show "\$DEF_IF" 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -1)
-WG_LISTEN=\$(read_field listen)
+# Heartbeat: full status block (lan_addrs + per-peer roster + transfer stats),
+# built by the hb helper from \`wg show <iface> dump\`. For a hub this roster is
+# the authoritative whole-mesh "who's online" view (doc/hub-status.md). Any
+# failure is ignored — the peer refresh below is the part that matters.
+HB_BODY=\$($HB_HELPER "\$IFACE" 2>/dev/null || echo '{}')
 curl -fsS --max-time 8 -X POST "\$SERVER/v1/heartbeat" \\
     -H "Authorization: Bearer \$TOKEN" -H "X-Device-Id: \$DEVICE_ID" \\
-    -H 'Content-Type: application/json' \\
-    -d "{\\"lan_addrs\\":[],\\"wg_endpoint\\":\\"\${PUB_IP}:\${WG_LISTEN}\\"}" \\
+    -H 'Content-Type: application/json' -d "\$HB_BODY" \\
     >/dev/null 2>&1 || true
 
 HTTP=\$(mktemp)
