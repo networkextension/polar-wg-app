@@ -34,6 +34,15 @@ import os.log
 import WireGuardCore
 import Darwin
 
+// Optional WireGuard-over-KCP transport. When the Shanghai KCP package is
+// linked into the extension target, a tunnel can carry wg_core's UDP through
+// KCP (ARQ + FEC + AES obfuscation) by setting `kcpEnable` in the tunnel's
+// providerConfiguration — useful on QoS'd / lossy / cross-border paths. When
+// the module isn't linked, this file compiles unchanged and uses NWUDPSession.
+#if canImport(Shanghai)
+import Shanghai
+#endif
+
 private let log = OSLog(subsystem: "com.example.wireguard", category: "tunnel")
 
 public final class PacketTunnelProvider: NEPacketTunnelProvider {
@@ -42,6 +51,11 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private var session: OpaquePointer?        // wg_session_t *
     private var udpSession: NWUDPSession?
+#if canImport(Shanghai)
+    // When non-nil, wg_core's UDP rides KCP instead of the NWUDPSession.
+    private var kcpSession: KcpSession?
+    private let kcpQueue = DispatchQueue(label: "com.example.wireguard.kcp")
+#endif
     private var tickTimer: DispatchSourceTimer?
     private var peerHost: NWHostEndpoint?       // current UDP destination
     private var routeDebugInfo: String = "(route debug not initialized)"
@@ -139,8 +153,39 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
                 } else {
                     self.selectedLocalBindDebug = "(none)"
                 }
+                #if canImport(Shanghai)
+                // KCP transport (if kcpEnable set + the module is linked).
+                // The wg conf's peer Endpoint should be the remote kcpfwd's
+                // public ip:port; its /32 is already in excludedRoutes (see
+                // buildNetworkSettings), so KcpSession's BSD socket to it is
+                // kept off the tunnel — no loop.
+                if let kcp = self.makeKcpSession(endpoint: endpoint,
+                                                 providerConfiguration: proto.providerConfiguration) {
+                    kcp.onReceive = { [weak self] data in self?.handleKcpReceive(data) }
+                    kcp.onStop = { error in
+                        if let error = error {
+                            os_log("kcp transport stopped: %{public}@", log: log,
+                                   type: .error, String(describing: error))
+                        }
+                    }
+                    do {
+                        try kcp.start()
+                        self.kcpSession = kcp
+                        self.selectedLocalBindDebug = "(kcp)"
+                    } catch {
+                        os_log("kcp start failed, using NWUDPSession: %{public}@", log: log,
+                               type: .error, String(describing: error))
+                        self.udpSession = self.createUDPSession(to: endpoint, from: localBind)
+                        self.attachUDPReadHandler()
+                    }
+                } else {
+                    self.udpSession = self.createUDPSession(to: endpoint, from: localBind)
+                    self.attachUDPReadHandler()
+                }
+                #else
                 self.udpSession = self.createUDPSession(to: endpoint, from: localBind)
                 self.attachUDPReadHandler()
+                #endif
             } else {
                 self.selectedEndpointDebug = "(none)"
                 self.selectedLocalBindDebug = "(none)"
@@ -164,6 +209,10 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     ) {
         tickTimer?.cancel()
         tickTimer = nil
+        #if canImport(Shanghai)
+        kcpSession?.stop()
+        kcpSession = nil
+        #endif
         udpSession?.cancel()
         udpSession = nil
         if let s = session {
@@ -553,6 +602,79 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         }, maxDatagrams: 64)
     }
 
+#if canImport(Shanghai)
+    // MARK: - KCP transport
+
+    /// Build a KcpSession for `endpoint` from the tunnel's providerConfiguration
+    /// when `kcpEnable` is truthy; nil keeps the plain NWUDPSession path. Keys
+    /// (all under NETunnelProviderProtocol.providerConfiguration, all strings):
+    ///   kcpEnable "1"/"true"/"yes" · kcpConv <UInt32> · kcpKey <psk> ·
+    ///   kcpCrypt none|aes|aes-128|aes-192 (default aes) ·
+    ///   kcpDatashard <n> (default 0=off) · kcpParityshard <n> (default 0) ·
+    ///   kcpMtu <n> (default 1350). Every value MUST match the remote kcpfwd.
+    /// The wg conf's peer Endpoint = the remote kcpfwd's public ip:port (its
+    /// /32 is excluded from the tunnel by buildNetworkSettings, so KcpSession's
+    /// BSD socket to it doesn't loop).
+    private func makeKcpSession(endpoint: NWHostEndpoint,
+                                providerConfiguration: [String: Any]?) -> KcpSession? {
+        guard let cfg = providerConfiguration, isTruthy(cfg["kcpEnable"]) else { return nil }
+        guard let port = UInt16(endpoint.port) else {
+            os_log("kcp: bad endpoint port %{public}@", log: log, type: .error, endpoint.port)
+            return nil
+        }
+        let conv = UInt32(stringValue(cfg["kcpConv"]) ?? "") ?? 0
+        let key = stringValue(cfg["kcpKey"]) ?? ""
+        let crypt = KcpPacketCryptoMethod(rawValue: stringValue(cfg["kcpCrypt"]) ?? "aes") ?? .aes
+        let ds = Int(stringValue(cfg["kcpDatashard"]) ?? "") ?? 0
+        let ps = Int(stringValue(cfg["kcpParityshard"]) ?? "") ?? 0
+        let mtu = Int32(stringValue(cfg["kcpMtu"]) ?? "") ?? 1350
+
+        var configuration = KcpConfiguration()
+        configuration.conversationID = conv
+        configuration.preSharedKey = key
+        configuration.crypt = crypt
+        configuration.dataShards = ds
+        configuration.parityShards = ps
+        configuration.mtu = mtu
+        configuration.streamMode = false   // datagram: 1 WG packet ↔ 1 KCP message
+
+        os_log("kcp transport → %{public}@:%d conv=%u crypt=%{public}@ fec=%d/%d",
+               log: log, type: .info, endpoint.hostname, Int(port), conv, crypt.rawValue, ds, ps)
+        return KcpSession(remoteHost: endpoint.hostname, remotePort: port,
+                          configuration: configuration, callbackQueue: kcpQueue)
+    }
+
+    /// KCP delivered a decoded WG packet — hand it to wg_core exactly like the
+    /// NWUDPSession read path (attachUDPReadHandler) does.
+    private func handleKcpReceive(_ data: Data) {
+        guard let session = self.session else { return }
+        data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            if var peerAddr = self.makeSockaddrFromCurrentEndpoint() {
+                _ = withUnsafeMutablePointer(to: &peerAddr.storage) { storagePtr in
+                    storagePtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+                        wg_session_handle_udp(session,
+                                              base.assumingMemoryBound(to: UInt8.self),
+                                              data.count, saPtr, peerAddr.length)
+                    }
+                }
+            }
+        }
+    }
+
+    private func isTruthy(_ v: Any?) -> Bool {
+        if let b = v as? Bool { return b }
+        if let s = v as? String { return ["1", "true", "yes", "on"].contains(s.lowercased()) }
+        if let n = v as? Int { return n != 0 }
+        return false
+    }
+    private func stringValue(_ v: Any?) -> String? {
+        if let s = v as? String { return s }
+        if let n = v as? Int { return String(n) }
+        return nil
+    }
+#endif
+
     private func startPacketFlowLoop() {
         packetFlow.readPackets { [weak self] packets, _ in
             guard let self = self, let session = self.session else { return }
@@ -588,6 +710,12 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     // `self` from the user_ctx pointer the session was created with.
 
     fileprivate func writeDatagram(_ bytes: UnsafePointer<UInt8>, length: Int) {
+        #if canImport(Shanghai)
+        if let kcp = kcpSession {
+            kcp.send(Data(bytes: bytes, count: length))
+            return
+        }
+        #endif
         guard let udpSession = udpSession else {
             os_log("udp write dropped: udpSession is nil", log: log, type: .error)
             return
