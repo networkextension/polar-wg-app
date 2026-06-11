@@ -415,7 +415,7 @@ final class TunnelManager: ObservableObject {
             // Hostname: iOS doesn't expose scutil; use ProcessInfo's
             // hostname (often a generic "iPhone"), let server hash it.
             let hostname = ProcessInfo.processInfo.hostName
-            let listen = 51820
+            let listen = 1632   // operator port: 51820 is DPI-fingerprinted, 1632 is port-forwarded
             let agentVer = "wg-mac-app-ios-1"
 
             let resp = try await client.register(

@@ -17,6 +17,12 @@ set -u
 STATE_DIR=/etc/wgctl
 LOG=/var/log/wg-agent.log
 AGENT_VER=wg-agent-native-1
+# Long-poll tuning (env-overridable). See scripts/wgctl-agent.sh for the model:
+# bounded long-poll loop per run, auto-degrades to single fetch.
+LP_BUDGET=${WGCTL_LP_BUDGET:-55}
+LP_WAIT=${WGCTL_LP_WAIT:-45}
+LP_MIN_RETURN=${WGCTL_LP_MIN_RETURN:-5}
+LP_FLOOR=${WGCTL_LP_FLOOR:-10}
 log(){ printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG" 2>/dev/null; }
 
 [ "$(id -u)" = 0 ] || { echo "wg-agent: must run as root" >&2; exit 1; }
@@ -25,10 +31,20 @@ command -v wg >/dev/null 2>&1 || { log "wg not found; is wireguard-tools install
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 case "$(uname -m)" in x86_64|amd64) ARCH=amd64;; arm64|aarch64) ARCH=arm64;; *) ARCH=$(uname -m);; esac
 [ "$OS" = freebsd ] && CONFDIR=/usr/local/etc/wireguard || CONFDIR=/etc/wireguard
+[ "$OS" = freebsd ] && RUNDIR=/var/run/wireguard || RUNDIR=/run/wireguard
+mkdir -p "$RUNDIR" 2>/dev/null || true
 HAS_SYSTEMD=0; [ "$OS" = linux ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] && HAS_SYSTEMD=1
 if [ -r /proc/uptime ]; then UPTIME=$(cut -d. -f1 /proc/uptime); else
   _b=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/.*sec = \([0-9]*\).*/\1/p')
   [ -n "$_b" ] && UPTIME=$(( $(date +%s) - _b )) || UPTIME=""
+fi
+
+# Single-instance guard: a long-poll run can last ~55s; cron (* * * * *) could
+# fire a second instance. systemd-timer OnUnitActiveSec and launchd don't
+# overlap, but cron does — so hold an flock when available (FreeBSD may lack it,
+# in which case we proceed; systemd path is the common Linux scheduler anyway).
+if command -v flock >/dev/null 2>&1 && exec 9>"$RUNDIR/wg-agent.lock" 2>/dev/null; then
+  flock -n 9 || { log "another wg-agent already running; skip"; exit 0; }
 fi
 
 reload_iface() {  # apply a changed conf
@@ -42,7 +58,114 @@ evict_iface() {   # server rejected our token: tear this iface down
   log "[$iface] EVICT: server rejected token"
   if [ "$HAS_SYSTEMD" = 1 ]; then systemctl disable --now "wg-quick@$iface" 2>>"$LOG"; fi
   wg-quick down "$iface" 2>>"$LOG" || true
-  rm -f "$CONFDIR/$iface.conf" "$state"
+  rm -f "$CONFDIR/$iface.conf" "$state" "$RUNDIR/$iface.rev"
+}
+
+# Persist the rev cursor atomically (only when non-empty).
+save_rev() {  # iface, rev
+  [ -n "$2" ] || return 0
+  printf '%s\n' "$2" > "$RUNDIR/$1.rev.tmp" 2>/dev/null && mv "$RUNDIR/$1.rev.tmp" "$RUNDIR/$1.rev" 2>/dev/null
+}
+
+# Fetch peers once. WAIT>0 → long-poll (?wait/?rev); REV omitted when empty.
+# Globals out: PR_OUTCOME{applied,unchanged,notmod,error}, PR_ELAPSED, PR_NEWREV.
+peer_refresh_once() {
+  local IFACE="$1" SERVER="$2" TOKEN="$3" DEVICE_ID="$4" ROLE="$5" WAIT="$6" REV="$7"
+  PR_OUTCOME=error; PR_ELAPSED=0; PR_NEWREV=""
+  local base; case "$ROLE" in hub) base="$SERVER/v1/hub/peers";; *) base="$SERVER/v1/peers";; esac
+  local url="$base" maxt=10
+  if [ "$WAIT" -gt 0 ]; then
+    url="$base?wait=$WAIT"
+    [ -n "$REV" ] && url="$url&rev=$(printf '%s' "$REV" | sed 's/[^A-Za-z0-9._-]/-/g')"
+    maxt=$((WAIT + 10))
+  fi
+  local PR t0 t1 PCODE
+  PR=$(mktemp); t0=$(date +%s)
+  PCODE=$(curl -sS -o "$PR" -w '%{http_code}' --max-time "$maxt" "$url" \
+          -H "Authorization: Bearer $TOKEN" -H "X-Device-Id: $DEVICE_ID" 2>>"$LOG" || echo 000)
+  t1=$(date +%s); PR_ELAPSED=$((t1 - t0))
+  if [ "$PCODE" != 200 ]; then log "[$IFACE] peers HTTP $PCODE"; rm -f "$PR"; PR_OUTCOME=error; return; fi
+  if grep -q '"not_modified"[[:space:]]*:[[:space:]]*true' "$PR"; then
+    PR_NEWREV=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("rev","") or "")' "$PR" 2>/dev/null)
+    rm -f "$PR"; PR_OUTCOME=notmod; return
+  fi
+  PR_NEWREV=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("rev","") or "")' "$PR" 2>/dev/null)
+  local NEW CONF; NEW=$(mktemp); CONF="$CONFDIR/$IFACE.conf"
+  python3 - "$NEW" "$PR" "$CONF" <<'PY'
+import json, sys
+new_path, resp_path, conf_path = sys.argv[1], sys.argv[2], sys.argv[3]
+priv = addr = listen = ""
+try:
+    for line in open(conf_path):
+        s = line.strip()
+        if s.startswith("PrivateKey"): priv = s.split("=",1)[1].strip()
+        elif s.startswith("Address"):  addr = s.split("=",1)[1].strip()
+        elif s.startswith("ListenPort"): listen = s.split("=",1)[1].strip()
+except FileNotFoundError:
+    sys.exit("conf missing")
+if not priv: sys.exit("priv missing")
+resp = json.load(open(resp_path))
+lines = ["[Interface]", f"PrivateKey = {priv}",
+         f"Address    = {addr or resp.get('device_ip','')+'/24'}",
+         f"ListenPort = {listen or '1632'}", ""]
+ka = resp.get("keepalive_sec", 25)
+for p in resp.get("peers", []):
+    if not p.get("pubkey"): continue
+    aips = ([p["wg_ip"] + "/32"] if p.get("wg_ip") else []) + (p.get("allowed_extra") or [])
+    if not aips: continue
+    lines += ["[Peer]", f"PublicKey  = {p['pubkey']}"]
+    if p.get("endpoint"): lines += [f"Endpoint   = {p['endpoint']}"]
+    lines += [f"AllowedIPs = {', '.join(aips)}"]
+    if ka: lines += [f"PersistentKeepalive = {ka}"]
+    lines += [""]
+open(new_path, "w").write("\n".join(lines))
+PY
+  if [ -s "$NEW" ]; then
+    if [ -f "$CONF" ] && cmp -s "$NEW" "$CONF"; then PR_OUTCOME=unchanged; else
+      install -m 0600 "$NEW" "$CONF"; log "[$IFACE] conf changed; reload"; reload_iface "$IFACE"; PR_OUTCOME=applied
+    fi
+  else
+    PR_OUTCOME=unchanged   # empty render (conf missing) → leave running conf alone
+  fi
+  rm -f "$NEW" "$PR"
+}
+
+# Bounded long-poll loop (single iface). Auto-detect + degrade; see wgctl-agent.sh.
+peer_refresh_loop() {
+  local IFACE="$1" SERVER="$2" TOKEN="$3" DEVICE_ID="$4" ROLE="$5"
+  local rev; rev=$(cat "$RUNDIR/$IFACE.rev" 2>/dev/null)
+  local deadline=$(( $(date +%s) + LP_BUDGET ))
+  local mode="probe" wait_for=0
+  while :; do
+    local now remaining
+    now=$(date +%s); remaining=$(( deadline - now ))
+    [ "$remaining" -le 1 ] && break
+    if [ "$mode" = longpoll ] || [ "$mode" = trial ]; then
+      wait_for=$LP_WAIT
+      [ "$wait_for" -gt "$remaining" ] && wait_for=$remaining
+      [ "$wait_for" -lt 1 ] && break
+    fi
+    peer_refresh_once "$IFACE" "$SERVER" "$TOKEN" "$DEVICE_ID" "$ROLE" "$wait_for" "$rev"
+    if [ -n "$PR_NEWREV" ] && [ "$PR_NEWREV" != "$rev" ]; then save_rev "$IFACE" "$PR_NEWREV"; rev="$PR_NEWREV"; fi
+    case "$PR_OUTCOME" in
+      error)  break ;;
+      notmod) mode=longpoll; continue ;;
+    esac
+    case "$mode" in
+      probe)
+        [ -z "$PR_NEWREV" ] && break
+        mode=trial; continue ;;
+      trial)
+        if [ "$PR_ELAPSED" -ge "$LP_MIN_RETURN" ]; then mode=longpoll; continue; fi
+        log "[$IFACE] server ignores ?wait (${PR_ELAPSED}s); single-fetch mode"; break ;;
+      longpoll)
+        if [ "$PR_ELAPSED" -lt "$LP_MIN_RETURN" ] && [ "$PR_OUTCOME" = unchanged ]; then
+          [ $(( deadline - $(date +%s) )) -le "$LP_FLOOR" ] && break
+          sleep "$LP_FLOOR"
+        fi
+        continue ;;
+    esac
+  done
 }
 
 process_iface() {
@@ -144,56 +267,24 @@ PY
     evict_iface "$IFACE" "$STATE"; return
   fi
 
-  # ----- 3. peer refresh -----
-  local PEER_URL; case "$ROLE" in hub) PEER_URL="$SERVER/v1/hub/peers";; *) PEER_URL="$SERVER/v1/peers";; esac
-  local PR PCODE
-  PR=$(mktemp)
-  PCODE=$(curl -sS -o "$PR" -w '%{http_code}' --max-time 10 "$PEER_URL" \
-          -H "Authorization: Bearer $TOKEN" -H "X-Device-Id: $DEVICE_ID" 2>>"$LOG" || echo 000)
-  [ "$PCODE" = 200 ] || { log "[$IFACE] peers HTTP $PCODE"; rm -f "$PR"; return; }
-
-  # ----- 4. re-render conf -----
-  local NEW CONF; NEW=$(mktemp); CONF="$CONFDIR/$IFACE.conf"
-  python3 - "$NEW" "$PR" "$CONF" <<'PY'
-import json, sys
-new_path, resp_path, conf_path = sys.argv[1], sys.argv[2], sys.argv[3]
-priv = addr = listen = ""
-try:
-    for line in open(conf_path):
-        s = line.strip()
-        if s.startswith("PrivateKey"): priv = s.split("=",1)[1].strip()
-        elif s.startswith("Address"):  addr = s.split("=",1)[1].strip()
-        elif s.startswith("ListenPort"): listen = s.split("=",1)[1].strip()
-except FileNotFoundError:
-    sys.exit("conf missing")
-if not priv: sys.exit("priv missing")
-resp = json.load(open(resp_path))
-lines = ["[Interface]", f"PrivateKey = {priv}",
-         f"Address    = {addr or resp.get('device_ip','')+'/24'}",
-         f"ListenPort = {listen or '1632'}", ""]
-ka = resp.get("keepalive_sec", 25)
-for p in resp.get("peers", []):
-    if not p.get("pubkey"): continue
-    aips = ([p["wg_ip"] + "/32"] if p.get("wg_ip") else []) + (p.get("allowed_extra") or [])
-    if not aips: continue
-    lines += ["[Peer]", f"PublicKey  = {p['pubkey']}"]
-    if p.get("endpoint"): lines += [f"Endpoint   = {p['endpoint']}"]
-    lines += [f"AllowedIPs = {', '.join(aips)}"]
-    if ka: lines += [f"PersistentKeepalive = {ka}"]
-    lines += [""]
-open(new_path, "w").write("\n".join(lines))
-PY
-  if [ -s "$NEW" ]; then
-    if [ -f "$CONF" ] && cmp -s "$NEW" "$CONF"; then :; else
-      install -m 0600 "$NEW" "$CONF"; log "[$IFACE] conf changed; reload"; reload_iface "$IFACE"
-    fi
+  # ----- 3. peer refresh (long-poll on single iface, else one immediate fetch) -----
+  if [ "${LONGPOLL_OK:-0}" = 1 ]; then
+    peer_refresh_loop "$IFACE" "$SERVER" "$TOKEN" "$DEVICE_ID" "$ROLE"
+  else
+    local rev0; rev0=$(cat "$RUNDIR/$IFACE.rev" 2>/dev/null)
+    peer_refresh_once "$IFACE" "$SERVER" "$TOKEN" "$DEVICE_ID" "$ROLE" 0 "$rev0"
+    [ -n "$PR_NEWREV" ] && [ "$PR_NEWREV" != "$rev0" ] && save_rev "$IFACE" "$PR_NEWREV"
   fi
-  rm -f "$NEW" "$PR"
 }
 
 shopt -s nullglob 2>/dev/null || true
+state_files=("$STATE_DIR"/*.json)
+# Long-poll only with a single mesh iface (a ~45s hold must not starve another
+# iface's heartbeat); multi-iface keeps the per-iface immediate fetch.
+LONGPOLL_OK=0
+[ "${#state_files[@]}" -eq 1 ] && LONGPOLL_OK=1
 found=0
-for s in "$STATE_DIR"/*.json; do
+for s in "${state_files[@]}"; do
   [ -e "$s" ] || continue
   found=1
   process_iface "$s"

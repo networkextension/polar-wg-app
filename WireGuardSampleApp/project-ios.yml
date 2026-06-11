@@ -59,7 +59,10 @@ settings:
       SWIFT_OPTIMIZATION_LEVEL: -O
       GCC_OPTIMIZATION_LEVEL: s
 
-packages: {}
+packages:
+  Shanghai:
+    url: https://github.com/yarshure/Shanghai.git
+    branch: feat/kcpfwd-wg-over-kcp
 
 schemes:
   WireGuardSampleApp-iOS:
@@ -111,3 +114,5 @@ targets:
       - framework: ../build/xcframework/WireGuardCore.xcframework
         embed: false
         codeSign: false
+      - package: Shanghai
+        product: Shanghai

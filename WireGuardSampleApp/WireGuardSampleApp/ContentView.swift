@@ -171,7 +171,7 @@ struct ContentView: View {
 
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Server URL").font(.caption).foregroundStyle(.secondary)
-                    TextField("https://zen.4950.store", text: $apiBaseURL)
+                    TextField("https://wg.4950.store:2443", text: $apiBaseURL)
                         .textFieldStyle(.roundedBorder)
                         #if !os(macOS)
                         .textInputAutocapitalization(.never)

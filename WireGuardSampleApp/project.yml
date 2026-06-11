@@ -52,7 +52,15 @@ settings:
 # Where the prebuilt xcframework lives. Path is relative to this
 # project.yml file. Run `make xcframework` from the repo root before
 # opening the .xcodeproj.
-packages: {}
+#
+# Shanghai = the optional WireGuard-over-KCP transport. The extension's
+# PacketTunnelProvider gates all KCP code behind `#if canImport(Shanghai)`,
+# so this dependency is what turns it on (set `kcpEnable` in the tunnel's
+# providerConfiguration to actually route through KCP).
+packages:
+  Shanghai:
+    url: https://github.com/yarshure/Shanghai.git
+    branch: feat/kcpfwd-wg-over-kcp
 
 schemes:
   WireGuardSampleApp:
@@ -106,3 +114,5 @@ targets:
       - framework: ../build/xcframework/WireGuardCore.xcframework
         embed: false
         codeSign: false
+      - package: Shanghai
+        product: Shanghai

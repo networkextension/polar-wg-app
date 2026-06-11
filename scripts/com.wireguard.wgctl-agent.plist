@@ -15,10 +15,15 @@
     launchctl bootout   system/com.wireguard.wgctl-agent
     rm /Library/LaunchDaemons/com.wireguard.wgctl-agent.plist
 
-  StartInterval = 60 → heartbeat + peer-poll every minute. The server
-  reports its preferred refresh_sec in /v1/register; we ignore that
-  for now (60 s is a reasonable lower bound — server can de-dup via
-  the rev/ETag in /v1/hub/peers if it cares).
+  StartInterval = 60 → launchd relaunches the agent every minute. The
+  agent is NOT a one-shot poller anymore: when there is a single mesh
+  iface it runs an internal bounded long-poll loop (up to ~55 s,
+  WGCTL_LP_BUDGET) that holds a GET /v1/peers?wait=… so a peer change
+  propagates near-instantly. It auto-degrades to a single fetch against
+  a server that doesn't support long-poll. LP_BUDGET (55) < StartInterval
+  (60) so invocations never overlap; the 60 s relaunch is the coverage
+  backstop. ExitTimeOut gives launchd headroom not to SIGKILL a held
+  request on stop/reload.
 -->
 <plist version="1.0">
 <dict>
@@ -35,6 +40,11 @@
 
     <key>RunAtLoad</key>
     <true/>
+
+    <!-- Headroom for an in-flight long-poll (budget ~55s + curl slack) so a
+         stop/reload doesn't SIGKILL the held request mid-flight. -->
+    <key>ExitTimeOut</key>
+    <integer>75</integer>
 
     <key>StandardOutPath</key>
     <string>/var/log/wgctl-agent.out.log</string>

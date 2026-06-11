@@ -42,7 +42,9 @@ SRC=$ROOT/src
 MODMAP=$ROOT/NetworkExtension/WireGuardKit/module.modulemap
 
 CC=${CC:-cc}
-AR=${AR:-ar}
+# Pin to Apple's ar. Homebrew binutils' ar in $PATH writes GNU archives
+# that Apple ld rejects with "archive member '/' not a mach-o file".
+AR=${AR:-/usr/bin/ar}
 SWIFTC=${SWIFTC:-swiftc}
 
 MACOS_SDK=$(xcrun --sdk macosx --show-sdk-path)
