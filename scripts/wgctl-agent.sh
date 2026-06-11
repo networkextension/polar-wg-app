@@ -26,6 +26,19 @@ set -u
 
 STATE_DIR=/etc/wgctl
 LOG=/var/log/wgctl-agent.log
+RUNDIR=/var/run/wireguard
+
+# Long-poll tuning (env-overridable for tests). Each invocation runs a
+# bounded long-poll loop up to LP_BUDGET sec then exits, so launchd relaunches
+# it (StartInterval=60 > LP_BUDGET ⇒ no overlap). LP_WAIT is what we ask the
+# server to hold a connection open. Against a server that does NOT support
+# long-poll the loop auto-degrades to a single fetch (no busy-loop) — see
+# peer_refresh_loop. LP_MIN_RETURN is the "fast return" threshold used to tell
+# a held connection from a server that ignores ?wait.
+LP_BUDGET=${WGCTL_LP_BUDGET:-55}
+LP_WAIT=${WGCTL_LP_WAIT:-45}
+LP_MIN_RETURN=${WGCTL_LP_MIN_RETURN:-5}
+LP_FLOOR=${WGCTL_LP_FLOOR:-10}
 
 log() {
     printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG"
@@ -91,6 +104,180 @@ reconcile_routes() {
     done
 }
 
+# ── peer refresh: one fetch ──────────────────────────────────────────────────
+# Fetch the peer list once and reconcile the iface conf. With WAIT>0 the URL
+# carries long-poll params (?wait/?rev) and the server may hold the request up
+# to WAIT seconds; REV is the opaque cursor from the last applied response,
+# omitted when empty (cold start → full list immediately).
+# Returns via globals:
+#   PR_OUTCOME  applied | unchanged | notmod | error
+#   PR_ELAPSED  seconds the request took (used to detect a held connection)
+#   PR_NEWREV   server's current rev for this view (may be empty)
+peer_refresh_once() {
+    local IFACE="$1" SERVER="$2" TOKEN="$3" DEVICE_ID="$4" ROLE="$5" WAIT="$6" REV="$7"
+    PR_OUTCOME=error; PR_ELAPSED=0; PR_NEWREV=""
+
+    local base
+    case "$ROLE" in
+        hub) base="$SERVER/v1/hub/peers" ;;
+        *)   base="$SERVER/v1/peers" ;;
+    esac
+    local url="$base" maxt=10
+    if [[ "$WAIT" -gt 0 ]]; then
+        url="$base?wait=$WAIT"
+        [[ -n "$REV" ]] && url="$url&rev=$(printf '%s' "$REV" | sed 's/[^A-Za-z0-9._-]/-/g')"
+        maxt=$((WAIT + 10))
+    fi
+
+    local resp t0 t1 code
+    resp=$(mktemp)
+    t0=$(date +%s)
+    code=$(curl -sS -o "$resp" -w '%{http_code}' --max-time "$maxt" \
+        "$url" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "X-Device-Id: $DEVICE_ID" 2>>"$LOG" || echo "000")
+    t1=$(date +%s)
+    PR_ELAPSED=$((t1 - t0))
+
+    if [[ "$code" != "200" ]]; then
+        log "[$IFACE] peers HTTP $code: $(head -c 200 "$resp" 2>/dev/null)"
+        rm -f "$resp"; PR_OUTCOME=error; return
+    fi
+
+    # Long-poll "nothing changed" sentinel: server held the request until the
+    # wait elapsed without a peer-set change. This is also how we know the
+    # server supports long-poll at all.
+    if grep -q '"not_modified"[[:space:]]*:[[:space:]]*true' "$resp"; then
+        PR_NEWREV=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("rev","") or "")' "$resp" 2>/dev/null)
+        rm -f "$resp"; PR_OUTCOME=notmod; return
+    fi
+
+    # Full list. Capture the server rev (empty against a server that doesn't
+    # send one yet — that keeps us in single-fetch mode, i.e. today's behavior).
+    PR_NEWREV=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("rev","") or "")' "$resp" 2>/dev/null)
+
+    local NEW_CONF CUR_CONF="/etc/wireguard/$IFACE.conf"
+    NEW_CONF=$(mktemp)
+    python3 - <<PY "$NEW_CONF" "$resp" "$CUR_CONF" "$ROLE"
+import json, sys
+out_path, resp_path, conf_path, role = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+priv = addr = listen = ""
+try:
+    for line in open(conf_path):
+        line = line.strip()
+        if line.startswith("PrivateKey"): priv = line.split("=",1)[1].strip()
+        elif line.startswith("Address"):  addr = line.split("=",1)[1].strip()
+        elif line.startswith("ListenPort"): listen = line.split("=",1)[1].strip()
+except FileNotFoundError:
+    sys.exit("conf not found")
+if not priv:
+    sys.exit("priv key missing from existing conf")
+resp = json.load(open(resp_path))
+
+lines = [
+    "[Interface]",
+    f"PrivateKey = {priv}",
+    f"Address    = {addr or resp.get('device_ip','') + '/24'}",
+    f"ListenPort = {listen or '1632'}",
+    "",
+]
+keepalive = resp.get("keepalive_sec", 25)
+for p in resp.get("peers", []):
+    pub = p.get("pubkey", "")
+    if not pub: continue
+    aips = []
+    if p.get("wg_ip"):
+        wgip = p["wg_ip"]
+        aips.append(wgip if "/" in wgip else wgip + "/32")
+    for e in (p.get("allowed_extra") or []):
+        aips.append(e)
+    if not aips: continue
+    lines.append("[Peer]")
+    lines.append(f"PublicKey  = {pub}")
+    if p.get("endpoint"):
+        lines.append(f"Endpoint   = {p['endpoint']}")
+    lines.append(f"AllowedIPs = {', '.join(aips)}")
+    if keepalive:
+        lines.append(f"PersistentKeepalive = {keepalive}")
+    lines.append("")
+open(out_path, "w").write("\n".join(lines))
+PY
+
+    if [[ -f "$CUR_CONF" ]] && cmp -s "$NEW_CONF" "$CUR_CONF"; then
+        PR_OUTCOME=unchanged
+    else
+        install -m 0600 "$NEW_CONF" "$CUR_CONF"
+        log "[$IFACE] conf changed; kickstart wg-mac.$IFACE"
+        launchctl kickstart -k "system/com.wireguard.wg-mac.$IFACE" 2>>"$LOG" || true
+        PR_OUTCOME=applied
+    fi
+    rm -f "$NEW_CONF" "$resp"
+}
+
+# Persist the rev cursor only after a response we actually applied/saw, atomically.
+save_rev() {  # iface, rev
+    [[ -n "$2" ]] || return 0
+    printf '%s\n' "$2" > "$RUNDIR/$1.rev.tmp" 2>/dev/null && mv "$RUNDIR/$1.rev.tmp" "$RUNDIR/$1.rev" 2>/dev/null
+}
+
+# ── peer refresh: bounded long-poll loop ─────────────────────────────────────
+# Runs up to LP_BUDGET seconds, then returns so launchd relaunches. Auto-detects
+# server long-poll support (probe → trial → longpoll) and degrades to a single
+# fetch — never a busy-loop — against a server that ignores ?wait/?rev.
+peer_refresh_loop() {
+    local IFACE="$1" SERVER="$2" TOKEN="$3" DEVICE_ID="$4" ROLE="$5"
+    local rev; rev=$(cat "$RUNDIR/$IFACE.rev" 2>/dev/null)
+    local deadline=$(( $(date +%s) + LP_BUDGET ))
+    local mode="probe" wait_for=0
+
+    while :; do
+        local now remaining
+        now=$(date +%s); remaining=$(( deadline - now ))
+        [[ $remaining -le 1 ]] && break
+        if [[ "$mode" == "longpoll" || "$mode" == "trial" ]]; then
+            wait_for=$LP_WAIT
+            [[ $wait_for -gt $remaining ]] && wait_for=$remaining
+            [[ $wait_for -lt 1 ]] && break
+        fi
+
+        peer_refresh_once "$IFACE" "$SERVER" "$TOKEN" "$DEVICE_ID" "$ROLE" "$wait_for" "$rev"
+
+        if [[ -n "$PR_NEWREV" && "$PR_NEWREV" != "$rev" ]]; then
+            save_rev "$IFACE" "$PR_NEWREV"; rev="$PR_NEWREV"
+        fi
+
+        case "$PR_OUTCOME" in
+            error)  break ;;                 # network/5xx: don't hammer
+            notmod) mode="longpoll"; continue ;;   # server held it → supported
+        esac
+
+        # applied / unchanged:
+        case "$mode" in
+            probe)
+                [[ -z "$PR_NEWREV" ]] && break       # legacy server (no rev) → done
+                mode="trial"; continue               # has rev; try a real long-poll
+                ;;
+            trial)
+                if [[ $PR_ELAPSED -ge $LP_MIN_RETURN ]]; then
+                    mode="longpoll"; continue        # server blocked → supported
+                fi
+                log "[$IFACE] server ignores ?wait (${PR_ELAPSED}s); single-fetch mode"
+                break                                # not long-poll → no busy-loop
+                ;;
+            longpoll)
+                # Guard a misbehaving server that returns instantly with no change.
+                if [[ $PR_ELAPSED -lt $LP_MIN_RETURN && "$PR_OUTCOME" == "unchanged" ]]; then
+                    [[ $(( deadline - $(date +%s) )) -le $LP_FLOOR ]] && break
+                    sleep "$LP_FLOOR"
+                fi
+                continue
+                ;;
+        esac
+    done
+}
+
+mkdir -p "$RUNDIR" 2>/dev/null || true
+
 # Walk every state file. /etc/wgctl/<iface>.json is the canonical form.
 shopt -s nullglob
 state_files=("$STATE_DIR"/*.json)
@@ -103,6 +290,12 @@ if [[ ${#state_files[@]} -eq 0 ]]; then
     reconcile_routes
     exit 0
 fi
+
+# Long-poll only with a single mesh iface: a ~45s hold on one iface must not
+# starve another iface's heartbeat. Multi-iface hosts keep today's per-iface
+# single fetch (≈60s propagation), which is no regression.
+LONGPOLL_OK=0
+[[ ${#state_files[@]} -eq 1 ]] && LONGPOLL_OK=1
 
 # --- per-iface reconcile loop ---
 process_iface() {
@@ -258,7 +451,8 @@ PY
         rm -f "/etc/wireguard/$IFACE.conf"
         rm -f "/var/run/wireguard/$IFACE.pid" \
               "/var/run/wireguard/$IFACE.sock" \
-              "/var/run/wireguard/$IFACE.name"
+              "/var/run/wireguard/$IFACE.name" \
+              "/var/run/wireguard/$IFACE.rev"
         rm -f "$STATE"
         # Don't touch other ifaces or the agent itself — siblings keep
         # running. Agent will see one fewer state file next tick.
@@ -267,80 +461,16 @@ PY
     fi
 
     # ----- 3. peer list refresh -----
-    case "$ROLE" in
-        hub) PEER_URL="$SERVER/v1/hub/peers" ;;
-        *)   PEER_URL="$SERVER/v1/peers" ;;
-    esac
-
-    local PEER_RESP PEER_STATUS
-    PEER_RESP=$(mktemp)
-    PEER_STATUS=$(curl -sS -o "$PEER_RESP" -w '%{http_code}' --max-time 10 \
-        "$PEER_URL" \
-        -H "Authorization: Bearer $TOKEN" \
-        -H "X-Device-Id: $DEVICE_ID" 2>>"$LOG" || echo "000")
-    if [[ "$PEER_STATUS" != "200" ]]; then
-        log "[$IFACE] peers HTTP $PEER_STATUS: $(cat "$PEER_RESP" 2>/dev/null | head -c 200)"
-        rm -f "$PEER_RESP"
-        return
-    fi
-
-    # ----- 4. render fresh conf -----
-    local NEW_CONF
-    NEW_CONF=$(mktemp)
-    python3 - <<PY "$NEW_CONF" "$PEER_RESP" "/etc/wireguard/$IFACE.conf" "$ROLE"
-import json, sys
-out_path, resp_path, conf_path, role = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-priv = addr = listen = ""
-try:
-    for line in open(conf_path):
-        line = line.strip()
-        if line.startswith("PrivateKey"): priv = line.split("=",1)[1].strip()
-        elif line.startswith("Address"):  addr = line.split("=",1)[1].strip()
-        elif line.startswith("ListenPort"): listen = line.split("=",1)[1].strip()
-except FileNotFoundError:
-    sys.exit("conf not found")
-if not priv:
-    sys.exit("priv key missing from existing conf")
-resp = json.load(open(resp_path))
-
-lines = [
-    "[Interface]",
-    f"PrivateKey = {priv}",
-    f"Address    = {addr or resp.get('device_ip','') + '/24'}",
-    f"ListenPort = {listen or '1632'}",
-    "",
-]
-keepalive = resp.get("keepalive_sec", 25)
-for p in resp.get("peers", []):
-    pub = p.get("pubkey", "")
-    if not pub: continue
-    aips = []
-    if p.get("wg_ip"):
-        wgip = p["wg_ip"]
-        aips.append(wgip if "/" in wgip else wgip + "/32")
-    for e in (p.get("allowed_extra") or []):
-        aips.append(e)
-    if not aips: continue
-    lines.append("[Peer]")
-    lines.append(f"PublicKey  = {pub}")
-    if p.get("endpoint"):
-        lines.append(f"Endpoint   = {p['endpoint']}")
-    lines.append(f"AllowedIPs = {', '.join(aips)}")
-    if keepalive:
-        lines.append(f"PersistentKeepalive = {keepalive}")
-    lines.append("")
-open(out_path, "w").write("\n".join(lines))
-PY
-
-    local CUR_CONF="/etc/wireguard/$IFACE.conf"
-    if [[ -f "$CUR_CONF" ]] && cmp -s "$NEW_CONF" "$CUR_CONF"; then
-        :
+    # Single mesh iface → bounded long-poll loop (near-instant propagation when
+    # the server supports it, auto-degrades otherwise). Multi-iface → one
+    # immediate fetch per iface (today's behavior), so no iface starves another.
+    if [[ "${LONGPOLL_OK:-0}" == 1 ]]; then
+        peer_refresh_loop "$IFACE" "$SERVER" "$TOKEN" "$DEVICE_ID" "$ROLE"
     else
-        install -m 0600 "$NEW_CONF" "$CUR_CONF"
-        log "[$IFACE] conf changed; kickstart wg-mac.$IFACE"
-        launchctl kickstart -k "system/com.wireguard.wg-mac.$IFACE" 2>>"$LOG" || true
+        local rev0; rev0=$(cat "$RUNDIR/$IFACE.rev" 2>/dev/null)
+        peer_refresh_once "$IFACE" "$SERVER" "$TOKEN" "$DEVICE_ID" "$ROLE" 0 "$rev0"
+        [[ -n "$PR_NEWREV" && "$PR_NEWREV" != "$rev0" ]] && save_rev "$IFACE" "$PR_NEWREV"
     fi
-    rm -f "$NEW_CONF" "$PEER_RESP"
 }
 
 for s in "${state_files[@]}"; do

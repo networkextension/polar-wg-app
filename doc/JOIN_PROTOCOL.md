@@ -154,12 +154,39 @@ Response 200 (same peer shape as /register):
   "hub":          {...},
   "keepalive_sec": 25,
   "refresh_sec":   300,
+  "rev":          "etag-or-monotonic",     // change cursor (see Long-poll below)
   "token_expires": "2026-06-17T00:00:00Z"  // null if non-expiring
 }
 ```
 
 The server is the source of truth — the client overwrites its conf with
 each refresh.
+
+> **`rev` is required for long-poll and is currently MISSING from
+> `/v1/peers` on the live control plane.** The server team must add a
+> top-level `rev` computed identically to `/v1/hub/peers` (opaque
+> etag-or-monotonic over the device's effective peer view). Until it
+> ships, the agent never sees a cursor and stays in plain-poll mode — no
+> regression. See **Long-poll (v2)** below.
+
+#### Long-poll (v2)
+
+`GET /v1/peers?wait=<sec>&rev=<last_rev>` lets the agent hold the request
+open until the peer set changes, cutting propagation from ~60 s to
+sub-second. Three response cases the server must implement:
+
+- **Changed** (or no `rev` sent): `200` with the full body above (new `rev`).
+- **Unchanged after holding `wait` sec**: `200 {"not_modified": true, "rev": "<current>"}`
+  (no peer body). This is also the agent's signal that long-poll is supported.
+- **Legacy / unsupported**: ignore `?wait`/`?rev`, return the full body
+  immediately (today's behavior).
+
+Rules: `wait` is server-clamped (e.g. ≤60 s); `rev` is opaque to the
+client (stored + echoed only) and should be scoped to the device's own
+view so an unrelated site's change doesn't wake every device. The agent
+auto-detects support (a held connection or a `not_modified` reply) and
+degrades to plain polling otherwise. Same `?wait`/`?rev`/`not_modified`
+contract applies to `/v1/hub/peers`.
 
 ### POST /v1/heartbeat
 
@@ -230,6 +257,13 @@ implicitly via device_id), then returns ALL active devices flattened:
 Hub agent uses `rev` to skip rewrite when unchanged. On change:
 overwrite `/etc/wireguard/<hub-iface>.conf` with the new peer list and
 `launchctl kickstart -k system/com.wireguard.wg-mac.<hub-iface>`.
+
+Supports the same long-poll contract as `/v1/peers`:
+`GET /v1/hub/peers?wait=<sec>&rev=<last_rev>` → full list (new `rev`) on
+change, `200 {"not_modified": true, "rev": "<current>"}` after holding
+`wait` sec unchanged, or immediate full list on a legacy server. `rev`
+already exists here, so only the `?wait`/`?rev` hold + `not_modified`
+reply need adding server-side.
 
 ### GET /v1/install (or /install.sh)
 
@@ -359,9 +393,15 @@ Hub requirements:
   via hub. Pure mesh-internal traffic needs forwarding only.
 
 A device entering or leaving site S triggers a peer-list refresh on
-every other device in S, and on the hub. Strategy: client polls
-`/v1/peers` every `refresh_sec` (server-tunable, default 300 s); server
-may also push via long-polling if it wants instant updates (v2).
+every other device in S, and on the hub. Strategy: the agent holds a
+**long-poll** `GET /v1/peers?wait=…&rev=…` (single mesh iface; ~55 s
+budget per launchd invocation, then relaunched) so a change propagates
+sub-second once the server supports it (see **Long-poll (v2)** under
+`/v1/peers`). The agent auto-detects support and falls back to plain
+polling every `refresh_sec` against a server that doesn't — so this is
+safe to ship client-side ahead of the server. **Server-side TODO**:
+honor `?wait`/`?rev`, return `{"not_modified":true,"rev":…}` on timeout,
+and add the missing `rev` to `/v1/peers`.
 
 ---
 
