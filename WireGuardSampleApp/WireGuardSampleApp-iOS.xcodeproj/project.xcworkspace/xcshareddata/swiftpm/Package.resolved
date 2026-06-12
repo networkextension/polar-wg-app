@@ -1,0 +1,24 @@
+{
+  "originHash" : "746a5034c6b872558efb01feceb6eb7bcc667151b87f7cd353975108f0df56ad",
+  "pins" : [
+    {
+      "identity" : "shanghai",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/yarshure/Shanghai.git",
+      "state" : {
+        "branch" : "feat/kcpfwd-wg-over-kcp",
+        "revision" : "239d75031e9a068dcbf352c1006ee5068232c7bc"
+      }
+    },
+    {
+      "identity" : "snappy.swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/awxkee/snappy.swift",
+      "state" : {
+        "revision" : "4ce38540e8131f75682a9dd8b36e65ec3979f645",
+        "version" : "1.0.0"
+      }
+    }
+  ],
+  "version" : 3
+}

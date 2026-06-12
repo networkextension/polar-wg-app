@@ -14,6 +14,7 @@
 		7B8329EC37AE5C58AA3772ED /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1A4CE34562EA2D699F5ABFC0 /* Assets.xcassets */; };
 		80258DE7BAE9296BA1058518 /* MeshClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 958B791B6BA6D6282E15CCE2 /* MeshClient.swift */; };
 		8DF3558A32265BB05FA4D462 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C8AFB0D96F982F1AB56FC12 /* ContentView.swift */; };
+		A04FDEE9E15D732DFCC67268 /* Shanghai in Frameworks */ = {isa = PBXBuildFile; productRef = DE035CDC1D1E327CA2F76614 /* Shanghai */; };
 		A598D8799D65B21D512E8112 /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 053382E4FECA7CD782692120 /* Network.framework */; };
 		D657F06A9FC2A0C0BCECDAFD /* WireGuardTunnelExtension-iOS.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 48F9E2D1F66A8E9D78362CAB /* WireGuardTunnelExtension-iOS.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		DA56EFC9D76D3C4A0B8D01CD /* TunnelManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 78B7551856CB04A639B0F569 /* TunnelManager.swift */; };
@@ -74,6 +75,7 @@
 				1444F030BA263048A838DBC6 /* NetworkExtension.framework in Frameworks */,
 				A598D8799D65B21D512E8112 /* Network.framework in Frameworks */,
 				256C2EE510EE8EE90303272E /* WireGuardCore.xcframework in Frameworks */,
+				A04FDEE9E15D732DFCC67268 /* Shanghai in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -191,6 +193,7 @@
 			);
 			name = "WireGuardTunnelExtension-iOS";
 			packageProductDependencies = (
+				DE035CDC1D1E327CA2F76614 /* Shanghai */,
 			);
 			productName = "WireGuardTunnelExtension-iOS";
 			productReference = 48F9E2D1F66A8E9D78362CAB /* WireGuardTunnelExtension-iOS.appex */;
@@ -224,6 +227,9 @@
 			);
 			mainGroup = 8A60BBD92841849E75328555;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				5B53C0E31530C57578F2F06F /* XCRemoteSwiftPackageReference "Shanghai" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 9EDCA9F9ADA9B58DF2384410 /* Products */;
 			projectDirPath = "";
@@ -508,6 +514,25 @@
 			defaultConfigurationName = Debug;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		5B53C0E31530C57578F2F06F /* XCRemoteSwiftPackageReference "Shanghai" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/yarshure/Shanghai.git";
+			requirement = {
+				branch = "feat/kcpfwd-wg-over-kcp";
+				kind = branch;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		DE035CDC1D1E327CA2F76614 /* Shanghai */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 5B53C0E31530C57578F2F06F /* XCRemoteSwiftPackageReference "Shanghai" */;
+			productName = Shanghai;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 536178A996B94DFCC43B4D3A /* Project object */;
 }
