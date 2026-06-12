@@ -40,9 +40,8 @@ settings:
     SWIFT_VERSION: "5.9"
     MARKETING_VERSION: "0.1.0"
     # Must monotonically increase; ASC rejects duplicates with
-    # ENTITY_ERROR.ATTRIBUTE.INVALID.DUPLICATE. Server's last known
-    # was 4, so we start at 5.
-    CURRENT_PROJECT_VERSION: "5"
+    # ENTITY_ERROR.ATTRIBUTE.INVALID.DUPLICATE.
+    CURRENT_PROJECT_VERSION: "6"
     CODE_SIGN_STYLE: Automatic
     # Filled in from Apple Distribution cert "XiangBo Kong (Z9XG3YEP93)"
     # already in the keychain. Change in Xcode → Signing if needed.

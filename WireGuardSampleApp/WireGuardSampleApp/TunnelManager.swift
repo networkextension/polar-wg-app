@@ -559,6 +559,30 @@ final class TunnelManager: ObservableObject {
         )
     }
 
+    /// Extract `#kcp ...` directive line(s) from a WireGuard config and map
+    /// them to the `kcp*` providerConfiguration keys the extension reads.
+    /// Recognised tokens: enable, conv, key, crypt, datashard, parityshard, mtu.
+    /// Returns an empty dict when no `#kcp` line is present (→ plain UDP path).
+    static func parseKcpDirectives(from config: String) -> [String: String] {
+        var out: [String: String] = [:]
+        let map: [String: String] = [
+            "enable": "kcpEnable", "conv": "kcpConv", "key": "kcpKey",
+            "crypt": "kcpCrypt", "datashard": "kcpDatashard",
+            "parityshard": "kcpParityshard", "mtu": "kcpMtu"
+        ]
+        for raw in config.split(whereSeparator: \.isNewline) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.lowercased().hasPrefix("#kcp") else { continue }
+            let body = line.dropFirst(4)   // strip "#kcp"
+            for tok in body.split(whereSeparator: { $0 == " " || $0 == "\t" }) {
+                let kv = tok.split(separator: "=", maxSplits: 1)
+                guard kv.count == 2, let dst = map[kv[0].lowercased()] else { continue }
+                out[dst] = String(kv[1])
+            }
+        }
+        return out
+    }
+
     /// Keep this for compatibility with existing call sites.
     func save(config: String, routeMode: RouteMode, splitInjectedRoutes: String) async {
         configText = config
@@ -570,12 +594,17 @@ final class TunnelManager: ObservableObject {
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = "com.change.wg.tunnel"
         proto.serverAddress = firstEndpointFrom(config: config) ?? "wireguard"
-        proto.providerConfiguration = [
+        var providerConfig: [String: Any] = [
             "config": config,
             "routeMode": routeMode.rawValue,
             "dnsMode": dnsMode.rawValue,
             "splitInjectedRoutes": splitInjectedRoutes
         ]
+        // Optional WireGuard-over-KCP: a directive line in the config text
+        //   #kcp enable=1 conv=88 key=clitest crypt=aes datashard=0 parityshard=0 mtu=1350
+        // populates the kcp* keys the PacketTunnelProvider reads. Absent → plain UDP.
+        for (k, v) in Self.parseKcpDirectives(from: config) { providerConfig[k] = v }
+        proto.providerConfiguration = providerConfig
         m.protocolConfiguration = proto
         m.localizedDescription = "WireGuard Sample"
         m.isEnabled = true
