@@ -194,7 +194,7 @@ lines = [
 ]
 for p in r['peers']:
     extras = p.get('allowed_extra', []) or []
-    aips = ([p['wg_ip']+'/32'] if p.get('wg_ip') else []) + extras
+    aips = ([p['wg_ip'] if '/' in p['wg_ip'] else p['wg_ip']+'/32'] if p.get('wg_ip') else []) + extras
     lines += [
         '[Peer]',
         f"PublicKey  = {p['pubkey']}",

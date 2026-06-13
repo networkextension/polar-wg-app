@@ -452,11 +452,12 @@ if [[ "$ROLE" == "hub" ]]; then
     echo "==> hub role: enabling net.ipv4.ip_forward"
     echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-wg-hub.conf
     sysctl -p /etc/sysctl.d/99-wg-hub.conf >/dev/null || true
-    # NAT for spoke internet egress via this hub (optional — set EGRESS_IF):
-    #   EGRESS_IF=eth0
-    #   MESH_CIDR=$(echo "$RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("mesh_cidr","100.64.0.0/24"))')
-    #   iptables -t nat -C POSTROUTING -s "$MESH_CIDR" -o "$EGRESS_IF" -j MASQUERADE 2>/dev/null || \
-    #     iptables -t nat -A POSTROUTING -s "$MESH_CIDR" -o "$EGRESS_IF" -j MASQUERADE
+    # Egress NAT (spokes exit to the internet / a datacenter subnet via this
+    # hub) is now SEMI-AUTOMATIC: the platform opens egress by setting this
+    # hub's advertised_routes, the server mirrors them in /v1/hub/peers, and
+    # the refresh agent (wg-agent) stands up the MASQUERADE rule on the next
+    # poll (and tears it down when egress is closed). Nothing to do at join;
+    # see apply_egress_nat in skills/wg-mac-install/scripts/wg-agent.sh.
 fi
 
 # ── systemd: bring up the iface + install the refresh timer ──────────────────
