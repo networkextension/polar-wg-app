@@ -67,6 +67,38 @@ save_rev() {  # iface, rev
   printf '%s\n' "$2" > "$RUNDIR/$1.rev.tmp" 2>/dev/null && mv "$RUNDIR/$1.rev.tmp" "$RUNDIR/$1.rev" 2>/dev/null
 }
 
+# Polar CGNAT mesh supernet — every hub's /24 lives inside this block, so one
+# source match covers a hub's own spokes AND cross-hub transit spokes.
+MESH_SUPERNET=${WGCTL_MESH_SUPERNET:-100.64.0.0/10}
+
+# apply_egress_nat — semi-automatic egress for a hub. The platform "opens
+# egress" by setting wg_hubs.advertised_routes; the server mirrors that list
+# back in /v1/hub/peers, and here we act on its presence: non-empty → stand up
+# MASQUERADE (mesh -> uplink) + ip_forward so opted-in spokes exit via this
+# hub; emptied → tear the rule back down. Idempotent (safe to run every poll).
+# The MASQUERADE only ever touches traffic the kernel is already routing OUT
+# the uplink — i.e. destinations covered by advertised_routes that an opted-in
+# spoke pushed here — so enabling it is harmless for a hub with no egress users.
+# Linux only (iptables); macOS/FreeBSD pf is a TODO — those hubs NAT manually.
+apply_egress_nat() {  # iface, has_egress(0|1)
+  local iface="$1" has="$2"
+  [ "$OS" = linux ] || return 0
+  command -v iptables >/dev/null 2>&1 || { [ "$has" = 1 ] && log "[$iface] egress: iptables not found"; return 0; }
+  local egif
+  egif=$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
+  [ -n "$egif" ] || { [ "$has" = 1 ] && log "[$iface] egress: no default-route iface"; return 0; }
+  if [ "$has" = 1 ]; then
+    [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = 1 ] || echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+    iptables -t nat -C POSTROUTING -s "$MESH_SUPERNET" -o "$egif" -j MASQUERADE 2>/dev/null \
+      || { iptables -t nat -A POSTROUTING -s "$MESH_SUPERNET" -o "$egif" -j MASQUERADE 2>>"$LOG" \
+           && log "[$iface] egress NAT on: $MESH_SUPERNET -> $egif"; }
+  else
+    iptables -t nat -C POSTROUTING -s "$MESH_SUPERNET" -o "$egif" -j MASQUERADE 2>/dev/null \
+      && { iptables -t nat -D POSTROUTING -s "$MESH_SUPERNET" -o "$egif" -j MASQUERADE 2>>"$LOG" \
+           && log "[$iface] egress NAT off"; }
+  fi
+}
+
 # Fetch peers once. WAIT>0 → long-poll (?wait/?rev); REV omitted when empty.
 # Globals out: PR_OUTCOME{applied,unchanged,notmod,error}, PR_ELAPSED, PR_NEWREV.
 peer_refresh_once() {
@@ -111,7 +143,7 @@ lines = ["[Interface]", f"PrivateKey = {priv}",
 ka = resp.get("keepalive_sec", 25)
 for p in resp.get("peers", []):
     if not p.get("pubkey"): continue
-    aips = ([p["wg_ip"] + "/32"] if p.get("wg_ip") else []) + (p.get("allowed_extra") or [])
+    aips = ([p["wg_ip"] if "/" in p["wg_ip"] else p["wg_ip"] + "/32"] if p.get("wg_ip") else []) + (p.get("allowed_extra") or [])
     if not aips: continue
     lines += ["[Peer]", f"PublicKey  = {p['pubkey']}"]
     if p.get("endpoint"): lines += [f"Endpoint   = {p['endpoint']}"]
@@ -126,6 +158,15 @@ PY
     fi
   else
     PR_OUTCOME=unchanged   # empty render (conf missing) → leave running conf alone
+  fi
+  # Egress NAT (hub role): the server mirrors this hub's advertised_routes back
+  # in the poll response — non-empty means the platform opened egress here, so
+  # converge the MASQUERADE rule to match. Runs on every full response (cheap,
+  # idempotent); not_modified short-circuits above so state is already correct.
+  if [ "$ROLE" = hub ]; then
+    local HAS_EGRESS
+    HAS_EGRESS=$(python3 -c 'import json,sys; print(1 if (json.load(open(sys.argv[1])).get("advertised_routes") or []) else 0)' "$PR" 2>/dev/null || echo 0)
+    apply_egress_nat "$IFACE" "$HAS_EGRESS"
   fi
   rm -f "$NEW" "$PR"
 }
