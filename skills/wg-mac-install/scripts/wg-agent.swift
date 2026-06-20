@@ -49,6 +49,14 @@ let IFCONFIG = toolPath(["/sbin/ifconfig", "/usr/sbin/ifconfig"])  // FreeBSD la
 let SYSCTL   = toolPath(["/sbin/sysctl", "/usr/sbin/sysctl"])
 let UNAME    = toolPath(["/usr/bin/uname", "/bin/uname"])
 
+// hub-role egress NAT (packet filter): masquerade this whole mesh supernet out the
+// uplink when the platform opens egress here. Source is the broad CGNAT supernet,
+// NOT the advertised CIDRs — the kernel routes only what an opted-in spoke pushes.
+let MESH_SUPERNET = ProcessInfo.processInfo.environment["WGCTL_MESH_SUPERNET"] ?? "100.64.0.0/10"
+let IPTABLES = toolPath(["/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"])  // Linux
+let PFCTL    = toolPath(["/sbin/pfctl"])                                                 // FreeBSD pf
+let ROUTE    = toolPath(["/sbin/route"])                                                 // default-route iface
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 func logLine(_ s: String) {
     let ts = ISO8601DateFormatter().string(from: Date())
@@ -144,6 +152,7 @@ struct PeerResponse: Codable {
     let keepalive_sec: Int?
     let rev: String?
     let not_modified: Bool?
+    let advertised_routes: [String]?   // hub-only; non-empty == egress opened here
 }
 
 // ── lan_addrs + public-endpoint guess ────────────────────────────────────────
@@ -312,6 +321,101 @@ func syncIface(_ iface: String) {
     reloadIface(iface)
 }
 
+// ── hub-role egress NAT / packet-filter control ─────────────────────────────
+// Converge the masquerade rule to the desired state on every full hub poll
+// (cheap + idempotent). enable == the /v1/hub/peers response advertised egress.
+func applyEgressNAT(iface: String, enable: Bool) {
+#if os(Linux)
+    applyEgressNATLinux(iface: iface, enable: enable)
+#else
+    applyEgressNATFreeBSD(iface: iface, enable: enable)
+#endif
+}
+
+// parse the egress/default-route interface name from a `<cmd>` output.
+// Linux `ip route get 1.1.1.1` → "... dev eth0 ..."; FreeBSD `route -n get
+// default` → a "interface: em0" line.
+func egressInterface() -> String {
+#if os(Linux)
+    let (_, out) = run(IP, ["route", "get", "1.1.1.1"])
+    let toks = out.split(whereSeparator: { $0 == " " || $0 == "\n" }).map(String.init)
+    if let i = toks.firstIndex(of: "dev"), i + 1 < toks.count { return toks[i + 1] }
+    return ""
+#else
+    let (_, out) = run(ROUTE, ["-n", "get", "default"])
+    for line in out.split(separator: "\n") {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        if t.hasPrefix("interface:") {
+            return t.dropFirst("interface:".count).trimmingCharacters(in: .whitespaces)
+        }
+    }
+    return ""
+#endif
+}
+
+#if os(Linux)
+// Direct port of wg-agent.sh apply_egress_nat: iptables MASQUERADE, check-before-act.
+func applyEgressNATLinux(iface: String, enable: Bool) {
+    guard FileManager.default.fileExists(atPath: IPTABLES) else {
+        if enable { logLine("[\(iface)] egress: iptables not found") }; return
+    }
+    let egif = egressInterface()
+    guard !egif.isEmpty else {
+        if enable { logLine("[\(iface)] egress: no default-route iface") }; return
+    }
+    let rule = ["-t", "nat", "POSTROUTING", "-s", MESH_SUPERNET, "-o", egif, "-j", "MASQUERADE"]
+    let present = run(IPTABLES, ["-C"] + rule).code == 0
+    if enable {
+        // ip forwarding (only when enabling); /proc rejects atomic temp-rename
+        let cur = (try? String(contentsOfFile: "/proc/sys/net/ipv4/ip_forward", encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if cur != "1" { try? "1\n".write(toFile: "/proc/sys/net/ipv4/ip_forward", atomically: false, encoding: .utf8) }
+        if !present, run(IPTABLES, ["-A"] + rule).code == 0 {
+            logLine("[\(iface)] egress NAT on: \(MESH_SUPERNET) -> \(egif)")
+        }
+    } else if present, run(IPTABLES, ["-D"] + rule).code == 0 {
+        logLine("[\(iface)] egress NAT off")
+    }
+}
+#else
+// FreeBSD pf: the agent fully owns /etc/pf.conf on a hub. Write a minimal ruleset
+// holding just the egress nat rule (no anchor needed — the rule is in the main
+// ruleset directly), enable pf if disabled, persist via rc.conf. Idempotent:
+// only reload when the file content changes.
+func applyEgressNATFreeBSD(iface: String, enable: Bool) {
+    guard FileManager.default.fileExists(atPath: PFCTL) else {
+        if enable { logLine("[\(iface)] egress: pfctl not found") }; return
+    }
+    let pfConf = "/etc/pf.conf"
+    let cur = (try? String(contentsOfFile: pfConf, encoding: .utf8)) ?? ""
+    let marker = "# wg-agent egress NAT"
+    if enable {
+        let egif = egressInterface()
+        guard !egif.isEmpty else { logLine("[\(iface)] egress: no default-route iface"); return }
+        _ = run(SYSCTL, ["net.inet.ip.forwarding=1"])
+        let desired = "\(marker)\nnat on \(egif) inet from \(MESH_SUPERNET) -> (\(egif))\n"
+        if cur != desired {
+            do {
+                try desired.write(toFile: pfConf, atomically: true, encoding: .utf8)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: pfConf)
+                let rc = run(PFCTL, ["-f", pfConf]).code
+                if rc == 0 { logLine("[\(iface)] egress NAT on: \(MESH_SUPERNET) -> \(egif) (pf)") }
+                else { logLine("[\(iface)] egress: pfctl -f failed rc=\(rc)") }
+            } catch { logLine("[\(iface)] egress: write pf.conf failed: \(error)") }
+        }
+        // enable pf only if disabled — NEVER -E (ref-count leak over polls)
+        if run(PFCTL, ["-s", "info"]).out.contains("Status: Disabled") { _ = run(PFCTL, ["-e"]) }
+        // boot persistence (idempotent)
+        _ = run("/usr/sbin/sysrc", ["pf_enable=YES", "gateway_enable=YES", "pf_rules=/etc/pf.conf"])
+    } else if cur.contains(marker) {
+        // teardown: empty ruleset, keep pf enabled (no NAT)
+        try? "\(marker)\n# (egress withdrawn)\n".write(toFile: pfConf, atomically: true, encoding: .utf8)
+        _ = run(PFCTL, ["-f", pfConf])
+        logLine("[\(iface)] egress NAT off")
+    }
+}
+#endif
+
 func evictIface(iface: String, statePath: String) {
     logLine("[\(iface)] EVICT: server rejected token")
     _ = run(WGQUICK, ["down", iface])
@@ -355,6 +459,13 @@ func processIface(statePath: String) {
     if resp.not_modified == true { return }
     if getenv("WG_AGENT_DEBUG") != nil {
         logLine("[\(iface)] OK heartbeat+peers 200 rev=\(resp.rev ?? "-") peers=\(resp.peers?.count ?? 0)")
+    }
+
+    // hub-role egress NAT: non-empty advertised_routes == platform opened egress
+    // here → converge the packet-filter rule (before render so a render failure
+    // can't skip the NAT reconcile).
+    if role == "hub" {
+        applyEgressNAT(iface: iface, enable: resp.advertised_routes?.isEmpty == false)
     }
 
     // 4. render + sync/reload if changed
