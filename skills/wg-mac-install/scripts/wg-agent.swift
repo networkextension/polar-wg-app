@@ -1,0 +1,396 @@
+// wg-agent (Swift) — native reconciler for wg-mac memberships. FreeBSD + Linux.
+//
+// Swift port of skills/wg-mac-install/scripts/wg-agent.sh, with no shell/python
+// dependency: HTTP via URLSession, JSON via Foundation, and the wireguard tools
+// invoked by absolute path. Per /etc/wgctl/<iface>.json it:
+//   1. POST /v1/heartbeat   (v2 status block from `wg show <iface> dump`)
+//   2. on 401 invalid-token → self-evict THIS iface (wg-quick down + cleanup)
+//   3. GET /v1/peers (or /v1/hub/peers for role=hub)
+//   4. re-render the wg-quick conf; if it changed, sync (peers) or reload (routes)
+//
+// Cross-platform (wg-quick / wireguard-tools on FreeBSD + Linux; no systemd reqd).
+// Build:
+//   FreeBSD:  . ~/swift632-env.sh && swiftc -O wg-agent.swift -o wg-agent
+//   Linux:    swiftc -O -static-stdlib wg-agent.swift -o wg-agent
+//             (CI builds the Linux amd64 binary — see .github/workflows/wg-agent-linux.yml)
+// Run as root, e.g. from cron or an rc.d/systemd unit every 60s.
+
+import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+#if canImport(Glibc)
+import Glibc   // getuid / setenv / getenv on Linux
+#endif
+
+// ── paths ───────────────────────────────────────────────────────────────────
+func toolPath(_ candidates: [String]) -> String {
+    for c in candidates where FileManager.default.fileExists(atPath: c) { return c }
+    return candidates.first ?? ""
+}
+
+#if os(Linux)
+let CONFDIR = "/etc/wireguard"
+let OS_NAME = "linux"
+#else
+let CONFDIR = "/usr/local/etc/wireguard"   // FreeBSD (and other BSD)
+let OS_NAME = "freebsd"
+#endif
+let STATE_DIR = "/etc/wgctl"
+let RUNDIR    = "/var/run/wireguard"
+let LOG_PATH  = "/var/log/wg-agent.log"
+let AGENT_VER = "wg-agent-swift-1"
+
+// resolve per-platform install locations (FreeBSD /usr/local/bin, Linux /usr/bin)
+let WG       = toolPath(["/usr/bin/wg", "/usr/local/bin/wg"])
+let WGQUICK  = toolPath(["/usr/bin/wg-quick", "/usr/local/bin/wg-quick"])
+let IP       = toolPath(["/usr/sbin/ip", "/sbin/ip", "/bin/ip"])   // Linux lan_addrs
+let IFCONFIG = toolPath(["/sbin/ifconfig", "/usr/sbin/ifconfig"])  // FreeBSD lan_addrs
+let SYSCTL   = toolPath(["/sbin/sysctl", "/usr/sbin/sysctl"])
+let UNAME    = toolPath(["/usr/bin/uname", "/bin/uname"])
+
+// ── helpers ─────────────────────────────────────────────────────────────────
+func logLine(_ s: String) {
+    let ts = ISO8601DateFormatter().string(from: Date())
+    let line = "\(ts) \(s)\n"
+    if let fh = FileHandle(forWritingAtPath: LOG_PATH) {
+        fh.seekToEndOfFile(); fh.write(line.data(using: .utf8)!); try? fh.close()
+    } else {
+        try? line.data(using: .utf8)!.write(to: URL(fileURLWithPath: LOG_PATH))
+    }
+}
+
+@discardableResult
+func run(_ path: String, _ args: [String]) -> (code: Int32, out: String) {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+    let outPipe = Pipe()
+    p.standardOutput = outPipe
+    p.standardError = Pipe()
+    do { try p.run() } catch { return (-1, "") }
+    let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+}
+
+// Synchronous HTTP via URLSession (no shell/curl).
+func http(_ urlStr: String, method: String = "GET", token: String, deviceID: String,
+          body: Data? = nil, timeout: TimeInterval = 15) -> (code: Int, body: Data?) {
+    guard let url = URL(string: urlStr) else { return (0, nil) }
+    var req = URLRequest(url: url)
+    req.httpMethod = method
+    req.timeoutInterval = timeout
+    req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    req.setValue(deviceID, forHTTPHeaderField: "X-Device-Id")
+    if let body = body {
+        req.httpBody = body
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    }
+    let sem = DispatchSemaphore(value: 0)
+    // captured by reference so the @Sendable completion can mutate cleanly
+    final class Box { var code = 0; var data: Data?; var err = "" }
+    let box = Box()
+    URLSession.shared.dataTask(with: req) { d, r, e in
+        if let h = r as? HTTPURLResponse { box.code = h.statusCode }
+        box.data = d
+        if let e = e as NSError? { box.err = "\(e.domain)#\(e.code): \(e.localizedDescription)" }
+        sem.signal()
+    }.resume()
+    _ = sem.wait(timeout: .now() + timeout + 5)
+    // surface transport errors (TLS/DNS/proxy) instead of a silent HTTP 0
+    if box.code == 0 && !box.err.isEmpty { logLine("http \(method) \(urlStr) failed: \(box.err)") }
+    return (box.code, box.data)
+}
+
+func uptimeSec() -> Int? {
+#if os(Linux)
+    // Linux: /proc/uptime → "12345.67 6789.01"
+    if let s = try? String(contentsOfFile: "/proc/uptime", encoding: .utf8),
+       let first = s.split(separator: " ").first, let secs = Double(first) {
+        return Int(secs)
+    }
+    return nil
+#else
+    // FreeBSD: sysctl -n kern.boottime → "{ sec = N, usec = ... }"
+    let (_, o) = run(SYSCTL, ["-n", "kern.boottime"])
+    if let r = o.range(of: "sec = ") {
+        let rest = o[r.upperBound...]
+        let num = rest.prefix { $0.isNumber }
+        if let boot = Int(num) { return max(0, Int(Date().timeIntervalSince1970) - boot) }
+    }
+    return nil
+#endif
+}
+
+// ── membership state ────────────────────────────────────────────────────────
+struct Membership: Codable {
+    let server: String?
+    let device_id: String?
+    let token: String?
+    let role: String?
+    let wg_listen: Int?
+}
+
+struct PeerEntry: Codable {
+    let pubkey: String?
+    let wg_ip: String?
+    let endpoint: String?
+    let allowed_extra: [String]?
+}
+struct PeerResponse: Codable {
+    let peers: [PeerEntry]?
+    let device_ip: String?
+    let keepalive_sec: Int?
+    let rev: String?
+    let not_modified: Bool?
+}
+
+// ── lan_addrs + public-endpoint guess ────────────────────────────────────────
+func lanAddrs() -> (lan: [[String: String]], pubIP: String) {
+    var lan: [[String: String]] = []
+#if os(Linux)
+    // `ip -o -4 addr show` → "2: eth0    inet 10.0.0.5/24 brd ... scope global eth0"
+    let (_, out) = run(IP, ["-o", "-4", "addr", "show"])
+    for raw in out.split(separator: "\n") {
+        let f = raw.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard f.count > 1, let ii = f.firstIndex(of: "inet"), ii + 1 < f.count else { continue }
+        let cidr = f[ii + 1]                                   // X.X.X.X/bits
+        let ip = cidr.split(separator: "/").first.map(String.init) ?? ""
+        if ip.hasPrefix("127.") || ip.hasPrefix("169.254.") || ip.hasPrefix("10.88.") { continue }
+        lan.append(["iface": f[1], "cidr": cidr])
+    }
+#else
+    // FreeBSD ifconfig: "<iface>:" headers, "inet X netmask 0xFFFFFFFF ..."
+    let (_, out) = run(IFCONFIG, [])
+    var cur = ""
+    for raw in out.split(separator: "\n", omittingEmptySubsequences: false) {
+        let line = String(raw)
+        if let m = line.range(of: #"^[a-z][a-z0-9]+:"#, options: .regularExpression) {
+            cur = String(line[m].dropLast()); continue
+        }
+        if let r = line.range(of: #"inet (\d+\.\d+\.\d+\.\d+) netmask 0x([0-9a-fA-F]+)"#,
+                              options: .regularExpression) {
+            let seg = String(line[r])
+            let parts = seg.split(separator: " ")
+            guard parts.count >= 4 else { continue }
+            let ip = String(parts[1])
+            if ip.hasPrefix("127.") || ip.hasPrefix("169.254.") || ip.hasPrefix("10.88.") { continue }
+            let hexMask = String(parts[3].dropFirst(2))
+            let bits = (UInt32(hexMask, radix: 16) ?? 0).nonzeroBitCount
+            lan.append(["iface": cur, "cidr": "\(ip)/\(bits)"])
+        }
+    }
+#endif
+    let pubIP = lan.first?["cidr"]?.split(separator: "/").first.map(String.init) ?? ""
+    return (lan, pubIP)
+}
+
+// ── parse `wg show <iface> dump` into peer status ───────────────────────────
+func peerStatus(iface: String) -> (peers: [[String: Any]], dumpNonEmpty: Bool) {
+    let (_, dump) = run(WG, ["show", iface, "dump"])
+    let now = Int(Date().timeIntervalSince1970)
+    var peers: [[String: Any]] = []
+    let lines = dump.split(separator: "\n", omittingEmptySubsequences: true)
+    for (i, l) in lines.enumerated() {
+        if i == 0 { continue }                         // interface line
+        let f = l.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+        if f.count < 8 { continue }
+        let pub = f[0], ep = f[2], aips = f[3], lhsRaw = f[4], rx = f[5], tx = f[6]
+        let lhs = Int(lhsRaw) ?? 0
+        let age: Int? = lhs == 0 ? nil : max(0, now - lhs)
+        var wgip: String? = nil
+        if !aips.isEmpty, aips != "(none)" {
+            wgip = aips.split(separator: ",").first?.trimmingCharacters(in: .whitespaces)
+                       .split(separator: "/").first.map(String.init)
+        }
+        peers.append([
+            "pubkey": pub,
+            "wg_ip": wgip as Any,
+            "endpoint": ep == "(none)" ? NSNull() : ep,
+            "last_handshake_sec": age as Any,
+            "rx_bytes": Int(rx) ?? 0,
+            "tx_bytes": Int(tx) ?? 0,
+            "online": (age != nil && age! < 180),
+        ])
+    }
+    return (peers, !dump.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+}
+
+func heartbeatBody(iface: String, role: String, wgListen: Int) -> Data? {
+    let (peers, ifaceUp) = peerStatus(iface: iface)
+    let ages = peers.compactMap { $0["last_handshake_sec"] as? Int }
+    let stats: [String: Any] = [
+        "rx_bytes": peers.reduce(0) { $0 + (($1["rx_bytes"] as? Int) ?? 0) },
+        "tx_bytes": peers.reduce(0) { $0 + (($1["tx_bytes"] as? Int) ?? 0) },
+        "last_handshake_sec": ages.min() ?? 0,
+    ]
+    let (lan, pubIP) = lanAddrs()
+    let onlineCount = peers.filter { ($0["online"] as? Bool) == true }.count
+    var status: [String: Any] = [
+        "schema": 1, "role": role, "os": OS_NAME,
+        "arch": run(UNAME, ["-m"]).out.trimmingCharacters(in: .whitespacesAndNewlines),
+        "agent_ver": AGENT_VER, "iface": iface, "iface_up": ifaceUp,
+        "wg_listen": wgListen, "peer_count": peers.count,
+        "peers_online": onlineCount, "peers": peers,
+    ]
+    if let up = uptimeSec() { status["uptime_sec"] = up }
+    let payload: [String: Any] = [
+        "lan_addrs": lan,
+        "wg_endpoint": pubIP.isEmpty ? "" : "\(pubIP):\(wgListen)",
+        "stats": stats,
+        "status": status,
+    ]
+    return try? JSONSerialization.data(withJSONObject: payload)
+}
+
+// ── render wg-quick conf from a peer response (preserving local [Interface]) ─
+func renderConf(iface: String, resp: PeerResponse) -> String? {
+    let confPath = "\(CONFDIR)/\(iface).conf"
+    var priv = "", addr = "", listen = ""
+    guard let existing = try? String(contentsOfFile: confPath, encoding: .utf8) else { return nil }
+    for line in existing.split(separator: "\n") {
+        let s = line.trimmingCharacters(in: .whitespaces)
+        if s.hasPrefix("PrivateKey"), let v = s.split(separator: "=", maxSplits: 1).last { priv = v.trimmingCharacters(in: .whitespaces) }
+        else if s.hasPrefix("Address"), let v = s.split(separator: "=", maxSplits: 1).last { addr = v.trimmingCharacters(in: .whitespaces) }
+        else if s.hasPrefix("ListenPort"), let v = s.split(separator: "=", maxSplits: 1).last { listen = v.trimmingCharacters(in: .whitespaces) }
+    }
+    if priv.isEmpty { return nil }
+    var lines = ["[Interface]", "PrivateKey = \(priv)",
+                 "Address    = \(addr.isEmpty ? (resp.device_ip ?? "") + "/24" : addr)",
+                 "ListenPort = \(listen.isEmpty ? "1632" : listen)", ""]
+    let ka = resp.keepalive_sec ?? 25
+    for p in (resp.peers ?? []).sorted(by: { ($0.pubkey ?? "") < ($1.pubkey ?? "") }) {
+        guard let pk = p.pubkey, !pk.isEmpty else { continue }
+        var aips: [String] = []
+        if let w = p.wg_ip, !w.isEmpty { aips.append(w.contains("/") ? w : "\(w)/32") }
+        aips.append(contentsOf: p.allowed_extra ?? [])
+        if aips.isEmpty { continue }
+        lines.append("[Peer]")
+        lines.append("PublicKey  = \(pk)")
+        if let ep = p.endpoint, !ep.isEmpty { lines.append("Endpoint   = \(ep)") }
+        lines.append("AllowedIPs = \(aips.joined(separator: ", "))")
+        if ka > 0 { lines.append("PersistentKeepalive = \(ka)") }
+        lines.append("")
+    }
+    return lines.joined(separator: "\n")
+}
+
+func reloadIface(_ iface: String) {
+    _ = run(WGQUICK, ["down", iface])
+    _ = run(WGQUICK, ["up", iface])
+}
+
+// the set of AllowedIPs CIDRs across all peers — changing this set means the
+// system routing table must change (full reload); peers/endpoints alone don't.
+func allowedIPsSet(_ conf: String) -> Set<String> {
+    var s = Set<String>()
+    for line in conf.split(separator: "\n") {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        if t.hasPrefix("AllowedIPs"), let v = t.split(separator: "=", maxSplits: 1).last {
+            for cidr in v.split(separator: ",") { s.insert(cidr.trimmingCharacters(in: .whitespaces)) }
+        }
+    }
+    return s
+}
+
+// non-disruptive peer/endpoint update: wg syncconf reprograms the running
+// interface without tearing it down (no tunnel drop, no route flap). wg-quick
+// strip drops wg-quick-only keys (Address/DNS/PostUp) syncconf rejects.
+func syncIface(_ iface: String) {
+    let confPath = "\(CONFDIR)/\(iface).conf"
+    let (sc, stripped) = run(WGQUICK, ["strip", confPath])
+    if sc == 0, !stripped.isEmpty {
+        let tmp = "\(RUNDIR)/\(iface).sync.conf"
+        if (try? stripped.write(toFile: tmp, atomically: true, encoding: .utf8)) != nil {
+            let (rc, _) = run(WG, ["syncconf", iface, tmp])
+            try? FileManager.default.removeItem(atPath: tmp)
+            if rc == 0 { return }
+        }
+    }
+    logLine("[\(iface)] syncconf failed; full reload")
+    reloadIface(iface)
+}
+
+func evictIface(iface: String, statePath: String) {
+    logLine("[\(iface)] EVICT: server rejected token")
+    _ = run(WGQUICK, ["down", iface])
+    try? FileManager.default.removeItem(atPath: "\(CONFDIR)/\(iface).conf")
+    try? FileManager.default.removeItem(atPath: statePath)
+    try? FileManager.default.removeItem(atPath: "\(RUNDIR)/\(iface).rev")
+}
+
+// ── per-iface reconcile ─────────────────────────────────────────────────────
+func processIface(statePath: String) {
+    let iface = (statePath as NSString).lastPathComponent.replacingOccurrences(of: ".json", with: "")
+    guard let data = FileManager.default.contents(atPath: statePath),
+          let m = try? JSONDecoder().decode(Membership.self, from: data),
+          let server = m.server?.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
+          let deviceID = m.device_id, let token = m.token,
+          !server.isEmpty, !deviceID.isEmpty, !token.isEmpty else {
+        logLine("[\(iface)] state incomplete; skip"); return
+    }
+    let role = m.role ?? "device"
+    let wgListen = m.wg_listen ?? 1632
+
+    // 1. heartbeat
+    if let body = heartbeatBody(iface: iface, role: role, wgListen: wgListen) {
+        let (code, respData) = http("\(server)/v1/heartbeat", method: "POST",
+                                    token: token, deviceID: deviceID, body: body)
+        let txt = respData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        if code != 200 { logLine("[\(iface)] heartbeat HTTP \(code): \(txt.prefix(160))") }
+        // 2. eviction policy
+        if code == 401, ["invalid device token", "token expired", "token does not match"].contains(where: { txt.contains($0) }) {
+            evictIface(iface: iface, statePath: statePath); return
+        }
+    }
+
+    // 3. peer refresh (single immediate fetch — long-poll is a follow-up)
+    let peerURL = role == "hub" ? "\(server)/v1/hub/peers" : "\(server)/v1/peers"
+    let (pcode, pdata) = http(peerURL, token: token, deviceID: deviceID)
+    guard pcode == 200, let pdata = pdata else { logLine("[\(iface)] peers HTTP \(pcode)"); return }
+    guard let resp = try? JSONDecoder().decode(PeerResponse.self, from: pdata) else {
+        logLine("[\(iface)] peers: bad JSON"); return
+    }
+    if resp.not_modified == true { return }
+    if getenv("WG_AGENT_DEBUG") != nil {
+        logLine("[\(iface)] OK heartbeat+peers 200 rev=\(resp.rev ?? "-") peers=\(resp.peers?.count ?? 0)")
+    }
+
+    // 4. render + sync/reload if changed
+    guard let newConf = renderConf(iface: iface, resp: resp) else { return }
+    let confPath = "\(CONFDIR)/\(iface).conf"
+    let oldConf = (try? String(contentsOfFile: confPath, encoding: .utf8)) ?? ""
+    if newConf != oldConf {
+        do {
+            try newConf.write(toFile: confPath, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: confPath)
+            if allowedIPsSet(newConf) == allowedIPsSet(oldConf) {
+                logLine("[\(iface)] peers changed; syncconf (non-disruptive)")
+                syncIface(iface)
+            } else {
+                logLine("[\(iface)] routes changed; full reload")
+                reloadIface(iface)
+            }
+        } catch { logLine("[\(iface)] write conf failed: \(error)") }
+    }
+}
+
+// ── main ────────────────────────────────────────────────────────────────────
+guard getuid() == 0 else { FileHandle.standardError.write("wg-agent: must run as root\n".data(using: .utf8)!); exit(1) }
+// URLSession's TLS (OpenSSL on FreeBSD, libcurl on Linux) may need an explicit
+// CA bundle path or HTTPS fails validation silently (→ HTTP 0). Self-set so the
+// binary works with no external env. (Linux libcurl usually finds it anyway.)
+if getenv("SSL_CERT_FILE") == nil {
+    for p in ["/etc/ssl/cert.pem",                       // FreeBSD
+              "/etc/ssl/certs/ca-certificates.crt",      // Debian/Ubuntu
+              "/etc/pki/tls/certs/ca-bundle.crt",        // RHEL/Fedora
+              "/usr/local/etc/ssl/cert.pem",
+              "/usr/local/share/certs/ca-root-nss.crt"]
+    where FileManager.default.fileExists(atPath: p) { setenv("SSL_CERT_FILE", p, 1); break }
+}
+try? FileManager.default.createDirectory(atPath: RUNDIR, withIntermediateDirectories: true)
+let states = (try? FileManager.default.contentsOfDirectory(atPath: STATE_DIR))?
+    .filter { $0.hasSuffix(".json") }.map { "\(STATE_DIR)/\($0)" } ?? []
+if states.isEmpty { logLine("no memberships in \(STATE_DIR); no-op") }
+for s in states { processIface(statePath: s) }
