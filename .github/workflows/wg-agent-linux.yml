@@ -22,7 +22,11 @@ on:
 jobs:
   build-linux-amd64:
     runs-on: ubuntu-latest
-    container: swift:6.0           # official Swift toolchain image (amd64)
+    # Build on Ubuntu 22.04 (Jammy, glibc 2.35) NOT the newer default: a binary
+    # linked against an older glibc runs on newer systems, but not vice-versa.
+    # Plain `swift:6.0` is Noble (glibc 2.38) and won't load on 22.04 hosts
+    # (e.g. the 124.221.22.9 hub). Jammy covers 22.04+.
+    container: swift:6.0-jammy
     steps:
       - uses: actions/checkout@v4
 
