@@ -24,6 +24,8 @@
 #   --listen=PORT     wg UDP listen port (default: 1632, matches the mesh)
 #   --iface=NAME      logical iface name (default: wgc0)
 #   --reinstall       re-register even if /etc/wgctl/<iface>.json exists
+#   --host-id=ID      polar-hosts host.id for the wg↔hosts cross-link
+#                     (auto-read from ~/.polar/agent.toml if omitted)
 
 set -euo pipefail
 
@@ -39,6 +41,7 @@ SITE_SLUG=""
 WG_LISTEN=1632
 IFACE="wgc0"
 REINSTALL=0
+HOST_ID=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -49,10 +52,24 @@ while [[ $# -gt 0 ]]; do
         --iface=*)    IFACE="${1#*=}";;
         --reinstall)  REINSTALL=1;;
         --server=*)   SERVER="${1#*=}";;
+        --host-id=*)  HOST_ID="${1#*=}";;
         *) echo "unknown arg: $1" >&2; exit 1;;
     esac
     shift
 done
+
+# host_id ties this wg device to its polar-hosts host row, lighting up the
+# bidirectional wg_devices↔hosts cross-link at register time (vs the fragile
+# hello-backfill that needs the agent to read+match the same wg pubkey). If
+# not passed explicitly, read it from the local polar-agent config when present
+# — most wg nodes also run polar-agent, which wrote host_id there at enroll.
+if [[ -z "$HOST_ID" ]]; then
+    for cfg in "$HOME/.polar/agent.toml" /root/.polar/agent.toml /home/*/.polar/agent.toml; do
+        [[ -r "$cfg" ]] || continue
+        HOST_ID=$(sed -n 's/^[[:space:]]*host_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$cfg" | head -1)
+        [[ -n "$HOST_ID" ]] && { echo "==> using host_id from $cfg"; break; }
+    done
+fi
 
 [[ $EUID -eq 0 ]] || { echo "must run as root (use sudo)" >&2; exit 1; }
 [[ -n "$TOKEN" ]] || { echo "--token=<TOKEN> required" >&2; exit 1; }
@@ -159,9 +176,10 @@ esac
 echo "==> registering with control plane $SERVER"
 REQ_JSON=$(TOKEN="$TOKEN" PUB="$PUB" HOSTNAME_REPORT="$HOSTNAME_REPORT" \
     ARCH="$ARCH" LAN="$LAN_ADDRS_JSON" WG_LISTEN="$WG_LISTEN" SITE_SLUG="$SITE_SLUG" \
+    HOST_ID="$HOST_ID" \
     python3 <<'PY'
 import json, os
-print(json.dumps({
+body = {
     "token":     os.environ["TOKEN"],
     "pubkey":    os.environ["PUB"],
     "hostname":  os.environ["HOSTNAME_REPORT"],
@@ -171,7 +189,11 @@ print(json.dumps({
     "lan_addrs": json.loads(os.environ["LAN"]),
     "wg_listen": int(os.environ["WG_LISTEN"]),
     "site_slug": os.environ["SITE_SLUG"],
-}))
+}
+hid = os.environ.get("HOST_ID", "").strip()
+if hid:
+    body["host_id"] = hid  # cross-link to polar-hosts; server stamps wg_devices.host_id
+print(json.dumps(body))
 PY
 )
 
