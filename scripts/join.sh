@@ -45,6 +45,7 @@ WG_LISTEN=1632
 IFACE=""          # empty → auto-allocate next-free wgcN
 FORCE=0
 REINSTALL=0
+HOST_ID=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -56,10 +57,21 @@ while [[ $# -gt 0 ]]; do
         --force)      FORCE=1;;
         --reinstall)  REINSTALL=1;;
         --server=*)   SERVER="${1#*=}";;   # offline test
+        --host-id=*)  HOST_ID="${1#*=}";;
         *) echo "unknown arg: $1" >&2; exit 1;;
     esac
     shift
 done
+
+# host_id ties this wg device to its polar-hosts host row (wg↔hosts cross-link,
+# stamped at register). Auto-read from the local polar-agent config if not given.
+if [[ -z "$HOST_ID" ]]; then
+    for cfg in "$HOME/.polar/agent.toml" /Users/*/.polar/agent.toml /var/root/.polar/agent.toml; do
+        [[ -r "$cfg" ]] || continue
+        HOST_ID=$(sed -n 's/^[[:space:]]*host_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$cfg" | head -1)
+        [[ -n "$HOST_ID" ]] && { echo "==> using host_id from $cfg"; break; }
+    done
+fi
 
 [[ $EUID -eq 0 ]] || { echo "must run as root (use sudo bash)" >&2; exit 1; }
 [[ -n "$TOKEN" ]] || { echo "--token=<TOKEN> required" >&2; exit 1; }
@@ -226,9 +238,9 @@ echo "==> registering with control plane $SERVER"
 
 REQ_JSON=$(TOKEN="$TOKEN" PUB="$PUB" HOSTNAME_REPORT="$HOSTNAME_REPORT" \
     ARCH="$ARCH" AGENT_VER="$AGENT_VER" LAN="$LAN_ADDRS_JSON" \
-    WG_LISTEN="$WG_LISTEN" SITE_SLUG="$SITE_SLUG" python3 <<'PY'
+    WG_LISTEN="$WG_LISTEN" SITE_SLUG="$SITE_SLUG" HOST_ID="$HOST_ID" python3 <<'PY'
 import json, os
-print(json.dumps({
+body = {
     "token":     os.environ["TOKEN"],
     "pubkey":    os.environ["PUB"],
     "hostname":  os.environ["HOSTNAME_REPORT"],
@@ -238,7 +250,11 @@ print(json.dumps({
     "lan_addrs": json.loads(os.environ["LAN"]),
     "wg_listen": int(os.environ["WG_LISTEN"]),
     "site_slug": os.environ["SITE_SLUG"],
-}))
+}
+hid = os.environ.get("HOST_ID", "").strip()
+if hid:
+    body["host_id"] = hid  # cross-link to polar-hosts; server stamps wg_devices.host_id
+print(json.dumps(body))
 PY
 )
 
