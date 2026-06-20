@@ -84,7 +84,7 @@ func run(_ path: String, _ args: [String]) -> (code: Int32, out: String) {
 
 // Synchronous HTTP via URLSession (no shell/curl).
 func http(_ urlStr: String, method: String = "GET", token: String, deviceID: String,
-          body: Data? = nil, timeout: TimeInterval = 15) -> (code: Int, body: Data?) {
+          body: Data? = nil, timeout: TimeInterval = 10) -> (code: Int, body: Data?) {
     guard let url = URL(string: urlStr) else { return (0, nil) }
     var req = URLRequest(url: url)
     req.httpMethod = method
@@ -95,6 +95,10 @@ func http(_ urlStr: String, method: String = "GET", token: String, deviceID: Str
         req.httpBody = body
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     }
+    // NOTE: use the shared session (NOT a per-call ephemeral one + invalidateAndCancel
+    // — that crashes FoundationNetworking's _MultiHandle on FreeBSD). The process-wide
+    // avalanche the CP-outage caused is prevented structurally instead: the flock
+    // single-instance guard + the watchdog + the final exit(0) in main.
     let sem = DispatchSemaphore(value: 0)
     // captured by reference so the @Sendable completion can mutate cleanly
     final class Box { var code = 0; var data: Data?; var err = "" }
@@ -105,7 +109,7 @@ func http(_ urlStr: String, method: String = "GET", token: String, deviceID: Str
         if let e = e as NSError? { box.err = "\(e.domain)#\(e.code): \(e.localizedDescription)" }
         sem.signal()
     }.resume()
-    _ = sem.wait(timeout: .now() + timeout + 5)
+    if sem.wait(timeout: .now() + timeout + 3) == .timedOut, box.err.isEmpty { box.err = "request timed out" }
     // surface transport errors (TLS/DNS/proxy) instead of a silent HTTP 0
     if box.code == 0 && !box.err.isEmpty { logLine("http \(method) \(urlStr) failed: \(box.err)") }
     return (box.code, box.data)
@@ -489,6 +493,19 @@ func processIface(statePath: String) {
 
 // ── main ────────────────────────────────────────────────────────────────────
 guard getuid() == 0 else { FileHandle.standardError.write("wg-agent: must run as root\n".data(using: .utf8)!); exit(1) }
+try? FileManager.default.createDirectory(atPath: RUNDIR, withIntermediateDirectories: true)
+// single-instance guard: a run that wedges (e.g. a network hang) must NOT let the
+// next cron tick pile up another — that avalanched to 98 stuck procs once. Hold an
+// flock for our lifetime; if another instance holds it, bail immediately.
+let lockFD = open("\(RUNDIR)/wg-agent.lock", O_CREAT | O_RDWR, 0o600)
+if lockFD >= 0, flock(lockFD, LOCK_EX | LOCK_NB) != 0 { exit(0) }
+// hard watchdog: never outlive the cron interval whatever hangs (URLSession worker,
+// a wedged subprocess pipe, …). Force-exit after 50s; flock then frees for next run.
+Thread.detachNewThread {
+    Thread.sleep(forTimeInterval: 50)
+    FileHandle.standardError.write("wg-agent: watchdog 50s — force exit\n".data(using: .utf8)!)
+    exit(2)
+}
 // URLSession's TLS (OpenSSL on FreeBSD, libcurl on Linux) may need an explicit
 // CA bundle path or HTTPS fails validation silently (→ HTTP 0). Self-set so the
 // binary works with no external env. (Linux libcurl usually finds it anyway.)
@@ -505,3 +522,4 @@ let states = (try? FileManager.default.contentsOfDirectory(atPath: STATE_DIR))?
     .filter { $0.hasSuffix(".json") }.map { "\(STATE_DIR)/\($0)" } ?? []
 if states.isEmpty { logLine("no memberships in \(STATE_DIR); no-op") }
 for s in states { processIface(statePath: s) }
+exit(0)   // force clean exit past any lingering URLSession worker threads
