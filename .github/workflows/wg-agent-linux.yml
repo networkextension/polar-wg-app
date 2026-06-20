@@ -1,0 +1,58 @@
+name: wg-agent (Linux build)
+
+# Compiles the Swift wg-agent reconciler for Linux on GitHub's ubuntu runner,
+# so we don't need a local Linux box with the Swift toolchain. Produces a
+# portable (static Swift stdlib) amd64 binary as a build artifact.
+#
+# Source is FreeBSD+Linux cross-platform (see the #if os(Linux) branches in
+# skills/wg-mac-install/scripts/wg-agent.swift). FreeBSD builds happen on the
+# box itself (no GitHub FreeBSD runner); this workflow covers Linux.
+
+on:
+  push:
+    paths:
+      - "skills/wg-mac-install/scripts/wg-agent.swift"
+      - ".github/workflows/wg-agent-linux.yml"
+  pull_request:
+    paths:
+      - "skills/wg-mac-install/scripts/wg-agent.swift"
+      - ".github/workflows/wg-agent-linux.yml"
+  workflow_dispatch:
+
+jobs:
+  build-linux-amd64:
+    runs-on: ubuntu-latest
+    container: swift:6.0           # official Swift toolchain image (amd64)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift toolchain
+        run: swift --version
+
+      - name: Compile (static stdlib → portable binary)
+        run: |
+          set -eux
+          SRC=skills/wg-mac-install/scripts/wg-agent.swift
+          # -static-stdlib bundles the Swift runtime so the binary runs on an
+          # Ubuntu VM without Swift installed (still needs glibc + libcurl).
+          swiftc -O -static-stdlib "$SRC" -o wg-agent-linux-amd64
+
+      - name: Inspect binary
+        run: |
+          file wg-agent-linux-amd64 || true
+          echo "--- ldd ---"
+          ldd  wg-agent-linux-amd64 || true
+          ls -la wg-agent-linux-amd64
+
+      - name: Smoke run (no memberships → clean exit, just proves it loads/runs)
+        run: |
+          set +e
+          ./wg-agent-linux-amd64
+          echo "exit=$?"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wg-agent-linux-amd64
+          path: wg-agent-linux-amd64
+          if-no-files-found: error
