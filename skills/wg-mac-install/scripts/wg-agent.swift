@@ -71,16 +71,29 @@ func logLine(_ s: String) {
 
 @discardableResult
 func run(_ path: String, _ args: [String]) -> (code: Int32, out: String) {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: path)
-    p.arguments = args
-    let outPipe = Pipe()
-    p.standardOutput = outPipe
-    p.standardError = Pipe()
-    do { try p.run() } catch { return (-1, "") }
-    let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-    p.waitUntilExit()
-    return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    // posix_spawn + waitpid (a real blocking syscall: the thread SLEEPS, 0% CPU)
+    // instead of Foundation.Process, whose Pipe/dispatch I/O busy-polls to ~100%
+    // CPU on FreeBSD while a slow child runs (curl on a timeout pegged the box).
+    // Capture output by briefly pointing our own fd 1/2 at a temp file — avoids
+    // posix_spawn_file_actions_t, whose type differs Linux↔FreeBSD.
+    let outPath = "\(RUNDIR)/.run.\(getpid()).out"
+    var argv: [UnsafeMutablePointer<CChar>?] = ([path] + args).map { strdup($0) }
+    argv.append(nil)
+    defer { for p in argv { free(p) } }
+    let saved1 = dup(1), saved2 = dup(2)
+    let fd = open(outPath, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
+    if fd >= 0 { dup2(fd, 1); dup2(fd, 2); close(fd) }
+    var pid: pid_t = 0
+    let spawnRC = posix_spawn(&pid, path, nil, nil, argv, environ)
+    if saved1 >= 0 { dup2(saved1, 1); close(saved1) }
+    if saved2 >= 0 { dup2(saved2, 2); close(saved2) }
+    if spawnRC != 0 { try? FileManager.default.removeItem(atPath: outPath); return (-1, "") }
+    var status: Int32 = 0
+    while waitpid(pid, &status, 0) < 0 && errno == EINTR { }
+    let out = (try? String(contentsOfFile: outPath, encoding: .utf8)) ?? ""
+    try? FileManager.default.removeItem(atPath: outPath)
+    let code: Int32 = (status & 0x7f) == 0 ? (status >> 8) & 0xff : 128 + (status & 0x7f)
+    return (code, out)
 }
 
 // Synchronous HTTP via curl (NOT URLSession). FoundationNetworking's event loop
