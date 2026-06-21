@@ -1236,6 +1236,48 @@ utun_apply_peer_routes(const char *ifname, const struct client_config *cfg)
     }
 }
 
+/* Periodically re-assert the AllowedIPs system routes (run_tunnel calls this
+ * every ~30s). macOS flushes utun interface routes on a primary-network change
+ * (e.g. moving between WiFi networks at a café), silently breaking egress
+ * routes like a hub-advertised LAN /24 while wg still holds the AllowedIPs.
+ * `route change` an existing entry back to us, else add; never delete, never
+ * log — so re-running on a tick is cheap and non-disruptive. */
+static void
+reassert_peer_routes(const char *ifname, const struct peer_state *peers, int n_peers)
+{
+    char cmd[256], net[INET6_ADDRSTRLEN];
+    for (int i = 0; i < n_peers; i++) {
+        const struct peer_state *peer = &peers[i];
+        for (int j = 0; j < peer->n_allowed; j++) {
+            const struct allowed_cidr *c = &peer->allowed[j];
+            if (c->prefix_len == 0) continue;
+            const char *af = "-net";
+            if (c->family == AF_INET) {
+                struct in_addr a;
+                memcpy(&a, c->addr, 4);
+                uint32_t mask = c->prefix_len >= 32 ? 0xFFFFFFFFu
+                              : htonl(0xFFFFFFFFu << (32 - c->prefix_len));
+                a.s_addr &= mask;
+                if (!inet_ntop(AF_INET, &a, net, sizeof(net))) continue;
+            } else if (c->family == AF_INET6) {
+                af = "-inet6";
+                if (!inet_ntop(AF_INET6, c->addr, net, sizeof(net))) continue;
+            } else {
+                continue;
+            }
+            snprintf(cmd, sizeof(cmd),
+                     "/sbin/route -q -n change %s %s/%d -interface %s >/dev/null 2>&1",
+                     af, net, c->prefix_len, ifname);
+            if (system(cmd) != 0) {
+                snprintf(cmd, sizeof(cmd),
+                         "/sbin/route -q -n add %s %s/%d -interface %s >/dev/null 2>&1",
+                         af, net, c->prefix_len, ifname);
+                (void)system(cmd);
+            }
+        }
+    }
+}
+
 /* Run /etc/wireguard/<logical>.postup if executable, passing the logical
  * iface name, conf path, and the live utun unit. This is the wg-quick
  * `PostUp = …` hook — script-level safety net for the route-loss case
@@ -1950,6 +1992,7 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
     }
 
     last_stats = time(NULL);
+    time_t last_route_reassert = time(NULL);
 
     signal(SIGINT,  on_quit);
     signal(SIGTERM, on_quit);
@@ -2011,6 +2054,14 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
 
         now = time(NULL);
         tunnel_tick(&ctx, now);
+
+        /* Re-assert AllowedIPs routes every 30s so egress routes (e.g. a
+         * hub-advertised LAN /24) survive a network change — macOS flushes
+         * utun routes on a primary-network switch while wg keeps the AllowedIPs. */
+        if (now - last_route_reassert >= 30) {
+            reassert_peer_routes(ctx.if_name, ctx.peers, ctx.n_peers);
+            last_route_reassert = now;
+        }
 
         if (sig_info) {
             sig_info = 0;
