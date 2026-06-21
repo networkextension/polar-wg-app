@@ -48,6 +48,7 @@ let IP       = toolPath(["/usr/sbin/ip", "/sbin/ip", "/bin/ip"])   // Linux lan_
 let IFCONFIG = toolPath(["/sbin/ifconfig", "/usr/sbin/ifconfig"])  // FreeBSD lan_addrs
 let SYSCTL   = toolPath(["/sbin/sysctl", "/usr/sbin/sysctl"])
 let UNAME    = toolPath(["/usr/bin/uname", "/bin/uname"])
+let CURL     = toolPath(["/usr/bin/curl", "/usr/local/bin/curl"])
 
 // hub-role egress NAT (packet filter): masquerade this whole mesh supernet out the
 // uplink when the platform opens egress here. Source is the broad CGNAT supernet,
@@ -70,49 +71,63 @@ func logLine(_ s: String) {
 
 @discardableResult
 func run(_ path: String, _ args: [String]) -> (code: Int32, out: String) {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: path)
-    p.arguments = args
-    let outPipe = Pipe()
-    p.standardOutput = outPipe
-    p.standardError = Pipe()
-    do { try p.run() } catch { return (-1, "") }
-    let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-    p.waitUntilExit()
-    return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    // posix_spawn + waitpid (a real blocking syscall: the thread SLEEPS, 0% CPU)
+    // instead of Foundation.Process, whose Pipe/dispatch I/O busy-polls to ~100%
+    // CPU on FreeBSD while a slow child runs (curl on a timeout pegged the box).
+    // Capture output by briefly pointing our own fd 1/2 at a temp file — avoids
+    // posix_spawn_file_actions_t, whose type differs Linux↔FreeBSD.
+    let outPath = "\(RUNDIR)/.run.\(getpid()).out"
+    var argv: [UnsafeMutablePointer<CChar>?] = ([path] + args).map { strdup($0) }
+    argv.append(nil)
+    defer { for p in argv { free(p) } }
+    let saved1 = dup(1), saved2 = dup(2)
+    let fd = open(outPath, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
+    if fd >= 0 { dup2(fd, 1); dup2(fd, 2); close(fd) }
+    var pid: pid_t = 0
+    let spawnRC = posix_spawn(&pid, path, nil, nil, argv, environ)
+    if saved1 >= 0 { dup2(saved1, 1); close(saved1) }
+    if saved2 >= 0 { dup2(saved2, 2); close(saved2) }
+    if spawnRC != 0 { try? FileManager.default.removeItem(atPath: outPath); return (-1, "") }
+    var status: Int32 = 0
+    while waitpid(pid, &status, 0) < 0 && errno == EINTR { }
+    let out = (try? String(contentsOfFile: outPath, encoding: .utf8)) ?? ""
+    try? FileManager.default.removeItem(atPath: outPath)
+    let code: Int32 = (status & 0x7f) == 0 ? (status >> 8) & 0xff : 128 + (status & 0x7f)
+    return (code, out)
 }
 
-// Synchronous HTTP via URLSession (no shell/curl).
+// Synchronous HTTP via curl (NOT URLSession). FoundationNetworking's event loop
+// busy-spins to ~200% CPU on FreeBSD/Linux when a request to an unreachable
+// control plane hangs — that pegged dpaa2 and starved its sshd. curl uses a
+// proper poll and returns cleanly on --max-time. curl is a binary, not a shell
+// (still "脱离 sh"). --noproxy bypasses any (dead) proxy; the CP cert is a real
+// Let's Encrypt one so curl's default CA verification passes (no -k needed).
 func http(_ urlStr: String, method: String = "GET", token: String, deviceID: String,
           body: Data? = nil, timeout: TimeInterval = 10) -> (code: Int, body: Data?) {
-    guard let url = URL(string: urlStr) else { return (0, nil) }
-    var req = URLRequest(url: url)
-    req.httpMethod = method
-    req.timeoutInterval = timeout
-    req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-    req.setValue(deviceID, forHTTPHeaderField: "X-Device-Id")
+    var args = ["-sS", "--noproxy", "*", "--max-time", "\(Int(timeout))",
+                "-w", "\n%{http_code}",
+                "-H", "Authorization: Bearer \(token)",
+                "-H", "X-Device-Id: \(deviceID)"]
+    if method != "GET" { args += ["-X", method] }
+    var bodyTmp: String? = nil
     if let body = body {
-        req.httpBody = body
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let tmp = "\(RUNDIR)/.http-body.\(getpid())"
+        if (try? body.write(to: URL(fileURLWithPath: tmp))) != nil {
+            bodyTmp = tmp
+            args += ["-H", "Content-Type: application/json", "--data-binary", "@\(tmp)"]
+        }
     }
-    // NOTE: use the shared session (NOT a per-call ephemeral one + invalidateAndCancel
-    // — that crashes FoundationNetworking's _MultiHandle on FreeBSD). The process-wide
-    // avalanche the CP-outage caused is prevented structurally instead: the flock
-    // single-instance guard + the watchdog + the final exit(0) in main.
-    let sem = DispatchSemaphore(value: 0)
-    // captured by reference so the @Sendable completion can mutate cleanly
-    final class Box { var code = 0; var data: Data?; var err = "" }
-    let box = Box()
-    URLSession.shared.dataTask(with: req) { d, r, e in
-        if let h = r as? HTTPURLResponse { box.code = h.statusCode }
-        box.data = d
-        if let e = e as NSError? { box.err = "\(e.domain)#\(e.code): \(e.localizedDescription)" }
-        sem.signal()
-    }.resume()
-    if sem.wait(timeout: .now() + timeout + 3) == .timedOut, box.err.isEmpty { box.err = "request timed out" }
-    // surface transport errors (TLS/DNS/proxy) instead of a silent HTTP 0
-    if box.code == 0 && !box.err.isEmpty { logLine("http \(method) \(urlStr) failed: \(box.err)") }
-    return (box.code, box.data)
+    args.append(urlStr)
+    let (rc, out) = run(CURL, args)
+    if let tmp = bodyTmp { try? FileManager.default.removeItem(atPath: tmp) }
+    // curl appends "\n<http_code>" after the body; split on the last newline.
+    guard let nl = out.lastIndex(of: "\n") else {
+        logLine("http \(method) \(urlStr) failed: curl rc=\(rc) (no response)")
+        return (0, nil)
+    }
+    let code = Int(out[out.index(after: nl)...].trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+    if code == 0 { logLine("http \(method) \(urlStr) failed: curl rc=\(rc)") }
+    return (code, String(out[..<nl]).data(using: .utf8))
 }
 
 func uptimeSec() -> Int? {
