@@ -163,6 +163,26 @@ $ nm -g build/.../WireGuardCore | grep "T _wg_session_" | wc -l
    manager.protocolConfiguration = proto
    ```
 
+   **`providerConfiguration` keys** read by the reference provider (all
+   string values; read once at `startTunnel`):
+
+   | key | meaning |
+   |-----|---------|
+   | `config` | wg-quick text (required) |
+   | `routeMode` | `full` \| `split` |
+   | `dnsMode` | `system` \| `plain` \| `doh` |
+   | `splitInjectedRoutes` | CSV of extra CIDRs (split mode) |
+   | `dnsServers` | CSV — operator DNS push; overrides the config's `DNS =` line in `plain` mode |
+   | `dnsMatchDomains` | CSV — split-DNS scoping (applied to `plain`/`doh`) |
+   | `dnsSearchDomains` | CSV — search domains appended to bare hostnames |
+   | `kcp*` | KCP transport (see `KCP-TRANSPORT.md`) |
+
+   The `dns*` keys carry the control-plane policy (`wg_hubs.policy_json` →
+   `/v1/register` → host-app reconciler → here). Empty/absent = legacy
+   behavior (DNS from the config's `DNS =` line). See
+   `doc/wg-dns-proxy-push-design.md`. Updating them requires re-saving the
+   profile + restarting the tunnel (v1; v3 = `sendProviderMessage`, no blip).
+
 6. **Code sign** the host app and the extension with a provisioning
    profile that includes the NE entitlement. Development profiles need
    to be created in App Store Connect or the free personal team.
