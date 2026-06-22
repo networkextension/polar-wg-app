@@ -63,6 +63,15 @@ struct VPNNode: Codable, Identifiable, Equatable {
     var dnsMode: DNSMode
     var splitInjectedRoutes: String
 
+    // DNS policy pushed by the control plane (wg_hubs.policy_json →
+    // /v1/register → NE providerConfiguration dns* keys). CSV strings;
+    // nil/"" = nothing pushed (NE falls back to the config's "DNS =" line).
+    // Optional + nil-default keeps old persisted profiles decodable and the
+    // memberwise init's existing call sites unchanged.
+    var dnsServers: String? = nil
+    var dnsMatchDomains: String? = nil
+    var dnsSearchDomains: String? = nil
+
     // Platform metadata (nil for manual nodes)
     var platformProxyId: String?
     var platformProfileId: String?
@@ -104,6 +113,10 @@ final class TunnelManager: ObservableObject {
     @Published var routeMode: RouteMode = .full
     @Published var dnsMode: DNSMode = .plain
     @Published var splitInjectedRoutes: String = ""
+    // Control-plane DNS policy (CSV), mirrored into providerConfiguration on save.
+    @Published var dnsServers: String = ""
+    @Published var dnsMatchDomains: String = ""
+    @Published var dnsSearchDomains: String = ""
 
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
@@ -437,6 +450,10 @@ final class TunnelManager: ObservableObject {
             let shortDev = String(resp.device_id.suffix(8))
             let role = resp.role ?? "device"
             let profileName = "mesh-\(role)-\(shortDev)"
+            // Operator DNS policy (per-hub) → persisted on the profile as CSV;
+            // save() pushes it into the NE providerConfiguration. nil = nothing
+            // pushed (profile keeps the config's "DNS =" line behavior).
+            let dnsPolicy = resp.policy?.dns
             let profile = VPNNode(
                 id: UUID(),
                 name: profileName,
@@ -445,7 +462,10 @@ final class TunnelManager: ObservableObject {
                 country: resp.hub_slug ?? "",
                 routeMode: .split,
                 dnsMode: .plain,
-                splitInjectedRoutes: resp.mesh_cidr ?? "10.88.0.0/16"
+                splitInjectedRoutes: resp.mesh_cidr ?? "10.88.0.0/16",
+                dnsServers: csvJoin(dnsPolicy?.servers),
+                dnsMatchDomains: csvJoin(dnsPolicy?.match_domains),
+                dnsSearchDomains: csvJoin(dnsPolicy?.search_domains)
             )
             profiles.append(profile)
             selectedProfileID = profile.id
@@ -478,6 +498,17 @@ final class TunnelManager: ObservableObject {
         } catch {
             meshJoinError = error.localizedDescription
         }
+    }
+
+    /// Join a control-plane string list into a CSV for providerConfiguration,
+    /// or nil when there's nothing to push (so the profile field stays unset
+    /// and the NE keeps its legacy DNS behavior). Trims + drops empties.
+    private func csvJoin(_ list: [String]?) -> String? {
+        guard let list else { return nil }
+        let cleaned = list
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        return cleaned.isEmpty ? nil : cleaned.joined(separator: ",")
     }
 
     /// Look up mesh metadata stored at join time (used by /v1/leave + a
@@ -574,7 +605,11 @@ final class TunnelManager: ObservableObject {
             "config": config,
             "routeMode": routeMode.rawValue,
             "dnsMode": dnsMode.rawValue,
-            "splitInjectedRoutes": splitInjectedRoutes
+            "splitInjectedRoutes": splitInjectedRoutes,
+            // Control-plane DNS policy (CSV; "" = unset → NE keeps legacy behavior).
+            "dnsServers": dnsServers,
+            "dnsMatchDomains": dnsMatchDomains,
+            "dnsSearchDomains": dnsSearchDomains
         ]
         m.protocolConfiguration = proto
         m.localizedDescription = "WireGuard Sample"
@@ -691,6 +726,9 @@ final class TunnelManager: ObservableObject {
         routeMode = profile.routeMode
         dnsMode = profile.dnsMode
         splitInjectedRoutes = profile.splitInjectedRoutes
+        dnsServers = profile.dnsServers ?? ""
+        dnsMatchDomains = profile.dnsMatchDomains ?? ""
+        dnsSearchDomains = profile.dnsSearchDomains ?? ""
     }
 
     private func syncCurrentProfileDraft() {
@@ -700,6 +738,9 @@ final class TunnelManager: ObservableObject {
         profiles[idx].routeMode = routeMode
         profiles[idx].dnsMode = dnsMode
         profiles[idx].splitInjectedRoutes = splitInjectedRoutes
+        profiles[idx].dnsServers = dnsServers
+        profiles[idx].dnsMatchDomains = dnsMatchDomains
+        profiles[idx].dnsSearchDomains = dnsSearchDomains
         persistProfilesToKeychain()
     }
 

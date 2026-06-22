@@ -37,6 +37,31 @@ struct MeshHub: Codable {
     let wg_ip: String
 }
 
+/// Operator DNS/proxy policy pushed per-hub (wg_hubs.policy_json on the
+/// control plane). v1 applies `dns`; `proxy` is decoded for v2 (iOS
+/// NEProxySettings) but not yet applied. See doc/wg-dns-proxy-push-design.md.
+struct MeshDNSPolicy: Codable {
+    let servers: [String]?
+    let match_domains: [String]?
+    let search_domains: [String]?
+    let mode: String?               // "plain" | "doh"
+    let doh_url: String?
+}
+
+struct MeshProxyPolicy: Codable {   // v2 — decoded, not applied yet
+    let http: String?
+    let https: String?
+    let pac_url: String?
+    let match_domains: [String]?
+    let bypass: [String]?
+    let exclude_simple: Bool?
+}
+
+struct MeshPolicy: Codable {
+    let dns: MeshDNSPolicy?
+    let proxy: MeshProxyPolicy?
+}
+
 struct MeshRegisterResponse: Codable {
     let device_id: String
     let device_ip: String
@@ -50,6 +75,7 @@ struct MeshRegisterResponse: Codable {
     let refresh_sec: Int?
     let token: String?
     let token_expires: String?
+    let policy: MeshPolicy?         // operator DNS/proxy push (per-hub)
 }
 
 /// What the join flow returns to the UI: a rendered conf + the metadata

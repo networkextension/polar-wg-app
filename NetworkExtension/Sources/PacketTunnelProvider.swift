@@ -96,6 +96,13 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         }()
         let splitInjectedRoutes = proto.providerConfiguration?["splitInjectedRoutes"] as? String ?? ""
         let dnsMode: String = proto.providerConfiguration?["dnsMode"] as? String ?? "plain"
+        // DNS policy pushed by the control plane (per-hub wg_hubs.policy_json →
+        // /v1/peers → host-app reconciler → providerConfiguration). All three
+        // are comma-separated strings; empty = nothing pushed (legacy behavior).
+        // See doc/wg-dns-proxy-push-design.md (v1).
+        let dnsServersOverride = csvList(proto.providerConfiguration?["dnsServers"] as? String ?? "")
+        let dnsMatchDomains = csvList(proto.providerConfiguration?["dnsMatchDomains"] as? String ?? "")
+        let dnsSearchDomains = csvList(proto.providerConfiguration?["dnsSearchDomains"] as? String ?? "")
 
         // 2. Build the C session with callbacks pointing back at self.
         //    We pass an unretained Unmanaged<PacketTunnelProvider> as the
@@ -128,7 +135,10 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             configText: configText,
             routeMode: routeMode,
             dnsMode: dnsMode,
-            splitInjectedRoutes: splitInjectedRoutes
+            splitInjectedRoutes: splitInjectedRoutes,
+            dnsServersOverride: dnsServersOverride,
+            dnsMatchDomains: dnsMatchDomains,
+            dnsSearchDomains: dnsSearchDomains
         )
 
         // 4. Hand the settings to the system. Once this completes,
@@ -290,7 +300,10 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         configText: String,
         routeMode: RouteMode,
         dnsMode: String,
-        splitInjectedRoutes: String
+        splitInjectedRoutes: String,
+        dnsServersOverride: [String] = [],
+        dnsMatchDomains: [String] = [],
+        dnsSearchDomains: [String] = []
     ) -> NEPacketTunnelNetworkSettings {
         // Tunnel remote address — cosmetic, shown in System Settings → VPN.
         // Pull it from the first peer's endpoint via the wg_session
@@ -501,21 +514,28 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         // MTU matches wg_core: 1420 gives us 60 bytes of outer overhead headroom.
         settings.mtu = 1420
 
-        // DNS mode (user choice via UI):
-        //   "system" → no override, use device default
-        //   "plain"  → plain DNS from the config's "DNS = ..." line
+        // DNS mode (user choice via UI), overlaid with operator policy push
+        // (dnsServersOverride / dnsMatchDomains / dnsSearchDomains, from the
+        // control plane). See doc/wg-dns-proxy-push-design.md (v1).
+        //   "system" → no override, use device default (policy not forced)
+        //   "plain"  → policy servers if pushed, else the config's "DNS = ..." line
         //   "doh"    → DNS-over-HTTPS via Cloudflare (1.1.1.1)
+        // Operator match/search domains apply to whatever NEDNSSettings is built
+        // (split-DNS scoping for "plain"/"doh"); "system" stays untouched.
         switch dnsMode {
         case "system":
             break  // no DNSSettings → system default
         case "doh":
             let doh = NEDNSOverHTTPSSettings(servers: ["1.1.1.1", "1.0.0.1"])
             doh.serverURL = URL(string: "https://cloudflare-dns.com/dns-query")
+            applyDNSDomains(doh, match: dnsMatchDomains, search: dnsSearchDomains)
             settings.dnsSettings = doh
         default: // "plain"
-            let dnsServers = parseDNSFromConfig(configText)
+            let dnsServers = dnsServersOverride.isEmpty ? parseDNSFromConfig(configText) : dnsServersOverride
             if !dnsServers.isEmpty {
-                settings.dnsSettings = NEDNSSettings(servers: dnsServers)
+                let dns = NEDNSSettings(servers: dnsServers)
+                applyDNSDomains(dns, match: dnsMatchDomains, search: dnsSearchDomains)
+                settings.dnsSettings = dns
             }
         }
         routeDebugInfo = renderRouteDebug(
@@ -877,6 +897,24 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// Parse "DNS = 1.1.1.1, 1.0.0.1" from a wg-quick config text.
     /// Returns an array of IP strings, empty if no DNS line found.
+    /// Split a comma-separated providerConfiguration value (e.g. the pushed
+    /// DNS server / match-domain / search-domain lists) into a trimmed,
+    /// non-empty array. Empty input → empty array (= nothing pushed).
+    private func csvList(_ s: String) -> [String] {
+        s.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// Apply operator-pushed match/search domains to an NEDNSSettings (plain
+    /// or DoH). matchDomains scopes the resolver to those suffixes (split DNS);
+    /// searchDomains are appended to bare hostnames. Empty lists are no-ops so
+    /// legacy (no-policy) behavior is unchanged.
+    private func applyDNSDomains(_ dns: NEDNSSettings, match: [String], search: [String]) {
+        if !match.isEmpty { dns.matchDomains = match }
+        if !search.isEmpty { dns.searchDomains = search }
+    }
+
     private func parseDNSFromConfig(_ config: String) -> [String] {
         var inInterface = false
         for line in config.components(separatedBy: .newlines) {
