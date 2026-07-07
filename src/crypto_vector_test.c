@@ -3,6 +3,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#endif
+
 #include "crypto.h"
 #include "wg_noise.h"
 #include "allowedips.h"
@@ -1228,6 +1232,14 @@ static int test_aips_edge_cases(void)
 int main(void)
 {
     int fails = 0;
+
+#if defined(_WIN32)
+    /* UAPI SET's endpoint= parsing calls getaddrinfo()/inet_pton(), which
+     * fail with WSANOTINITIALISED until WSAStartup() has run once. On
+     * every other platform the socket layer needs no such call. */
+    WSADATA wsa_data;
+    WSAStartup(MAKEWORD(2, 2), &wsa_data);
+#endif
 
     if (crypto_init() != 0) {
         printf("crypto_init failed\n");

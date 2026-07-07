@@ -18,10 +18,59 @@
  *   void curve25519_clamp_secret(uint8_t priv[32]);
  */
 
+#if defined(_CRT_RAND_S)
+/* already defined by includer */
+#elif defined(_WIN32)
+#define _CRT_RAND_S
+#endif
+
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <unistd.h>
+#endif
+
+/* MSVC has no __uint128_t. Shim a 128-bit accumulator out of
+ * _umul128 (64x64->128 multiply) + _addcarry_u64 (128-bit add).
+ * Only the operations this file needs are provided: multiply,
+ * add, shift-right-by-51, and low-51-bits extraction. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define WG_NEED_U128_SHIM 1
+#include <intrin.h>
+
+typedef struct { uint64_t lo, hi; } u128_t;
+
+static __forceinline u128_t u128_mul64(uint64_t a, uint64_t b)
+{
+    u128_t r;
+    r.lo = _umul128(a, b, &r.hi);
+    return r;
+}
+
+static __forceinline u128_t u128_add(u128_t a, u128_t b)
+{
+    u128_t r;
+    unsigned char carry = _addcarry_u64(0, a.lo, b.lo, &r.lo);
+    _addcarry_u64(carry, a.hi, b.hi, &r.hi);
+    return r;
+}
+
+static __forceinline u128_t u128_add_u64(u128_t a, uint64_t b)
+{
+    u128_t r;
+    unsigned char carry = _addcarry_u64(0, a.lo, b, &r.lo);
+    _addcarry_u64(carry, a.hi, 0, &r.hi);
+    return r;
+}
+
+/* shift right by 51 bits — the only shift this file ever needs */
+static __forceinline uint64_t u128_shr51(u128_t a)
+{
+    return (a.lo >> 51) | (a.hi << 13);
+}
+#endif /* _MSC_VER && !__clang__ */
 
 /* ── Field arithmetic in GF(2^255 - 19) using 5 × 51-bit limbs ─────── */
 
@@ -40,15 +89,16 @@ static void fe_frombytes(fe h, const uint8_t s[32])
     uint64_t t2 = (((uint64_t)s[12] >> 6)       ) | ((uint64_t)s[13] << 2)
                | ((uint64_t)s[14] << 10) | ((uint64_t)s[15] << 18)
                | ((uint64_t)s[16] << 26) | ((uint64_t)s[17] << 34)
-               | (((uint64_t)s[18] & 0x01) << 42);
-    uint64_t t3 = (((uint64_t)s[18] >> 1)       ) | ((uint64_t)s[19] << 7)
-               | ((uint64_t)s[20] << 15) | ((uint64_t)s[21] << 23)
-               | ((uint64_t)s[22] << 31) | ((uint64_t)s[23] << 39)
-               | (((uint64_t)s[24] & 0x0f) << 47);
-    uint64_t t4 = (((uint64_t)s[24] >> 4)       ) | ((uint64_t)s[25] << 4)
-               | ((uint64_t)s[26] << 12) | ((uint64_t)s[27] << 20)
-               | ((uint64_t)s[28] << 28) | ((uint64_t)s[29] << 36)
-               | (((uint64_t)s[30] & 0x7f) << 44);
+               | ((uint64_t)s[18] << 42)
+               | (((uint64_t)s[19] & 0x01) << 50);
+    uint64_t t3 = (((uint64_t)s[19] >> 1)       ) | ((uint64_t)s[20] << 7)
+               | ((uint64_t)s[21] << 15) | ((uint64_t)s[22] << 23)
+               | ((uint64_t)s[23] << 31) | ((uint64_t)s[24] << 39)
+               | (((uint64_t)s[25] & 0x0f) << 47);
+    uint64_t t4 = (((uint64_t)s[25] >> 4)       ) | ((uint64_t)s[26] << 4)
+               | ((uint64_t)s[27] << 12) | ((uint64_t)s[28] << 20)
+               | ((uint64_t)s[29] << 28) | ((uint64_t)s[30] << 36)
+               | (((uint64_t)s[31] & 0x7f) << 44);
     h[0] = t0; h[1] = t1; h[2] = t2; h[3] = t3; h[4] = t4;
 }
 
@@ -86,20 +136,20 @@ static void fe_tobytes(uint8_t s[32], const fe h)
     s[15] = (uint8_t)( t[2] >> 18 );
     s[16] = (uint8_t)( t[2] >> 26 );
     s[17] = (uint8_t)( t[2] >> 34 );
-    s[18] = (uint8_t)((t[2] >> 42) | (t[3] << 1));
-    s[19] = (uint8_t)( t[3] >>  7 );
-    s[20] = (uint8_t)( t[3] >> 15 );
-    s[21] = (uint8_t)( t[3] >> 23 );
-    s[22] = (uint8_t)( t[3] >> 31 );
-    s[23] = (uint8_t)( t[3] >> 39 );
-    s[24] = (uint8_t)((t[3] >> 47) | (t[4] << 4));
-    s[25] = (uint8_t)( t[4] >>  4 );
-    s[26] = (uint8_t)( t[4] >> 12 );
-    s[27] = (uint8_t)( t[4] >> 20 );
-    s[28] = (uint8_t)( t[4] >> 28 );
-    s[29] = (uint8_t)( t[4] >> 36 );
-    s[30] = (uint8_t)( t[4] >> 44 );
-    s[31] = 0;
+    s[18] = (uint8_t)( t[2] >> 42 );
+    s[19] = (uint8_t)((t[2] >> 50) | (t[3] << 1));
+    s[20] = (uint8_t)( t[3] >>  7 );
+    s[21] = (uint8_t)( t[3] >> 15 );
+    s[22] = (uint8_t)( t[3] >> 23 );
+    s[23] = (uint8_t)( t[3] >> 31 );
+    s[24] = (uint8_t)( t[3] >> 39 );
+    s[25] = (uint8_t)((t[3] >> 47) | (t[4] << 4));
+    s[26] = (uint8_t)( t[4] >>  4 );
+    s[27] = (uint8_t)( t[4] >> 12 );
+    s[28] = (uint8_t)( t[4] >> 20 );
+    s[29] = (uint8_t)( t[4] >> 28 );
+    s[30] = (uint8_t)( t[4] >> 36 );
+    s[31] = (uint8_t)( t[4] >> 44 );
 }
 
 #define MASK51 0x7ffffffffffffULL
@@ -120,6 +170,36 @@ static void fe_sub(fe h, const fe f, const fe g)
     h[4] = f[4]+0xffffffffffffeULL - g[4];
 }
 
+#if defined(WG_NEED_U128_SHIM)
+static void fe_mul(fe h, const fe f, const fe g)
+{
+    uint64_t g1_19 = g[1]*19, g2_19 = g[2]*19, g3_19 = g[3]*19, g4_19 = g[4]*19;
+    u128_t t0 = u128_add(u128_add(u128_mul64(f[0],g[0]),   u128_mul64(f[1],g4_19)),
+                 u128_add(u128_add(u128_mul64(f[2],g3_19), u128_mul64(f[3],g2_19)),
+                          u128_mul64(f[4],g1_19)));
+    u128_t t1 = u128_add(u128_add(u128_mul64(f[0],g[1]),   u128_mul64(f[1],g[0])),
+                 u128_add(u128_add(u128_mul64(f[2],g4_19), u128_mul64(f[3],g3_19)),
+                          u128_mul64(f[4],g2_19)));
+    u128_t t2 = u128_add(u128_add(u128_mul64(f[0],g[2]),   u128_mul64(f[1],g[1])),
+                 u128_add(u128_add(u128_mul64(f[2],g[0]),  u128_mul64(f[3],g4_19)),
+                          u128_mul64(f[4],g3_19)));
+    u128_t t3 = u128_add(u128_add(u128_mul64(f[0],g[3]),   u128_mul64(f[1],g[2])),
+                 u128_add(u128_add(u128_mul64(f[2],g[1]),  u128_mul64(f[3],g[0])),
+                          u128_mul64(f[4],g4_19)));
+    u128_t t4 = u128_add(u128_add(u128_mul64(f[0],g[4]),   u128_mul64(f[1],g[3])),
+                 u128_add(u128_add(u128_mul64(f[2],g[2]),  u128_mul64(f[3],g[1])),
+                          u128_mul64(f[4],g[0])));
+
+    uint64_t c;
+    c = u128_shr51(t0); h[0] = t0.lo & MASK51; t1 = u128_add_u64(t1, c);
+    c = u128_shr51(t1); h[1] = t1.lo & MASK51; t2 = u128_add_u64(t2, c);
+    c = u128_shr51(t2); h[2] = t2.lo & MASK51; t3 = u128_add_u64(t3, c);
+    c = u128_shr51(t3); h[3] = t3.lo & MASK51; t4 = u128_add_u64(t4, c);
+    c = u128_shr51(t4); h[4] = t4.lo & MASK51;
+    h[0] += c * 19;
+    c = h[0] >> 51; h[0] &= MASK51; h[1] += c;
+}
+#else
 static void fe_mul(fe h, const fe f, const fe g)
 {
     __uint128_t t0,t1,t2,t3,t4;
@@ -149,19 +229,41 @@ static void fe_mul(fe h, const fe f, const fe g)
     h[0] += c * 19;
     c = h[0] >> 51; h[0] &= MASK51; h[1] += c;
 }
+#endif /* WG_NEED_U128_SHIM */
 
 static void fe_sq(fe h, const fe f)
 {
     fe_mul(h, f, f);
 }
 
+/* a24 = (486662 - 2) / 4 = 121665 per RFC 7748 §4.1 (this vendored copy
+ * had 121666 — an off-by-one from confusing (A-2)/4 with (A+2)/4 — which
+ * silently produced wrong shared secrets for every keypair). */
+#if defined(WG_NEED_U128_SHIM)
 static void fe_mul121666(fe h, const fe f)
 {
-    __uint128_t t0 = (__uint128_t)f[0] * 121666;
-    __uint128_t t1 = (__uint128_t)f[1] * 121666;
-    __uint128_t t2 = (__uint128_t)f[2] * 121666;
-    __uint128_t t3 = (__uint128_t)f[3] * 121666;
-    __uint128_t t4 = (__uint128_t)f[4] * 121666;
+    u128_t t0 = u128_mul64(f[0], 121665);
+    u128_t t1 = u128_mul64(f[1], 121665);
+    u128_t t2 = u128_mul64(f[2], 121665);
+    u128_t t3 = u128_mul64(f[3], 121665);
+    u128_t t4 = u128_mul64(f[4], 121665);
+    uint64_t c;
+    c = u128_shr51(t0); h[0] = t0.lo & MASK51; t1 = u128_add_u64(t1, c);
+    c = u128_shr51(t1); h[1] = t1.lo & MASK51; t2 = u128_add_u64(t2, c);
+    c = u128_shr51(t2); h[2] = t2.lo & MASK51; t3 = u128_add_u64(t3, c);
+    c = u128_shr51(t3); h[3] = t3.lo & MASK51; t4 = u128_add_u64(t4, c);
+    c = u128_shr51(t4); h[4] = t4.lo & MASK51;
+    h[0] += c * 19;
+    c = h[0] >> 51; h[0] &= MASK51; h[1] += c;
+}
+#else
+static void fe_mul121666(fe h, const fe f)
+{
+    __uint128_t t0 = (__uint128_t)f[0] * 121665;
+    __uint128_t t1 = (__uint128_t)f[1] * 121665;
+    __uint128_t t2 = (__uint128_t)f[2] * 121665;
+    __uint128_t t3 = (__uint128_t)f[3] * 121665;
+    __uint128_t t4 = (__uint128_t)f[4] * 121665;
     uint64_t c;
     c = (uint64_t)(t0 >> 51); h[0] = (uint64_t)t0 & MASK51; t1 += c;
     c = (uint64_t)(t1 >> 51); h[1] = (uint64_t)t1 & MASK51; t2 += c;
@@ -171,6 +273,7 @@ static void fe_mul121666(fe h, const fe f)
     h[0] += c * 19;
     c = h[0] >> 51; h[0] &= MASK51; h[1] += c;
 }
+#endif /* WG_NEED_U128_SHIM */
 
 static void fe_invert(fe out, const fe z)
 {
@@ -204,10 +307,12 @@ static void fe_invert(fe out, const fe z)
     fe_sq(t2, t2);
     for (i = 0; i < 49; i++) fe_sq(t2, t2);
     fe_mul(t1, t2, t1);        /* t1 = z^(2^250 - 1) */
-    fe_sq(t1, t1); fe_sq(t1, t1);  /* t1 = z^(2^252 - 4) */
-    fe_mul(t1, t1, z);
+    /* p - 2 = 2^255 - 21 = (2^250 - 1)*2^5 + 11, and t0 still holds z^11
+     * from earlier (never overwritten) — five more squarings then one
+     * multiply by t0 lands exactly on z^(p-2). */
     fe_sq(t1, t1);
-    fe_mul(out, t1, z);        /* out = z^(p-2) */
+    for (i = 0; i < 4; i++) fe_sq(t1, t1);  /* t1 = z^(2^255 - 32) */
+    fe_mul(out, t1, t0);       /* out = z^(2^255 - 32 + 11) = z^(p-2) */
 }
 
 /* ── Montgomery ladder (X25519 scalar multiplication) ───────────────── */
@@ -296,6 +401,14 @@ void curve25519_generate_secret(uint8_t priv[32])
 #elif defined(__linux__) || defined(__ANDROID__)
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd >= 0) { read(fd, priv, 32); close(fd); }
+#elif defined(_WIN32)
+    /* rand_s (declared via _CRT_RAND_S) draws from the OS CSPRNG
+     * (RtlGenRandom) — no bcrypt.lib linkage needed. */
+    for (int i = 0; i < 8; i++) {
+        unsigned int word;
+        rand_s(&word);
+        memcpy(priv + i * 4, &word, 4);
+    }
 #else
     /* Fallback: zero (unsafe! should never ship without a real RNG) */
     memset(priv, 0, 32);
@@ -321,3 +434,4 @@ int curve25519(uint8_t shared[32],
     for (int i = 0; i < 32; i++) zero |= shared[i];
     return zero != 0 ? 1 : 0;
 }
+
