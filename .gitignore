@@ -21,6 +21,9 @@ src/id_ed25519.pub
 src/test.ini
 src/server_tcpdump.txt
 
+# join-windows.ps1 output: real private keys + registration tokens
+config/
+
 # macOS cruft
 .DS_Store
 

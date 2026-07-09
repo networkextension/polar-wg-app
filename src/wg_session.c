@@ -63,10 +63,17 @@
   #include <sys/endian.h>
 #endif
 
-#include "macos_stubs/sys/mbuf.h"
-#include "macos_stubs/sys/param.h"
-#include "macos_stubs/sys/rwlock.h"
-#include "macos_stubs/sys/mutex.h"
+#if defined(_WIN32)
+  #include "windows_stubs/sys/mbuf.h"
+  #include "windows_stubs/sys/param.h"
+  #include "windows_stubs/sys/rwlock.h"
+  #include "windows_stubs/sys/mutex.h"
+#else
+  #include "macos_stubs/sys/mbuf.h"
+  #include "macos_stubs/sys/param.h"
+  #include "macos_stubs/sys/rwlock.h"
+  #include "macos_stubs/sys/mutex.h"
+#endif
 #include "wg_cookie.h"
 
 /* ─────────────────────────────────────────────────────────────────────────
