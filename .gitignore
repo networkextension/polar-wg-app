@@ -29,3 +29,8 @@ src/server_tcpdump.txt
 **/xcuserdata/
 **/*.xcuserstate
 **/project.xcworkspace/xcuserdata/
+
+# Swift package + cross-arch bundle build artifacts
+.build/
+build-x86/
+build-uni/
