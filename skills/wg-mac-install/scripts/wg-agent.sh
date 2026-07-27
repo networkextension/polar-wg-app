@@ -25,6 +25,47 @@ LP_MIN_RETURN=${WGCTL_LP_MIN_RETURN:-5}
 LP_FLOOR=${WGCTL_LP_FLOOR:-10}
 log(){ printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG" 2>/dev/null; }
 
+# ── public egress IP ─────────────────────────────────────────────────
+# wg_endpoint is documented as the "public observed peer", but this used
+# to report the default route's own source address — behind NAT that is
+# an RFC1918 address, never the egress IP, so an egress change was
+# invisible to the control plane. Ask an external echo service instead.
+#
+# Cached: ifconfig.co allows ~1 request/min per source IP and every device
+# behind one NAT shares that budget, so a 60 s tick must not probe every
+# time. On total failure keep serving the last known IP (stale beats
+# nothing) but retry sooner than the full TTL. Cache file format matches
+# scripts/wgctl-agent.sh so both agents can share it.
+PUBIP_CACHE=$STATE_DIR/public_ip
+PUBIP_TTL=${WGCTL_PUBIP_TTL:-900}
+PUBIP_RETRY=${WGCTL_PUBIP_RETRY:-120}
+PUBIP_URLS=${WGCTL_PUBIP_URLS:-"https://ifconfig.co/ip https://ifconfig.me/ip"}
+
+public_ip(){
+  now=$(date +%s); stamp=0; cached=""
+  if [ -r "$PUBIP_CACHE" ]; then
+    read -r stamp cached < "$PUBIP_CACHE" 2>/dev/null || { stamp=0; cached=""; }
+    case "$stamp" in (*[!0-9]*|"") stamp=0 ;; esac
+  fi
+  if [ -n "$cached" ] && [ $((now - stamp)) -lt "$PUBIP_TTL" ]; then
+    printf '%s' "$cached"; return
+  fi
+  for url in $PUBIP_URLS; do
+    fresh=$(curl -4 -fsS --noproxy '*' --connect-timeout 3 --max-time 5 "$url" 2>/dev/null \
+            | tr -d '[:space:]')
+    case "$fresh" in
+      *[!0-9.]*|"") continue ;;
+      *.*.*.*)
+        printf '%s %s\n' "$now" "$fresh" > "$PUBIP_CACHE"
+        [ "$fresh" = "$cached" ] || log "public egress IP: ${cached:-none} -> $fresh"
+        printf '%s' "$fresh"; return ;;
+      *) continue ;;
+    esac
+  done
+  printf '%s %s\n' "$((now - PUBIP_TTL + PUBIP_RETRY))" "$cached" > "$PUBIP_CACHE"
+  printf '%s' "$cached"
+}
+
 [ "$(id -u)" = 0 ] || { echo "wg-agent: must run as root" >&2; exit 1; }
 command -v wg >/dev/null 2>&1 || { log "wg not found; is wireguard-tools installed?"; exit 1; }
 
@@ -218,16 +259,21 @@ process_iface() {
 $(python3 - "$STATE" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1]))
+# join-linux.sh writes "listen", the other joiners write "wg_listen".
+# Reading only the latter pinned every join-linux host to 1632 regardless
+# of its real port.
+listen = c.get("wg_listen") or c.get("listen") or 1632
 print(c.get("server","").rstrip("/"), c.get("device_id",""), c.get("token",""),
-      c.get("role","device"), c.get("wg_listen",1632))
+      c.get("role","device"), listen)
 PY
 )
 EOF
   [ -n "$SERVER" ] && [ -n "$DEVICE_ID" ] && [ -n "$TOKEN" ] || { log "[$IFACE] state incomplete; skip"; return; }
 
-  local DUMP HB_BODY
+  local DUMP HB_BODY PUB_IP
   DUMP=$(wg show "$IFACE" dump 2>/dev/null)
-  HB_BODY=$(DUMP="$DUMP" ROLE="$ROLE" IFACE="$IFACE" WG_LISTEN="$WG_LISTEN" \
+  PUB_IP=$(public_ip)
+  HB_BODY=$(DUMP="$DUMP" ROLE="$ROLE" IFACE="$IFACE" WG_LISTEN="$WG_LISTEN" PUB_IP="$PUB_IP" \
             HOST_OS="$OS" HOST_ARCH="$ARCH" HOST_UPTIME="$UPTIME" AGENT_VER="$AGENT_VER" \
             python3 - <<'PY'
 import os, re, json, time, subprocess, shutil
@@ -253,8 +299,11 @@ stats = {"rx_bytes": sum(p["rx_bytes"] for p in peers),
          "tx_bytes": sum(p["tx_bytes"] for p in peers),
          "last_handshake_sec": min(ages) if ages else 0}
 
-# lan_addrs + public-endpoint guess
-lan, pub_ip = [], ""
+# lan_addrs. The public egress IP is NOT derived here: the default route's
+# source address is an RFC1918 address behind NAT. It comes from public_ip()
+# in the shell above, which asks an external echo service and caches.
+lan = []
+pub_ip = os.environ.get("PUB_IP", "")
 if shutil.which("ip"):
     out = subprocess.run(["ip","-o","-4","addr","show"], capture_output=True, text=True).stdout
     for l in out.splitlines():
@@ -263,8 +312,6 @@ if shutil.which("ip"):
         ifc, cidr = m.group(1), m.group(2); ip = cidr.split('/')[0]
         if ifc == "lo" or ip.startswith(("127.","169.254.","10.88.")): continue
         lan.append({"iface": ifc, "cidr": cidr})
-    g = subprocess.run(["ip","route","get","1.1.1.1"], capture_output=True, text=True).stdout
-    m = re.search(r'src\s+(\d+\.\d+\.\d+\.\d+)', g);  pub_ip = m.group(1) if m else ""
 else:
     out = subprocess.run(["ifconfig"], capture_output=True, text=True).stdout
     cur = None
@@ -276,7 +323,6 @@ else:
         ip = m.group(1)
         if ip.startswith(("127.","169.254.","10.88.")): continue
         lan.append({"iface": cur, "cidr": f"{ip}/{bin(int(m.group(2),16)).count('1')}"})
-    if lan: pub_ip = lan[0]["cidr"].split('/')[0]
 
 up = os.environ.get("HOST_UPTIME","")
 status = {"schema": 1, "role": os.environ.get("ROLE","device"),

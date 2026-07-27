@@ -51,6 +51,46 @@ die() {
 
 [[ $EUID -eq 0 ]] || die "must run as root"
 
+# ── public egress IP ─────────────────────────────────────────────────
+# wg_endpoint is documented as the "public observed peer" (JOIN_PROTOCOL
+# §heartbeat), but this used to report the default NIC's own address —
+# behind NAT that is an RFC1918 address, never the egress IP, so an
+# egress change was invisible to the control plane. Ask an external echo
+# service instead.
+#
+# Cached: ifconfig.co asks for <=1 request/min per source IP and every
+# device behind one NAT shares that budget, so a 60s heartbeat must not
+# probe every tick. When every probe fails we keep serving the last known
+# IP (stale beats nothing) and retry sooner than the full TTL.
+PUBIP_CACHE=$STATE_DIR/public_ip
+PUBIP_TTL=${WGCTL_PUBIP_TTL:-900}
+PUBIP_RETRY=${WGCTL_PUBIP_RETRY:-120}
+PUBIP_URLS=${WGCTL_PUBIP_URLS:-"https://ifconfig.co/ip https://ifconfig.me/ip"}
+
+public_ip() {
+    local now stamp cached url fresh
+    now=$(date +%s)
+    stamp=0; cached=""
+    if [[ -r "$PUBIP_CACHE" ]]; then
+        read -r stamp cached < "$PUBIP_CACHE" 2>/dev/null || { stamp=0; cached=""; }
+        [[ "$stamp" =~ ^[0-9]+$ ]] || stamp=0
+    fi
+    if [[ -n "$cached" ]] && (( now - stamp < PUBIP_TTL )); then
+        printf '%s' "$cached"
+        return
+    fi
+    for url in $PUBIP_URLS; do
+        fresh=$(curl -4 -fsS --connect-timeout 3 --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
+        [[ "$fresh" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
+        printf '%s %s\n' "$now" "$fresh" > "$PUBIP_CACHE"
+        [[ "$fresh" == "$cached" ]] || log "public egress IP: ${cached:-none} -> $fresh"
+        printf '%s' "$fresh"
+        return
+    done
+    printf '%s %s\n' "$(( now - PUBIP_TTL + PUBIP_RETRY ))" "$cached" > "$PUBIP_CACHE"
+    printf '%s' "$cached"
+}
+
 # ── host-level facts (same for every iface this tick; see doc/hub-status.md) ──
 HOST_OS=$(uname -s | tr '[:upper:]' '[:lower:]')   # darwin / linux / freebsd
 case "$(uname -m)" in
@@ -66,7 +106,10 @@ else
     [[ -n "$_boot" ]] && HOST_UPTIME=$(( $(date +%s) - _boot )) || HOST_UPTIME=""
 fi
 # Agent version: bundle leaves it here at install; "unknown" otherwise.
-AGENT_VER=$(cat /usr/local/share/wg-mac/VERSION 2>/dev/null | head -1)
+# install.sh writes $PREFIX/libexec/wg-mac/VERSION; the share/ path never
+# existed, so agent_ver was always "unknown". Keep share/ as a fallback for
+# any host that predates the fix.
+AGENT_VER=$(cat /usr/local/libexec/wg-mac/VERSION /usr/local/share/wg-mac/VERSION 2>/dev/null | head -1)
 [[ -n "$AGENT_VER" ]] || AGENT_VER="unknown"
 
 # Migration: old single-file layout /etc/wgctl/config.json gets
@@ -338,7 +381,10 @@ def toB(n, u): return int(float(n) * UNIT.get(u, 1))
 peers, cur = [], None
 for raw in show.splitlines():
     s = raw.strip()
-    m = re.match(r'peer:\s+(\S+)', s)
+    # wg_core prints "peer #0: <pub>"; upstream wg prints "peer: <pub>".
+    # Matching only the latter left `cur` unset forever, so every following
+    # field was skipped and stats went up as all-zero.
+    m = re.match(r'peer(?:\s+#\d+)?:\s+(\S+)', s)
     if m:
         cur = {"pubkey": m.group(1), "wg_ip": None, "endpoint": None,
                "last_handshake_sec": None, "rx_bytes": 0, "tx_bytes": 0,
@@ -387,11 +433,14 @@ PY
 )
     [[ -n "$STATUS_JSON" ]] || STATUS_JSON='{"stats":{},"status":{}}'
 
-    # ----- public endpoint guess from default route -----
-    local DEF_IF PUB_IP WG_ENDPOINT
-    DEF_IF=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
-    PUB_IP=$(ifconfig "$DEF_IF" 2>/dev/null | awk '/inet /{print $2; exit}')
-    WG_ENDPOINT="${PUB_IP:-}:${WG_LISTEN}"
+    # ----- public egress IP (external echo service, cached) -----
+    local PUB_IP WG_ENDPOINT
+    PUB_IP=$(public_ip)
+    # Blank on total lookup failure, deliberately: the server keeps the
+    # previous endpoint when this field is empty, whereas the ":$WG_LISTEN"
+    # a failed lookup used to yield overwrote it with junk.
+    WG_ENDPOINT=""
+    [[ -n "$PUB_IP" ]] && WG_ENDPOINT="$PUB_IP:$WG_LISTEN"
 
     local LAN_JSON
     LAN_JSON=$(python3 - <<'PY'

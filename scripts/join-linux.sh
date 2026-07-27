@@ -328,14 +328,52 @@ for ln in run("ip", "-o", "-4", "addr", "show", "scope", "global").splitlines():
         continue
     lan.append({"iface": dev, "cidr": cidr})
 
-# public egress IP for wg_endpoint (best-effort, via the default route NIC).
-r = run("ip", "route", "show", "default").split()
-def_if = r[r.index("dev") + 1] if "dev" in r else ""
-pub_ip = ""
-for ln in run("ip", "-o", "-4", "addr", "show", def_if).splitlines():
-    p = ln.split()
-    if len(p) >= 4 and p[2] == "inet":
-        pub_ip = p[3].split("/")[0]; break
+# Public egress IP for wg_endpoint.
+#
+# This used to take the default route NIC's own address, which behind NAT is an
+# RFC1918 address and never the egress IP — so an egress change was invisible to
+# the control plane. Ask an external echo service instead, cached: ifconfig.co
+# allows ~1 request/min per source IP and every device behind one NAT shares
+# that budget. On total failure keep serving the last known address (stale beats
+# nothing) but back-date the stamp so the retry comes sooner than a full TTL.
+# File format matches the shell agents so all three can share the cache.
+PUBIP_CACHE = "/etc/wgctl/public_ip"
+PUBIP_TTL   = int(os.environ.get("WGCTL_PUBIP_TTL", "900"))
+PUBIP_RETRY = int(os.environ.get("WGCTL_PUBIP_RETRY", "120"))
+PUBIP_URLS  = os.environ.get(
+    "WGCTL_PUBIP_URLS", "https://ifconfig.co/ip https://ifconfig.me/ip").split()
+
+def _is_ipv4(s):
+    p = s.split(".")
+    return len(p) == 4 and all(q.isdigit() and 0 <= int(q) <= 255 for q in p)
+
+def _write_pubip(stamp, ip):
+    try:
+        with open(PUBIP_CACHE + ".tmp", "w") as f:
+            f.write("%d %s\n" % (stamp, ip))
+        os.replace(PUBIP_CACHE + ".tmp", PUBIP_CACHE)
+    except Exception:
+        pass
+
+def public_ip():
+    now, stamp, cached = int(time.time()), 0, ""
+    try:
+        parts = open(PUBIP_CACHE).read().split()
+        stamp, cached = int(parts[0]), (parts[1] if len(parts) > 1 else "")
+    except Exception:
+        pass
+    if cached and now - stamp < PUBIP_TTL:
+        return cached
+    for url in PUBIP_URLS:
+        ip = run("curl", "-4", "-fsS", "--noproxy", "*",
+                 "--connect-timeout", "3", "--max-time", "5", url).strip()
+        if _is_ipv4(ip):
+            _write_pubip(now, ip)
+            return ip
+    _write_pubip(now - PUBIP_TTL + PUBIP_RETRY, cached)
+    return cached
+
+pub_ip = public_ip()
 
 try:
     uptime = int(float(open("/proc/uptime").read().split()[0]))
@@ -403,7 +441,11 @@ curl -fsS --max-time 8 -X POST "\$SERVER/v1/heartbeat" \\
     >/dev/null 2>&1 || true
 
 HTTP=\$(mktemp)
-CODE=\$(curl -fsS -o "\$HTTP" -w '%{http_code}' \\
+# -sS, NOT -fsS: with -f curl exits 22 on a 401 while still printing
+# %{http_code}, so the || echo 000 appended a second line and \$CODE became
+# "401\\n000" — matching neither branch, which made the eviction below dead
+# code and pinned the agent to "keeping current conf" forever.
+CODE=\$(curl -sS -o "\$HTTP" -w '%{http_code}' \\
     -H "Authorization: Bearer \$TOKEN" -H "X-Device-Id: \$DEVICE_ID" \\
     "\$PEER_URL" || echo 000)
 
