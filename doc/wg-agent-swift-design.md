@@ -16,7 +16,11 @@
 - 目标机上不能要求装 python3。当前三个 shell agent 每次心跳都要 fork 一次 python3 来拼 JSON —— 这是最大的部署包袱（jailbroken iOS、musl 小机器上 python3 都是负担）。
 - 必须保留现网行为，见 §6。fleet 是活的，不能靠"重写一遍差不多"过渡。
 
-**明确的非目标**：Windows；把 `wg_core`/`wgctl`（C 数据面）也改写成 Swift。
+**明确的非目标**：把 `wg_core`/`wgctl`（C 数据面）也改写成 Swift。
+
+> **2026-07-27 更新**：Windows 原本列在非目标里，现已**改为目标**（语言选型已定为
+> Swift，与 POSIX 侧统一）。数据面不自己做——复用官方 wireguard-windows。详见
+> `polar-wg/doc/wg-mac-windows-client-design.md`，本文 §3 的平台矩阵已同步。
 
 ---
 
@@ -51,7 +55,32 @@
 | FreeBSD amd64 | 官方**预览**（nightly tarball，非发布通道） | **做，但 tier-2** | `--static-swift-stdlib` 在预览版里无效 |
 | FreeBSD arm64 | **无官方工具链**，唯一实现是 `networkextension/swift-freebsd`（本项目自有） | **做，但 tier-2 且限期观察** | 见下 |
 | Android arm64 | Swift 6.3 起官方 | 暂缓 | 语言侧没问题，卡在 SELinux/init 集成，与本设计无关 |
-| Windows | 官方 | **不做** | 整个 daemon 模型（wg-quick、unix signal、posix spawn）不存在 |
+| Windows amd64 | 官方（dev + deploy，2026-01 成立 Windows Workgroup） | **做** ← 2026-07-27 改判 | 数据面复用官方 wireguard-windows，我们只写 agent。见下 |
+
+### Windows 的改判（2026-07-27）
+
+原判"不做"，理由写的是"整个 daemon 模型（wg-quick、unix signal、posix spawn）不存在"。
+这条理由**看错了对象**：那些是 POSIX *数据面 + 生命周期* 的设施，而 Windows 上这两层
+本来就该复用官方 wireguard-windows（WireGuardNT 内核驱动 + 每隧道一个 Windows 服务 +
+托盘 UI），不该由我们提供。我们要写的只有 agent —— 而 agent 需要的东西 Windows 全都有。
+
+另一条曾用来反对 Swift 的论据是"Windows 目标无法从 macOS 交叉编译"。**该论据已撤回**：
+构建主机是可获取的资源，不是架构约束。
+
+改判后的关键事实：**标准 `wg(8)` 工具在 Windows 上可用**，所以 Windows 与 Linux 走
+同一条控制路径（`wg show <iface> dump` 读状态、`wg set … endpoint` 换端点），只有
+"路由变了要重启"从 `wg-quick down/up` 换成 `sc stop/start WireGuardTunnel$<name>`。
+
+移植面因此很小：`WGAgentCore` 零平台 API，原样编译；`WGPlatform` 六个文件里四个需要
+Windows 实现（`Resolver` 几乎白送——`getaddrinfo` 同名存在于 ws2_32；`ProcessRunner`
+换 `CreateProcessW`；`HostFacts` 换 `GetAdaptersAddresses`；`Runtime` 的看门狗要重想，
+因为 Windows 没有 SIGALRM，而 §4.5 选 `alarm(2)` 正是因为睡眠线程在 CPU 打满时会
+错过自己的 deadline）。
+
+**唯一未确定的是 HTTP 栈**：FoundationNetworking/URLSession 在 Windows 上的当前状态
+查不到权威结论，不猜测；备选是 libcurl via vcpkg（与 musl 分支共用 `CCurl` target）
+或 WinHTTP。有构建主机后一小时内可证伪。完整设计见
+`polar-wg/doc/wg-mac-windows-client-design.md`。
 
 ### FreeBSD 这个决定值得单独说
 
