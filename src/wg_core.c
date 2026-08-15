@@ -225,6 +225,22 @@ struct peer_state {
     /* Stats */
     uint64_t  tx_pkts, tx_bytes, rx_pkts, rx_bytes;
     uint64_t  rx_dropped_aips;
+
+    /* Per-peer CONNECTED UDP socket for the data-plane fast path. It is
+     * bound to the same local port as the shared listener (SO_REUSEPORT)
+     * and connect()ed to the peer's current endpoint, so we can send()
+     * instead of sendto(): on macOS an unconnected sendto() costs a
+     * per-packet route lookup + NECP evaluation (measured 10 us on
+     * macOS 14, ~150 us on macOS 26/27, vs 3-4 us for send()). Because
+     * the kernel demuxes by exact 4-tuple first, the peer's inbound
+     * packets ALSO land on this socket, so it is part of the RX set.
+     * -1 = none (falls back to sendto on the listener). */
+    int                      tx_fd;
+    struct sockaddr_storage  tx_ep;       /* endpoint tx_fd is connected to */
+    socklen_t                tx_ep_len;
+    time_t                   tx_err_last; /* rate-limit for send() error logs */
+    time_t                   tx_retry_at; /* don't rebuild the socket before this */
+    uint64_t                 tx_send_errs;
 };
 
 struct client_config {
@@ -619,6 +635,27 @@ resolve_endpoint(const char *host, uint16_t port,
     return 0;
 }
 
+/* Data-plane tuning (see peer_state.tx_fd). WG_CONNECTED_TX=0 disables the
+ * per-peer connected send sockets (pure sendto/recvfrom on the listener). */
+static int      g_connected_tx = 1;
+static uint16_t g_bound_port   = 0;   /* host order; port the listener bound */
+#define WG_RX_BATCH 64   /* max datagrams drained per readable fd per wakeup */
+#define WG_TX_BATCH 64   /* max utun packets drained per wakeup */
+#define WG_SOCKBUF  (4 * 1024 * 1024)
+
+/* Bump socket buffers so bursts (e.g. a TCP sender ramping up) are queued
+ * instead of dropped while we're busy in utun_write. Try WG_SOCKBUF, then
+ * halve until the kernel accepts (kern.ipc.maxsockbuf caps it). */
+static void
+set_sock_bufs(int fd)
+{
+    for (int sz = WG_SOCKBUF; sz >= 256 * 1024; sz /= 2) {
+        int a = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
+        int b = setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+        if (a == 0 && b == 0) return;
+    }
+}
+
 /* Open an unconnected UDP socket bound to INADDR_ANY:listen_port.
  * Pass listen_port = 0 for an ephemeral port (initiator-only mode).
  * We deliberately do NOT connect(): using sendto/recvfrom lets us see
@@ -633,6 +670,10 @@ udp_open_unconnected(int family, uint16_t listen_port)
     if (fd < 0) { perror("socket(udp)"); return -1; }
     (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
     (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    /* SO_REUSEPORT so the per-peer connected TX sockets can bind the same
+     * local port later (see peer_tx_socket). Must be set before bind(). */
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+    set_sock_bufs(fd);
 
     if (family == AF_INET) {
         struct sockaddr_in sin;
@@ -672,6 +713,7 @@ udp_open_unconnected(int family, uint16_t listen_port)
                 p = ntohs(s->sin6_port);
             }
             fprintf(stderr, "[udp] bound local %s:%u (fd=%d)\n", abuf, p, fd);
+            g_bound_port = p;
         }
     }
     return fd;
@@ -697,6 +739,155 @@ fmt_sockaddr(const struct sockaddr *sa, char *out, size_t out_len)
     snprintf(out, out_len, "%s:%u", abuf, port);
 }
 
+/* Compare two endpoints by family/addr/port only (sockaddr_storage may
+ * carry uninitialised padding, so memcmp of the whole struct is unsafe). */
+static bool
+sockaddr_same(const struct sockaddr_storage *a, socklen_t alen,
+              const struct sockaddr_storage *b, socklen_t blen)
+{
+    if (alen == 0 || blen == 0 || a->ss_family != b->ss_family) return false;
+    if (a->ss_family == AF_INET) {
+        const struct sockaddr_in *x = (const void *)a, *y = (const void *)b;
+        return x->sin_port == y->sin_port &&
+               x->sin_addr.s_addr == y->sin_addr.s_addr;
+    }
+    if (a->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *x = (const void *)a, *y = (const void *)b;
+        return x->sin6_port == y->sin6_port &&
+               memcmp(&x->sin6_addr, &y->sin6_addr, sizeof(x->sin6_addr)) == 0;
+    }
+    return false;
+}
+
+static void
+peer_tx_close(struct peer_state *peer)
+{
+    if (peer->tx_fd >= 0) close(peer->tx_fd);
+    peer->tx_fd     = -1;
+    peer->tx_ep_len = 0;
+}
+
+/* Return a connected, non-blocking UDP socket for this peer's CURRENT
+ * endpoint (creating or re-connecting it as needed), or -1 if the fast
+ * path is unavailable — caller then falls back to sendto() on the
+ * listener. Re-connect on roaming is just another connect(). */
+static int
+peer_tx_socket(struct peer_state *peer)
+{
+    if (!g_connected_tx || peer->endpoint_len == 0 || g_bound_port == 0)
+        return -1;
+    if (peer->tx_fd >= 0 &&
+        sockaddr_same(&peer->tx_ep, peer->tx_ep_len,
+                      &peer->endpoint, peer->endpoint_len))
+        return peer->tx_fd;
+    if (peer->tx_retry_at && time(NULL) < peer->tx_retry_at)
+        return -1;             /* recent connect() failure: back off */
+
+    int family = peer->endpoint.ss_family;
+    if (peer->tx_fd >= 0 && peer->tx_ep.ss_family != family)
+        peer_tx_close(peer);   /* can't re-connect across families */
+
+    if (peer->tx_fd < 0) {
+        int fd = socket(family, SOCK_DGRAM, 0), one = 1;
+        if (fd < 0) return -1;
+        (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+        (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        (void)setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+        set_sock_bufs(fd);
+        int brc;
+        if (family == AF_INET) {
+            struct sockaddr_in sin;
+            memset(&sin, 0, sizeof(sin));
+            sin.sin_family = AF_INET; sin.sin_addr.s_addr = htonl(INADDR_ANY);
+            sin.sin_port = htons(g_bound_port);
+            brc = bind(fd, (struct sockaddr *)&sin, sizeof(sin));
+        } else {
+            struct sockaddr_in6 sin6;
+            memset(&sin6, 0, sizeof(sin6));
+            sin6.sin6_family = AF_INET6; sin6.sin6_addr = in6addr_any;
+            sin6.sin6_port = htons(g_bound_port);
+            brc = bind(fd, (struct sockaddr *)&sin6, sizeof(sin6));
+        }
+        if (brc < 0) {
+            /* Bind refused (port collision with a non-REUSEPORT socket?) —
+             * disable the fast path globally rather than retry per packet. */
+            perror("[udp] peer tx socket bind (fast path disabled)");
+            g_connected_tx = 0;
+            close(fd);
+            return -1;
+        }
+        (void)fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+        peer->tx_fd = fd;
+    }
+    if (connect(peer->tx_fd, (struct sockaddr *)&peer->endpoint,
+                peer->endpoint_len) < 0) {
+        int e = errno;
+        peer->tx_retry_at = time(NULL) + 10;   /* runs per packet: back off */
+        peer_tx_close(peer);
+        {
+            char addr_s[80];
+            fmt_sockaddr((struct sockaddr *)&peer->endpoint, addr_s, sizeof(addr_s));
+            fprintf(stderr, "[udp] peer tx socket connect %s: %s (sendto for 10s)\n",
+                    addr_s, strerror(e));
+        }
+        return -1;
+    }
+    peer->tx_retry_at = 0;
+    memcpy(&peer->tx_ep, &peer->endpoint, peer->endpoint_len);
+    peer->tx_ep_len = peer->endpoint_len;
+    {
+        char addr_s[80];
+        fmt_sockaddr((struct sockaddr *)&peer->endpoint, addr_s, sizeof(addr_s));
+        fprintf(stderr, "[udp] peer tx socket fd=%d connected to %s\n",
+                peer->tx_fd, addr_s);
+    }
+    return peer->tx_fd;
+}
+
+/* Send one WireGuard datagram to a peer's current endpoint: connected
+ * fast path first, sendto() on the listener as fallback. Returns 0 on
+ * success. Errors are rate-limited to one line per 10 s per peer — this
+ * runs per packet, so a perror() here would be its own DoS. */
+static int
+peer_send(int udp_fd, struct peer_state *peer, const void *buf, size_t len)
+{
+    int fd = peer_tx_socket(peer);
+    if (fd >= 0) {
+        ssize_t n = send(fd, buf, len, 0);
+        if (n == (ssize_t)len) return 0;
+        int e = errno;
+        peer->tx_send_errs++;
+        if (e == EAGAIN || e == EWOULDBLOCK || e == ENOBUFS)
+            return -1;                       /* queue full: drop, like a NIC */
+        if (e == ECONNREFUSED)
+            return -1;                       /* ICMP unreachable from peer: transient */
+        /* Anything else (EADDRNOTAVAIL after a network change, ENETUNREACH,
+         * EHOSTUNREACH, EPIPE, EINVAL ...): the connected socket is stale.
+         * Drop it and fall through to sendto() for this packet; the next
+         * packet rebuilds the fast path. */
+        time_t now = time(NULL);
+        if (now - peer->tx_err_last >= 10) {
+            peer->tx_err_last = now;
+            fprintf(stderr, "[udp] send() on peer tx socket: %s (%llu errs); "
+                            "falling back to sendto\n", strerror(e),
+                    (unsigned long long)peer->tx_send_errs);
+        }
+        peer_tx_close(peer);
+    }
+    if (sendto(udp_fd, buf, len, 0,
+               (struct sockaddr *)&peer->endpoint, peer->endpoint_len)
+        != (ssize_t)len) {
+        int e = errno;
+        time_t now = time(NULL);
+        if (now - peer->tx_err_last >= 10) {
+            peer->tx_err_last = now;
+            fprintf(stderr, "[udp] sendto: %s\n", strerror(e));
+        }
+        return -1;
+    }
+    return 0;
+}
+
 static int send_initiation(int udp_fd, struct peer_state *peer,
                            uint32_t *out_s_idx)
 {
@@ -719,10 +910,8 @@ static int send_initiation(int udp_fd, struct peer_state *peer,
 
     cookie_maker_mac(&peer->cookie, &pkt.m, &pkt, sizeof(pkt) - sizeof(pkt.m));
 
-    if (sendto(udp_fd, &pkt, sizeof(pkt), 0,
-               (struct sockaddr *)&peer->endpoint, peer->endpoint_len)
-        != (ssize_t)sizeof(pkt)) {
-        perror("sendto initiation");
+    if (peer_send(udp_fd, peer, &pkt, sizeof(pkt)) != 0) {
+        fprintf(stderr, "send_initiation: send failed\n");
         return -1;
     }
 
@@ -739,8 +928,30 @@ static int wait_for_response(int udp_fd,
     struct sockaddr_storage from_ss;
     socklen_t from_sl = sizeof(from_ss);
     ssize_t n;
+    int rfd = udp_fd;
 
-    n = recvfrom(udp_fd, buf, sizeof(buf), 0,
+    /* The response arrives on the peer's connected tx socket when one
+     * exists (exact 4-tuple match wins in the kernel), otherwise on the
+     * listener — wait on both. */
+    {
+        fd_set rfds;
+        struct timeval tv = { 3, 0 };
+        int maxfd = udp_fd;
+        FD_ZERO(&rfds);
+        FD_SET(udp_fd, &rfds);
+        if (peer->tx_fd >= 0) {
+            FD_SET(peer->tx_fd, &rfds);
+            if (peer->tx_fd > maxfd) maxfd = peer->tx_fd;
+        }
+        int rc = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+        if (rc <= 0) {
+            if (rc < 0) perror("select");
+            else fprintf(stderr, "[handshake] timeout waiting for response\n");
+            return -1;
+        }
+        if (peer->tx_fd >= 0 && FD_ISSET(peer->tx_fd, &rfds)) rfd = peer->tx_fd;
+    }
+    n = recvfrom(rfd, buf, sizeof(buf), 0,
                  (struct sockaddr *)&from_ss, &from_sl);
     if (n < 0) {
         perror("recvfrom");
@@ -899,12 +1110,8 @@ wg_encap(int udp_fd, struct peer_state *peer,
     memcpy(out, &hdr, sizeof(hdr));
     memcpy(out + sizeof(hdr), m->m_data, (size_t)m->m_len);
 
-    if (sendto(udp_fd, out, out_len, 0,
-               (struct sockaddr *)&peer->endpoint, peer->endpoint_len)
-        != (ssize_t)out_len) {
-        perror("wg_encap: sendto");
+    if (peer_send(udp_fd, peer, out, out_len) != 0)
         goto out;
-    }
     rc = 0;
 out:
     if (m)  m_freem(m);
@@ -1079,7 +1286,8 @@ utun_read(int fd, uint8_t *out, size_t out_cap)
     uint8_t buf[4 + 2048];
     ssize_t n = read(fd, buf, sizeof(buf));
     if (n < 4) {
-        if (n < 0) perror("utun read");
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+            perror("utun read");
         return -1;
     }
     size_t ip_len = (size_t)(n - 4);
@@ -1956,6 +2164,99 @@ runtime_cleanup(void)
     if (g_name_path[0]) (void)unlink(g_name_path);
 }
 
+/* Handle one datagram that arrived on any of our UDP sockets (the shared
+ * listener or a peer's connected tx socket). Split out of run_tunnel so
+ * the loop can drain several sockets in a batch. */
+static void
+rx_handle_datagram(tunnel_ctx *ctx, uint8_t *udp_buf, ssize_t n,
+                   struct sockaddr_storage *from_ss_p, socklen_t from_sl,
+                   uint8_t *inner_buf, size_t inner_cap)
+{
+    struct sockaddr_storage from_ss;
+    memcpy(&from_ss, from_ss_p, sizeof(from_ss));
+    int trace_rx = g_trace_rx < g_trace_cap;
+    if (trace_rx) {
+        char addr_s[80];
+        fmt_sockaddr((struct sockaddr *)&from_ss, addr_s, sizeof(addr_s));
+        g_trace_rx++;
+        fprintf(stderr, "[rx#%d] recvfrom %s len=%zd\n",
+                g_trace_rx, addr_s, n);
+        trace_hex("wire", udp_buf, (size_t)n);
+    }
+    if (n >= 4) {
+        uint32_t t;
+        memcpy(&t, udp_buf, sizeof(t));
+        if (t == WG_PKT_DATA) {
+            struct peer_state *src_peer = NULL;
+            int inner = wg_decap(ctx->local, udp_buf, (size_t)n,
+                                 inner_buf, inner_cap,
+                                 &src_peer);
+            if (inner > 0 && src_peer) {
+                /* Anti-spoofing: the inner src must belong to
+                 * the peer that authenticated the packet. */
+                void *aip_owner = aips_lookup_inner_src(
+                    ctx->aips, inner_buf, (size_t)inner);
+                if (aip_owner != (void *)src_peer) {
+                    src_peer->rx_dropped_aips++;
+                    if (trace_rx) {
+                        fprintf(stderr, "[rx#%d] DROP: inner src not in "
+                                        "this peer's allowed-ips\n",
+                                g_trace_rx);
+                    }
+                    return;
+                }
+                if (trace_rx) {
+                    fprintf(stderr, "[rx#%d] decap OK: %d inner bytes, ver=%u\n",
+                            g_trace_rx, inner, inner_buf[0] >> 4);
+                    trace_hex("plain", inner_buf, (size_t)inner);
+                }
+                if (utun_write(ctx->utun_fd, inner_buf, (size_t)inner) == 0) {
+                    src_peer->rx_pkts++;
+                    src_peer->rx_bytes += (uint64_t)inner;
+                    /* Roaming: update peer endpoint to where this
+                     * authenticated data packet came from. */
+                    memcpy(&src_peer->endpoint, &from_ss, from_sl);
+                    src_peer->endpoint_len = from_sl;
+                } else if (trace_rx) {
+                    fprintf(stderr, "[rx#%d] utun_write FAILED\n", g_trace_rx);
+                }
+            } else if (inner == 0 && src_peer) {
+                if (trace_rx)
+                    fprintf(stderr, "[rx#%d] keepalive (empty inner)\n", g_trace_rx);
+                src_peer->rx_pkts++;
+                memcpy(&src_peer->endpoint, &from_ss, from_sl);
+                src_peer->endpoint_len = from_sl;
+            } else if (trace_rx) {
+                fprintf(stderr, "[rx#%d] decap FAILED\n", g_trace_rx);
+            }
+        } else if (t == WG_PKT_INITIATION) {
+            if (tunnel_consume_initiation(ctx, udp_buf, (size_t)n,
+                                          (struct sockaddr *)&from_ss,
+                                          from_sl) != 0) {
+                fprintf(stderr, "[rx] handshake initiation rejected\n");
+            }
+        } else if (t == WG_PKT_RESPONSE) {
+            if (tunnel_consume_response(ctx, udp_buf, (size_t)n) != 0)
+                fprintf(stderr, "[rx] handshake response rejected\n");
+        } else if (t == WG_PKT_COOKIE) {
+            /* Cookie replies are addressed to a specific peer
+             * (we track which initiation we sent and to whom),
+             * so dispatch to whichever peer is hs_pending. */
+            if ((size_t)n >= sizeof(struct wg_pkt_cookie)) {
+                struct wg_pkt_cookie pkt;
+                memcpy(&pkt, udp_buf, sizeof(pkt));
+                struct peer_state *p = find_peer_pending_response(ctx, pkt.r_idx);
+                if (p && cookie_maker_consume_payload(&p->cookie,
+                                                      pkt.nonce, pkt.ec) == 0)
+                    fprintf(stderr, "[rx] cookie reply consumed for peer\n");
+            }
+        } else {
+            fprintf(stderr, "[rx#%d] unknown pkt type=0x%08x len=%zd\n",
+                    g_trace_rx, (unsigned)le32toh(t), n);
+        }
+    }
+}
+
 static int
 run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
            const char *logical_name,
@@ -2017,6 +2318,14 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
         }
     }
 
+    /* Non-blocking I/O from here on: the loop drains each ready fd in
+     * batches (WG_RX_BATCH / WG_TX_BATCH) instead of one packet per
+     * select() wakeup. Probe mode above relied on blocking recvfrom, which
+     * is why this isn't done at socket-open time. */
+    (void)fcntl(udp_fd,  F_SETFL, fcntl(udp_fd,  F_GETFL, 0) | O_NONBLOCK);
+    (void)fcntl(utun_fd, F_SETFL, fcntl(utun_fd, F_GETFL, 0) | O_NONBLOCK);
+    time_t last_rx_err_log = 0;
+
     printf("[tunnel] entering event loop "
            "(utun_fd=%d, udp_fd=%d, peers=%d, trace_cap=%d)\n",
            utun_fd, udp_fd, ctx.n_peers, g_trace_cap);
@@ -2034,10 +2343,22 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
         int rc;
         time_t now;
 
+        /* RX set = shared listener + every peer's connected tx socket
+         * (the kernel delivers a peer's datagrams to the connected socket
+         * once one exists — see peer_state.tx_fd). */
+        int rx_fds[1 + WG_MAX_PEERS];
+        int n_rx = 0;
+        rx_fds[n_rx++] = udp_fd;
+        for (int i = 0; i < ctx.n_peers && n_rx < (int)(sizeof(rx_fds)/sizeof(rx_fds[0])); i++)
+            if (ctx.peers[i].tx_fd >= 0) rx_fds[n_rx++] = ctx.peers[i].tx_fd;
+
         FD_ZERO(&rfds);
-        FD_SET(udp_fd,  &rfds);
+        maxfd = utun_fd;
         FD_SET(utun_fd, &rfds);
-        maxfd = (udp_fd > utun_fd) ? udp_fd : utun_fd;
+        for (int k = 0; k < n_rx; k++) {
+            FD_SET(rx_fds[k], &rfds);
+            if (rx_fds[k] > maxfd) maxfd = rx_fds[k];
+        }
         if (ctx.status_listen_fd >= 0) {
             FD_SET(ctx.status_listen_fd, &rfds);
             if (ctx.status_listen_fd > maxfd) maxfd = ctx.status_listen_fd;
@@ -2096,10 +2417,12 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
         }
 
         /* ── utun → udp (encap) ─────────────────────────────────────── */
-        if (FD_ISSET(utun_fd, &rfds)) {
+        if (FD_ISSET(utun_fd, &rfds)) for (int b = 0; b < WG_TX_BATCH; b++) {
             int n = utun_read(utun_fd, inner_buf, sizeof(inner_buf));
+            if (n < 0) break;   /* EAGAIN (drained) or error already logged */
             if (n > 0) {
-                if (g_trace_tx < g_trace_cap) {
+                int trace_tx = g_trace_tx < g_trace_cap;
+                if (trace_tx) {
                     g_trace_tx++;
                     fprintf(stderr, "[tx#%d] utun_read %d B, inner IP ver=%u\n",
                             g_trace_tx, n, inner_buf[0] >> 4);
@@ -2116,112 +2439,41 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
                     dst_peer = aips_lookup(&ctx.aips->v6, inner_buf + 24);
 
                 if (!dst_peer) {
-                    if (g_trace_tx <= g_trace_cap)
+                    if (trace_tx)
                         fprintf(stderr, "[tx#%d] DROP: no peer for inner dst\n",
                                 g_trace_tx);
                 } else if (wg_encap(udp_fd, dst_peer, inner_buf, (size_t)n) == 0) {
                     dst_peer->tx_pkts++;
                     dst_peer->tx_bytes += (uint64_t)n;
                     dst_peer->last_authd_tx = now;
-                } else if (g_trace_tx <= g_trace_cap) {
+                } else if (trace_tx) {
                     fprintf(stderr, "[tx#%d] wg_encap FAILED\n", g_trace_tx);
                 }
-            } else if (n < 0 && g_trace_tx < g_trace_cap) {
-                fprintf(stderr, "[tx] utun_read returned %d\n", n);
             }
         }
 
         /* ── udp → utun (decap) ─────────────────────────────────────── */
-        if (FD_ISSET(udp_fd, &rfds)) {
-            struct sockaddr_storage from_ss;
-            socklen_t from_sl = sizeof(from_ss);
-            ssize_t n = recvfrom(udp_fd, udp_buf, sizeof(udp_buf), 0,
-                                 (struct sockaddr *)&from_ss, &from_sl);
-            if (n < 0) {
-                if (errno != EAGAIN && errno != EWOULDBLOCK)
-                    perror("[rx] recvfrom");
-                continue;
-            }
-
-            if (g_trace_rx < g_trace_cap) {
-                char addr_s[80];
-                fmt_sockaddr((struct sockaddr *)&from_ss, addr_s, sizeof(addr_s));
-                g_trace_rx++;
-                fprintf(stderr, "[rx#%d] recvfrom %s len=%zd\n",
-                        g_trace_rx, addr_s, n);
-                trace_hex("wire", udp_buf, (size_t)n);
-            }
-            if (n >= 4) {
-                uint32_t t;
-                memcpy(&t, udp_buf, sizeof(t));
-                if (t == WG_PKT_DATA) {
-                    struct peer_state *src_peer = NULL;
-                    int inner = wg_decap(local, udp_buf, (size_t)n,
-                                         inner_buf, sizeof(inner_buf),
-                                         &src_peer);
-                    if (inner > 0 && src_peer) {
-                        /* Anti-spoofing: the inner src must belong to
-                         * the peer that authenticated the packet. */
-                        void *aip_owner = aips_lookup_inner_src(
-                            ctx.aips, inner_buf, (size_t)inner);
-                        if (aip_owner != (void *)src_peer) {
-                            src_peer->rx_dropped_aips++;
-                            if (g_trace_rx <= g_trace_cap) {
-                                fprintf(stderr, "[rx#%d] DROP: inner src not in "
-                                                "this peer's allowed-ips\n",
-                                        g_trace_rx);
-                            }
-                            continue;
-                        }
-                        if (g_trace_rx <= g_trace_cap) {
-                            fprintf(stderr, "[rx#%d] decap OK: %d inner bytes, ver=%u\n",
-                                    g_trace_rx, inner, inner_buf[0] >> 4);
-                            trace_hex("plain", inner_buf, (size_t)inner);
-                        }
-                        if (utun_write(utun_fd, inner_buf, (size_t)inner) == 0) {
-                            src_peer->rx_pkts++;
-                            src_peer->rx_bytes += (uint64_t)inner;
-                            /* Roaming: update peer endpoint to where this
-                             * authenticated data packet came from. */
-                            memcpy(&src_peer->endpoint, &from_ss, from_sl);
-                            src_peer->endpoint_len = from_sl;
-                        } else if (g_trace_rx <= g_trace_cap) {
-                            fprintf(stderr, "[rx#%d] utun_write FAILED\n", g_trace_rx);
-                        }
-                    } else if (inner == 0 && src_peer) {
-                        if (g_trace_rx <= g_trace_cap)
-                            fprintf(stderr, "[rx#%d] keepalive (empty inner)\n", g_trace_rx);
-                        src_peer->rx_pkts++;
-                        memcpy(&src_peer->endpoint, &from_ss, from_sl);
-                        src_peer->endpoint_len = from_sl;
-                    } else if (g_trace_rx <= g_trace_cap) {
-                        fprintf(stderr, "[rx#%d] decap FAILED\n", g_trace_rx);
+        for (int k = 0; k <= ctx.n_peers; k++) {
+            /* k==0: the shared listener; k>0: peer k-1's connected socket,
+             * read LIVE (the tx path above may have rebuilt it). */
+            int fd = (k == 0) ? udp_fd : ctx.peers[k - 1].tx_fd;
+            if (fd < 0 || fd >= FD_SETSIZE || !FD_ISSET(fd, &rfds)) continue;
+            for (int b = 0; b < WG_RX_BATCH; b++) {
+                struct sockaddr_storage from_ss;
+                socklen_t from_sl = sizeof(from_ss);
+                ssize_t n = recvfrom(fd, udp_buf, sizeof(udp_buf), 0,
+                                     (struct sockaddr *)&from_ss, &from_sl);
+                if (n < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    if (errno == ECONNREFUSED) continue; /* ICMP on a connected socket */
+                    if (now - last_rx_err_log >= 10) {
+                        last_rx_err_log = now;
+                        fprintf(stderr, "[rx] recvfrom fd=%d: %s\n", fd, strerror(errno));
                     }
-                } else if (t == WG_PKT_INITIATION) {
-                    if (tunnel_consume_initiation(&ctx, udp_buf, (size_t)n,
-                                                  (struct sockaddr *)&from_ss,
-                                                  from_sl) != 0) {
-                        fprintf(stderr, "[rx] handshake initiation rejected\n");
-                    }
-                } else if (t == WG_PKT_RESPONSE) {
-                    if (tunnel_consume_response(&ctx, udp_buf, (size_t)n) != 0)
-                        fprintf(stderr, "[rx] handshake response rejected\n");
-                } else if (t == WG_PKT_COOKIE) {
-                    /* Cookie replies are addressed to a specific peer
-                     * (we track which initiation we sent and to whom),
-                     * so dispatch to whichever peer is hs_pending. */
-                    if ((size_t)n >= sizeof(struct wg_pkt_cookie)) {
-                        struct wg_pkt_cookie pkt;
-                        memcpy(&pkt, udp_buf, sizeof(pkt));
-                        struct peer_state *p = find_peer_pending_response(&ctx, pkt.r_idx);
-                        if (p && cookie_maker_consume_payload(&p->cookie,
-                                                              pkt.nonce, pkt.ec) == 0)
-                            fprintf(stderr, "[rx] cookie reply consumed for peer\n");
-                    }
-                } else {
-                    fprintf(stderr, "[rx#%d] unknown pkt type=0x%08x len=%zd\n",
-                            g_trace_rx, (unsigned)le32toh(t), n);
+                    break;
                 }
+                rx_handle_datagram(&ctx, udp_buf, n, &from_ss, from_sl,
+                                   inner_buf, sizeof(inner_buf));
             }
         }
     }
@@ -2308,6 +2560,16 @@ int main(int argc, char *argv[])
     if (load_config(config_path, &cfg) != 0)
         return 1;
 
+    /* WG_CONNECTED_TX=0 → classic sendto()-only data plane (rollback knob;
+     * see peer_state.tx_fd). Parsed here so probe mode honours it too. */
+    {
+        const char *env = getenv("WG_CONNECTED_TX");
+        if (env && atoi(env) == 0) {
+            g_connected_tx = 0;
+            fprintf(stderr, "[udp] WG_CONNECTED_TX=0: per-peer connected tx sockets disabled\n");
+        }
+    }
+
     if (crypto_init() != 0) {
         fprintf(stderr, "crypto_init failed\n");
         return 1;
@@ -2326,6 +2588,7 @@ int main(int argc, char *argv[])
     int any_endpoint = 0;
     for (int i = 0; i < cfg.n_peers; i++) {
         struct peer_state *p = &cfg.peers[i];
+        p->tx_fd = -1;
         p->remote = noise_remote_alloc(local, p, p->pubkey);
         if (!p->remote) {
             fprintf(stderr, "noise_remote_alloc failed for peer #%d\n", i);
@@ -2564,6 +2827,7 @@ out:
     if (checker_inited)
         cookie_checker_free(&checker);
     for (int i = 0; i < cfg.n_peers; i++) {
+        peer_tx_close(&cfg.peers[i]);
         if (cfg.peers[i].cookie_inited)
             cookie_maker_free(&cfg.peers[i].cookie);
         if (cfg.peers[i].remote)
