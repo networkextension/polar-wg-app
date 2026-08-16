@@ -4,6 +4,8 @@
 #include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -23,6 +25,13 @@
 #include <net/if.h>
 #include <net/if_utun.h>
 #include <unistd.h>
+
+/* Packet buffer size. Wire MTU is 1420 by default, but [Interface] MTU can
+ * raise it for jumbo-frame paths (Thunderbolt bridge, 9k LAN), and the
+ * data plane is packet-rate bound, so bigger packets = proportionally more
+ * throughput. 16 KiB covers MTU up to ~16000 + WireGuard framing. */
+#define WG_BUF_MAX  16384
+#define WG_MTU_DEFAULT 1420
 
 #include "macos_stubs/sys/mbuf.h"
 #include "macos_stubs/sys/param.h"
@@ -241,12 +250,22 @@ struct peer_state {
     time_t                   tx_err_last; /* rate-limit for send() error logs */
     time_t                   tx_retry_at; /* don't rebuild the socket before this */
     uint64_t                 tx_send_errs;
+    time_t                   nokp_log_last; /* rate-limit "no current keypair" */
+
+    /* Guards endpoint/endpoint_len and the tx_* socket fields above. The
+     * data plane runs on two threads (TX: utun→udp, main: udp→utun +
+     * handshakes); the main thread updates the endpoint on roaming while
+     * the TX thread reads it in peer_send(). Everything else in this
+     * struct is either single-writer (stats: tx by TX, rx and hs by
+     * main) or immutable after startup. */
+    pthread_mutex_t          lock;
 };
 
 struct client_config {
     /* [Interface] */
     uint8_t  private_key[WG_KEY_LEN];
     uint16_t listen_port;           /* 0 = ephemeral */
+    int      mtu;                   /* utun MTU; 0 = WG_MTU_DEFAULT (1420) */
     struct iface_addr if_addrs[WG_MAX_IFACE_ADDRS];
     int      n_if_addrs;
 
@@ -543,6 +562,14 @@ static int load_config(const char *path, struct client_config *cfg)
                 return -1;
             }
             cfg->listen_port = (uint16_t)lp;
+        } else if (in_interface && strcmp(p, "MTU") == 0) {
+            int m = atoi(eq);
+            if (m < 576 || m > WG_BUF_MAX - 256) {
+                fprintf(stderr, "invalid MTU: %s (576..%d)\n", eq, WG_BUF_MAX - 256);
+                fclose(f);
+                return -1;
+            }
+            cfg->mtu = m;
         } else if (in_interface && strcmp(p, "Address") == 0) {
             if (parse_iface_addrs(eq, cfg) != 0) {
                 fclose(f);
@@ -638,6 +665,14 @@ resolve_endpoint(const char *host, uint16_t port,
 /* Data-plane tuning (see peer_state.tx_fd). WG_CONNECTED_TX=0 disables the
  * per-peer connected send sockets (pure sendto/recvfrom on the listener). */
 static int      g_connected_tx = 1;
+/* WG_TX_THREAD=1 runs utun→udp on its own thread. Measured on macOS 14
+ * (M3 Max, Thunderbolt bridge): with MTU 1420 the split LOSES (TCP 486/414
+ * vs 617/926 Mbit/s single-threaded) because both threads contend on the
+ * same utun and UDP socket locks in the kernel; with MTU 8920 it only
+ * helps the bidirectional case (2.41 vs 2.0 Gbit/s aggregate). Off by
+ * default; the real next step is one I/O thread + parallel AEAD workers. */
+static int      g_tx_thread    = 0;
+static int      g_mtu          = WG_MTU_DEFAULT;
 static uint16_t g_bound_port   = 0;   /* host order; port the listener bound */
 #define WG_RX_BATCH 64   /* max datagrams drained per readable fd per wakeup */
 #define WG_TX_BATCH 64   /* max utun packets drained per wakeup */
@@ -767,10 +802,30 @@ peer_tx_close(struct peer_state *peer)
     peer->tx_ep_len = 0;
 }
 
+/* Roaming update, safe against the TX thread reading the endpoint in
+ * peer_send() (same lock). */
+static void
+peer_set_endpoint(struct peer_state *peer, const struct sockaddr_storage *from,
+                  socklen_t from_len)
+{
+    if (from_len == 0 || from_len > sizeof(peer->endpoint)) return;
+    /* The main thread is the ONLY writer of endpoint, so it can compare
+     * against its own last write without the lock; the lock is only for
+     * making the write atomic w.r.t. the TX thread's snapshot. Common
+     * case (unchanged endpoint) costs nothing. */
+    if (sockaddr_same(&peer->endpoint, peer->endpoint_len, from, from_len))
+        return;
+    pthread_mutex_lock(&peer->lock);
+    memcpy(&peer->endpoint, from, from_len);
+    peer->endpoint_len = from_len;
+    pthread_mutex_unlock(&peer->lock);
+}
+
 /* Return a connected, non-blocking UDP socket for this peer's CURRENT
  * endpoint (creating or re-connecting it as needed), or -1 if the fast
  * path is unavailable — caller then falls back to sendto() on the
- * listener. Re-connect on roaming is just another connect(). */
+ * listener. Re-connect on roaming is just another connect().
+ * Caller holds peer->lock. */
 static int
 peer_tx_socket(struct peer_state *peer)
 {
@@ -846,25 +901,40 @@ peer_tx_socket(struct peer_state *peer)
 
 /* Send one WireGuard datagram to a peer's current endpoint: connected
  * fast path first, sendto() on the listener as fallback. Returns 0 on
- * success. Errors are rate-limited to one line per 10 s per peer — this
- * runs per packet, so a perror() here would be its own DoS. */
+ * success. Called from BOTH threads (TX data path; main thread for
+ * handshakes/keepalives), so peer->lock is taken only around the socket
+ * bookkeeping — never across the send() syscall itself, otherwise the RX
+ * thread's roaming updates would serialise the two threads. Errors are
+ * rate-limited to one line per 10 s per peer — this runs per packet, so
+ * a perror() here would be its own DoS. */
 static int
 peer_send(int udp_fd, struct peer_state *peer, const void *buf, size_t len)
 {
-    int fd = peer_tx_socket(peer);
+    struct sockaddr_storage ep;
+    socklen_t ep_len;
+    int fd;
+
+    pthread_mutex_lock(&peer->lock);
+    fd     = peer_tx_socket(peer);          /* may create/re-connect */
+    ep_len = peer->endpoint_len;
+    if (ep_len) memcpy(&ep, &peer->endpoint, ep_len);
+    pthread_mutex_unlock(&peer->lock);
+
     if (fd >= 0) {
         ssize_t n = send(fd, buf, len, 0);
         if (n == (ssize_t)len) return 0;
         int e = errno;
-        peer->tx_send_errs++;
         if (e == EAGAIN || e == EWOULDBLOCK || e == ENOBUFS)
             return -1;                       /* queue full: drop, like a NIC */
         if (e == ECONNREFUSED)
             return -1;                       /* ICMP unreachable from peer: transient */
         /* Anything else (EADDRNOTAVAIL after a network change, ENETUNREACH,
-         * EHOSTUNREACH, EPIPE, EINVAL ...): the connected socket is stale.
-         * Drop it and fall through to sendto() for this packet; the next
-         * packet rebuilds the fast path. */
+         * EHOSTUNREACH, EPIPE, EINVAL, EBADF if the other thread rebuilt
+         * it ...): the connected socket is stale. Drop it (only if it is
+         * still ours) and fall through to sendto() for this packet; the
+         * next packet rebuilds the fast path. */
+        pthread_mutex_lock(&peer->lock);
+        peer->tx_send_errs++;
         time_t now = time(NULL);
         if (now - peer->tx_err_last >= 10) {
             peer->tx_err_last = now;
@@ -872,10 +942,11 @@ peer_send(int udp_fd, struct peer_state *peer, const void *buf, size_t len)
                             "falling back to sendto\n", strerror(e),
                     (unsigned long long)peer->tx_send_errs);
         }
-        peer_tx_close(peer);
+        if (peer->tx_fd == fd) peer_tx_close(peer);
+        pthread_mutex_unlock(&peer->lock);
     }
-    if (sendto(udp_fd, buf, len, 0,
-               (struct sockaddr *)&peer->endpoint, peer->endpoint_len)
+    if (ep_len == 0) return -1;
+    if (sendto(udp_fd, buf, len, 0, (struct sockaddr *)&ep, ep_len)
         != (ssize_t)len) {
         int e = errno;
         time_t now = time(NULL);
@@ -924,7 +995,7 @@ static int wait_for_response(int udp_fd,
                              struct peer_state *peer,
                              uint32_t expected_local_idx)
 {
-    uint8_t buf[2048];
+    uint8_t buf[WG_BUF_MAX];
     struct sockaddr_storage from_ss;
     socklen_t from_sl = sizeof(from_ss);
     ssize_t n;
@@ -1053,10 +1124,10 @@ wg_encap(int udp_fd, struct peer_state *peer,
     uint64_t nonce;
     uint32_t r_idx;
     struct wg_pkt_data_hdr hdr;
-    uint8_t out[2048];
+    uint8_t out[WG_BUF_MAX];
     size_t padded_len;
     size_t out_len;
-    uint8_t scratch[2048];
+    uint8_t scratch[WG_BUF_MAX];
     int rc = -1;
 
     if (!peer || peer->endpoint_len == 0) {
@@ -1080,7 +1151,13 @@ wg_encap(int udp_fd, struct peer_state *peer,
 
     kp = noise_keypair_current(peer->remote);
     if (!kp) {
-        fprintf(stderr, "wg_encap: no current keypair for peer\n");
+        /* Normal while a peer is down/handshaking; runs per packet, so
+         * log at most once per 10 s per peer. */
+        time_t now = time(NULL);
+        if (now - peer->nokp_log_last >= 10) {
+            peer->nokp_log_last = now;
+            fprintf(stderr, "wg_encap: no current keypair for peer\n");
+        }
         return -1;
     }
     if (noise_keypair_nonce_next(kp, &nonce) != 0) {
@@ -1283,7 +1360,7 @@ utun_open(char ifname[IFNAMSIZ])
 static int
 utun_read(int fd, uint8_t *out, size_t out_cap)
 {
-    uint8_t buf[4 + 2048];
+    uint8_t buf[4 + WG_BUF_MAX];
     ssize_t n = read(fd, buf, sizeof(buf));
     if (n < 4) {
         if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
@@ -1335,8 +1412,8 @@ utun_apply_inet4(const char *ifname, const struct iface_addr *a)
     char cmd[256];
 
     snprintf(cmd, sizeof(cmd),
-             "/sbin/ifconfig %s inet %s %s mtu 1420 up",
-             ifname, a->addr_str, a->addr_str);
+             "/sbin/ifconfig %s inet %s %s mtu %d up",
+             ifname, a->addr_str, a->addr_str, g_mtu);
     if (system(cmd) != 0) {
         fprintf(stderr, "utun_configure: '%s' failed\n", cmd);
         return -1;
@@ -1559,7 +1636,7 @@ utun_configure(const char *ifname, const struct client_config *cfg)
     /* If only v6 was configured, the interface still needs `up`. */
     if (!v4_done) {
         char cmd[64];
-        snprintf(cmd, sizeof(cmd), "/sbin/ifconfig %s mtu 1420 up", ifname);
+        snprintf(cmd, sizeof(cmd), "/sbin/ifconfig %s mtu %d up", ifname, g_mtu);
         (void)system(cmd);
     }
     /* Routes follow AllowedIPs (wg-quick Table=auto), independent of the
@@ -1977,8 +2054,7 @@ tunnel_consume_initiation(tunnel_ctx *ctx,
      * clear it via tunnel_consume_response, or (b) we time out and
      * retransmit — both are harmless because peer already installed a
      * keypair from this initiation we just processed. */
-    memcpy(&peer->endpoint, from, from_len);
-    peer->endpoint_len = from_len;
+    peer_set_endpoint(peer, (const struct sockaddr_storage *)from, from_len);
     peer_stamp_keypair(peer, time(NULL));
     fprintf(stderr, "[hs] responded to incoming initiation, keypair installed\n");
     return 0;
@@ -2164,6 +2240,75 @@ runtime_cleanup(void)
     if (g_name_path[0]) (void)unlink(g_name_path);
 }
 
+/* Encapsulate one plaintext IP packet read from utun and send it to the
+ * peer that owns its destination (cryptokey routing). Called from the TX
+ * thread (or the main loop when WG_TX_THREAD=0). Touches only: the
+ * read-only aips trie, noise (thread-safe), peer_send() (peer->lock),
+ * and the TX-owned stats/last_authd_tx of the peer. */
+static void
+tx_handle_packet(tunnel_ctx *ctx, uint8_t *inner_buf, int n, time_t now)
+{
+    int trace_tx = g_trace_tx < g_trace_cap;
+    if (trace_tx) {
+        g_trace_tx++;
+        fprintf(stderr, "[tx#%d] utun_read %d B, inner IP ver=%u\n",
+                g_trace_tx, n, inner_buf[0] >> 4);
+        trace_hex("plain", inner_buf, (size_t)n);
+    }
+    struct peer_state *dst_peer = NULL;
+    int ver = inner_buf[0] >> 4;
+    if (ver == 4 && n >= 20)
+        dst_peer = aips_lookup(&ctx->aips->v4, inner_buf + 16);
+    else if (ver == 6 && n >= 40)
+        dst_peer = aips_lookup(&ctx->aips->v6, inner_buf + 24);
+
+    if (!dst_peer) {
+        if (trace_tx)
+            fprintf(stderr, "[tx#%d] DROP: no peer for inner dst\n", g_trace_tx);
+    } else if (wg_encap(ctx->udp_fd, dst_peer, inner_buf, (size_t)n) == 0) {
+        dst_peer->tx_pkts++;
+        dst_peer->tx_bytes += (uint64_t)n;
+        dst_peer->last_authd_tx = now;
+    } else if (trace_tx) {
+        fprintf(stderr, "[tx#%d] wg_encap FAILED\n", g_trace_tx);
+    }
+}
+
+/* TX thread: block in poll() on utun, then drain it, encrypting and
+ * sending each packet. Independent of the main (RX/handshake) thread so
+ * the two directions use two cores; the only shared mutable state is
+ * peer->endpoint / tx socket (peer->lock) and noise keypairs (own locks +
+ * atomic refcounts). Exits when sig_quit is set (poll wakes every 1 s). */
+static void *
+tx_thread_main(void *arg)
+{
+    tunnel_ctx *ctx = arg;
+    uint8_t inner_buf[WG_BUF_MAX];
+    struct pollfd pfd = { .fd = ctx->utun_fd, .events = POLLIN };
+    while (!sig_quit) {
+        int rc = poll(&pfd, 1, 1000);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            perror("[tx] poll");
+            break;
+        }
+        if (rc == 0 || !(pfd.revents & POLLIN)) {
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                fprintf(stderr, "[tx] utun poll revents=0x%x, exiting\n", pfd.revents);
+                break;
+            }
+            continue;
+        }
+        time_t now = time(NULL);
+        for (int b = 0; b < 4096; b++) {           /* drain, but re-poll periodically */
+            int n = utun_read(ctx->utun_fd, inner_buf, sizeof(inner_buf));
+            if (n < 0) break;
+            if (n > 0) tx_handle_packet(ctx, inner_buf, n, now);
+        }
+    }
+    return NULL;
+}
+
 /* Handle one datagram that arrived on any of our UDP sockets (the shared
  * listener or a peer's connected tx socket). Split out of run_tunnel so
  * the loop can drain several sockets in a batch. */
@@ -2215,8 +2360,7 @@ rx_handle_datagram(tunnel_ctx *ctx, uint8_t *udp_buf, ssize_t n,
                     src_peer->rx_bytes += (uint64_t)inner;
                     /* Roaming: update peer endpoint to where this
                      * authenticated data packet came from. */
-                    memcpy(&src_peer->endpoint, &from_ss, from_sl);
-                    src_peer->endpoint_len = from_sl;
+                    peer_set_endpoint(src_peer, &from_ss, from_sl);
                 } else if (trace_rx) {
                     fprintf(stderr, "[rx#%d] utun_write FAILED\n", g_trace_rx);
                 }
@@ -2224,8 +2368,7 @@ rx_handle_datagram(tunnel_ctx *ctx, uint8_t *udp_buf, ssize_t n,
                 if (trace_rx)
                     fprintf(stderr, "[rx#%d] keepalive (empty inner)\n", g_trace_rx);
                 src_peer->rx_pkts++;
-                memcpy(&src_peer->endpoint, &from_ss, from_sl);
-                src_peer->endpoint_len = from_sl;
+                peer_set_endpoint(src_peer, &from_ss, from_sl);
             } else if (trace_rx) {
                 fprintf(stderr, "[rx#%d] decap FAILED\n", g_trace_rx);
             }
@@ -2265,8 +2408,8 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
            struct peer_state *peers, int n_peers)
 {
     tunnel_ctx ctx;
-    uint8_t udp_buf[2048];
-    uint8_t inner_buf[2048];
+    uint8_t udp_buf[WG_BUF_MAX];
+    uint8_t inner_buf[WG_BUF_MAX];
     time_t last_stats;
 
     memset(&ctx, 0, sizeof(ctx));
@@ -2326,6 +2469,18 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
     (void)fcntl(utun_fd, F_SETFL, fcntl(utun_fd, F_GETFL, 0) | O_NONBLOCK);
     time_t last_rx_err_log = 0;
 
+    pthread_t tx_thr;
+    int tx_thr_started = 0;
+    if (g_tx_thread) {
+        if (pthread_create(&tx_thr, NULL, tx_thread_main, &ctx) == 0) {
+            tx_thr_started = 1;
+            fprintf(stderr, "[tunnel] TX thread started (utun→udp); main thread does udp→utun + handshakes\n");
+        } else {
+            perror("[tunnel] pthread_create(tx); falling back to single-threaded loop");
+            g_tx_thread = 0;
+        }
+    }
+
     printf("[tunnel] entering event loop "
            "(utun_fd=%d, udp_fd=%d, peers=%d, trace_cap=%d)\n",
            utun_fd, udp_fd, ctx.n_peers, g_trace_cap);
@@ -2349,12 +2504,16 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
         int rx_fds[1 + WG_MAX_PEERS];
         int n_rx = 0;
         rx_fds[n_rx++] = udp_fd;
-        for (int i = 0; i < ctx.n_peers && n_rx < (int)(sizeof(rx_fds)/sizeof(rx_fds[0])); i++)
-            if (ctx.peers[i].tx_fd >= 0) rx_fds[n_rx++] = ctx.peers[i].tx_fd;
+        for (int i = 0; i < ctx.n_peers && n_rx < (int)(sizeof(rx_fds)/sizeof(rx_fds[0])); i++) {
+            pthread_mutex_lock(&ctx.peers[i].lock);
+            int fd = ctx.peers[i].tx_fd;
+            pthread_mutex_unlock(&ctx.peers[i].lock);
+            if (fd >= 0) rx_fds[n_rx++] = fd;
+        }
 
         FD_ZERO(&rfds);
-        maxfd = utun_fd;
-        FD_SET(utun_fd, &rfds);
+        maxfd = udp_fd;
+        if (!g_tx_thread) { FD_SET(utun_fd, &rfds); if (utun_fd > maxfd) maxfd = utun_fd; }
         for (int k = 0; k < n_rx; k++) {
             FD_SET(rx_fds[k], &rfds);
             if (rx_fds[k] > maxfd) maxfd = rx_fds[k];
@@ -2368,7 +2527,7 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
         tv.tv_usec = 0;
         rc = select(maxfd + 1, &rfds, NULL, NULL, &tv);
         if (rc < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == EBADF) continue; /* EBADF: tx socket rebuilt under us */
             perror("select");
             return -1;
         }
@@ -2416,47 +2575,21 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
             continue;
         }
 
-        /* ── utun → udp (encap) ─────────────────────────────────────── */
-        if (FD_ISSET(utun_fd, &rfds)) for (int b = 0; b < WG_TX_BATCH; b++) {
-            int n = utun_read(utun_fd, inner_buf, sizeof(inner_buf));
-            if (n < 0) break;   /* EAGAIN (drained) or error already logged */
-            if (n > 0) {
-                int trace_tx = g_trace_tx < g_trace_cap;
-                if (trace_tx) {
-                    g_trace_tx++;
-                    fprintf(stderr, "[tx#%d] utun_read %d B, inner IP ver=%u\n",
-                            g_trace_tx, n, inner_buf[0] >> 4);
-                    trace_hex("plain", inner_buf, (size_t)n);
-                }
-                /* Cryptokey routing: look up the inner DST IP in the
-                 * shared allowedips trie to pick which peer this packet
-                 * belongs to. NULL means no peer owns this destination. */
-                struct peer_state *dst_peer = NULL;
-                int ver = inner_buf[0] >> 4;
-                if (ver == 4 && n >= 20)
-                    dst_peer = aips_lookup(&ctx.aips->v4, inner_buf + 16);
-                else if (ver == 6 && n >= 40)
-                    dst_peer = aips_lookup(&ctx.aips->v6, inner_buf + 24);
-
-                if (!dst_peer) {
-                    if (trace_tx)
-                        fprintf(stderr, "[tx#%d] DROP: no peer for inner dst\n",
-                                g_trace_tx);
-                } else if (wg_encap(udp_fd, dst_peer, inner_buf, (size_t)n) == 0) {
-                    dst_peer->tx_pkts++;
-                    dst_peer->tx_bytes += (uint64_t)n;
-                    dst_peer->last_authd_tx = now;
-                } else if (trace_tx) {
-                    fprintf(stderr, "[tx#%d] wg_encap FAILED\n", g_trace_tx);
-                }
+        /* ── utun → udp (encap) — only when running single-threaded ──── */
+        if (!g_tx_thread && FD_ISSET(utun_fd, &rfds))
+            for (int b = 0; b < WG_TX_BATCH; b++) {
+                int n = utun_read(utun_fd, inner_buf, sizeof(inner_buf));
+                if (n < 0) break;   /* EAGAIN (drained) or error already logged */
+                if (n > 0) tx_handle_packet(&ctx, inner_buf, n, now);
             }
-        }
 
         /* ── udp → utun (decap) ─────────────────────────────────────── */
-        for (int k = 0; k <= ctx.n_peers; k++) {
-            /* k==0: the shared listener; k>0: peer k-1's connected socket,
-             * read LIVE (the tx path above may have rebuilt it). */
-            int fd = (k == 0) ? udp_fd : ctx.peers[k - 1].tx_fd;
+        for (int k = 0; k < n_rx; k++) {
+            /* The snapshot taken before select(). A peer socket the TX
+             * thread closed meanwhile yields EBADF/EAGAIN below (harmless);
+             * whichever fd a datagram arrives on, rx_handle_datagram()
+             * attributes it by crypto, not by socket. */
+            int fd = rx_fds[k];
             if (fd < 0 || fd >= FD_SETSIZE || !FD_ISSET(fd, &rfds)) continue;
             for (int b = 0; b < WG_RX_BATCH; b++) {
                 struct sockaddr_storage from_ss;
@@ -2464,7 +2597,7 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
                 ssize_t n = recvfrom(fd, udp_buf, sizeof(udp_buf), 0,
                                      (struct sockaddr *)&from_ss, &from_sl);
                 if (n < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EBADF) break;
                     if (errno == ECONNREFUSED) continue; /* ICMP on a connected socket */
                     if (now - last_rx_err_log >= 10) {
                         last_rx_err_log = now;
@@ -2478,6 +2611,10 @@ run_tunnel(int udp_fd, int utun_fd, const char *utun_name,
         }
     }
 
+    if (tx_thr_started) {
+        sig_quit = 1;                 /* also covers the error-return paths above */
+        pthread_join(tx_thr, NULL);
+    }
     if (ctx.status_listen_fd >= 0)
         close(ctx.status_listen_fd);
 
@@ -2559,6 +2696,10 @@ int main(int argc, char *argv[])
 
     if (load_config(config_path, &cfg) != 0)
         return 1;
+    if (cfg.mtu > 0) {
+        g_mtu = cfg.mtu;
+        fprintf(stderr, "[tunnel] MTU %d (from config)\n", g_mtu);
+    }
 
     /* WG_CONNECTED_TX=0 → classic sendto()-only data plane (rollback knob;
      * see peer_state.tx_fd). Parsed here so probe mode honours it too. */
@@ -2567,6 +2708,11 @@ int main(int argc, char *argv[])
         if (env && atoi(env) == 0) {
             g_connected_tx = 0;
             fprintf(stderr, "[udp] WG_CONNECTED_TX=0: per-peer connected tx sockets disabled\n");
+        }
+        env = getenv("WG_TX_THREAD");
+        if (env && atoi(env) == 1) {
+            g_tx_thread = 1;
+            fprintf(stderr, "[tunnel] WG_TX_THREAD=1: utun→udp on a separate thread\n");
         }
     }
 
@@ -2589,6 +2735,7 @@ int main(int argc, char *argv[])
     for (int i = 0; i < cfg.n_peers; i++) {
         struct peer_state *p = &cfg.peers[i];
         p->tx_fd = -1;
+        pthread_mutex_init(&p->lock, NULL);
         p->remote = noise_remote_alloc(local, p, p->pubkey);
         if (!p->remote) {
             fprintf(stderr, "noise_remote_alloc failed for peer #%d\n", i);
