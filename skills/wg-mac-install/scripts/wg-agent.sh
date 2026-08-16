@@ -174,7 +174,7 @@ lines = ["[Interface]", f"PrivateKey = {priv}",
 ka = resp.get("keepalive_sec", 25)
 for p in resp.get("peers", []):
     if not p.get("pubkey"): continue
-    aips = ([p["wg_ip"] + "/32"] if p.get("wg_ip") else []) + (p.get("allowed_extra") or [])
+    aips = ([p["wg_ip"] if "/" in p["wg_ip"] else p["wg_ip"] + "/32"] if p.get("wg_ip") else []) + (p.get("allowed_extra") or [])
     if not aips: continue
     lines += ["[Peer]", f"PublicKey  = {p['pubkey']}"]
     if p.get("endpoint"): lines += [f"Endpoint   = {p['endpoint']}"]
