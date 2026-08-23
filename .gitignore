@@ -37,3 +37,22 @@ config/
 .build/
 build-x86/
 build-uni/
+
+# Release bundles / APKs (make-bundle.sh, gradle release output)
+dist/
+WireGuardAndroid/app/release/
+
+# Local scratch scripts (session resumes, ad-hoc tunnel test loops)
+newhub.sh
+resume.sh
+test.script.sh
+update_test.sh
+src/script.sh
+src/stop.sh
+src/wg_client.c
+src/wg_client2.c
+doc/test.md
+
+# Ad-hoc peer test scripts that embed literal private keys
+src/test-go.sh
+src/test-go2.sh
