@@ -33,6 +33,11 @@
 #   5. POST <server>/v1/register
 #   6. render /etc/wireguard/<iface>.conf + /etc/wgctl/<iface>.json
 #   7. bootstrap ONLY this iface's launchd daemon
+#
+# Base system only — no python3. /usr/bin/python3 is a Command Line Tools
+# *stub*: on a Mac without Xcode CLT it prints "No developer tools were
+# found" and exits non-zero, which made this script unrunnable on a stock
+# macOS install. JSON is read with plutil(1) and written with printf.
 
 set -euo pipefail
 
@@ -72,9 +77,11 @@ if [[ -z "$HOST_ID" ]]; then
         [[ -n "$HOST_ID" ]] && { echo "==> using host_id from $cfg"; break; }
     done
 fi
+HOST_ID=$(printf '%s' "$HOST_ID" | tr -d '[:space:]')
 
 [[ $EUID -eq 0 ]] || { echo "must run as root (use sudo bash)" >&2; exit 1; }
 [[ -n "$TOKEN" ]] || { echo "--token=<TOKEN> required" >&2; exit 1; }
+[[ "$WG_LISTEN" =~ ^[0-9]+$ ]] || { echo "--listen must be a port number" >&2; exit 1; }
 [[ "$SERVER" != "__SERVER_PLACEHOLDER__" ]] || {
     echo "SERVER not set; this script must be served by control plane with __SERVER_PLACEHOLDER__ substituted, OR call with --server=https://..." >&2
     exit 1
@@ -103,29 +110,47 @@ TS
         ;;
 esac
 
+# ── JSON helpers (plutil + printf; no python) ────────────────────────────────
+# plutil parses JSON natively and ships in the macOS base system.
+#   jget   FILE KEYPATH → scalar at KEYPATH; "" when absent or JSON null
+#   jcount FILE KEYPATH → element count of an array/dict; 0 when absent
+#   json_esc STR        → STR escaped for use inside a JSON string literal
+# `plutil -extract <array> raw` prints the element count, which is how jcount
+# gets a length without a second parser.
+# Gate on plutil's exit status, never on its output: macOS 14's plutil prints
+# "Could not extract value ..." to *stdout* (macOS 26+ uses stderr), so a
+# missing key would otherwise be substituted into the conf as if it were data.
+jget() {
+    local v
+    v=$(plutil -extract "$2" raw -o - -- "$1" 2>/dev/null) || return 0
+    printf '%s' "$v"
+}
+jcount() {
+    local v
+    v=$(plutil -extract "$2" raw -o - -- "$1" 2>/dev/null) || { printf 0; return 0; }
+    case "$v" in ""|*[!0-9]*) printf 0;; *) printf '%s' "$v";; esac
+}
+json_esc() { printf '%s' "$1" | tr -d '[:cntrl:]' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+# A JSON string literal, or bare null when the value is empty (matches what
+# json.dumps(None) used to write into the state file).
+json_str_or_null() {
+    if [[ -n "$1" ]]; then printf '"%s"' "$(json_esc "$1")"; else printf 'null'; fi
+}
+
 # ── 0. identity: is this token already registered on this host? ───────────────
 # A token is single-use. If we already hold a state file carrying it, this is
 # a re-run (a bug), not a fresh join. Refuse — don't re-consume the token.
 # Also handles the legacy single-file /etc/wgctl/config.json.
 mkdir -p /etc/wgctl && chmod 0700 /etc/wgctl
 TOKEN_IFACE=""
-if compgen -G "/etc/wgctl/*.json" >/dev/null 2>&1; then
-    TOKEN_IFACE=$(TOKEN="$TOKEN" python3 - <<'PY'
-import glob, json, os
-tok = os.environ["TOKEN"]
-for path in sorted(glob.glob("/etc/wgctl/*.json")):
-    try:
-        st = json.load(open(path))
-    except Exception:
-        continue
-    if st.get("token") == tok:
-        # logical iface name = state's "iface" field, else the filename stem
-        name = st.get("iface") or os.path.basename(path)[:-5]
-        print(name)
-        break
-PY
-)
-fi
+for st in /etc/wgctl/*.json; do
+    [[ -f "$st" ]] || continue                      # unmatched glob
+    [[ "$(jget "$st" token)" == "$TOKEN" ]] || continue
+    # logical iface name = state's "iface" field, else the filename stem
+    TOKEN_IFACE=$(jget "$st" iface)
+    [[ -n "$TOKEN_IFACE" ]] || TOKEN_IFACE=$(basename "$st" .json)
+    break
+done
 
 if [[ -n "$TOKEN_IFACE" && $REINSTALL -eq 0 ]]; then
     cat >&2 <<MSG
@@ -206,23 +231,23 @@ PUB=$(echo "$PRIV" | /usr/local/bin/wgctl pubkey)
 # ── 5. collect lan_addrs ─────────────────────────────────────────────────────
 HOSTNAME_REPORT="${HOSTNAME_OVERRIDE:-$(scutil --get LocalHostName 2>/dev/null || hostname -s)}"
 
-LAN_ADDRS_JSON=$(python3 <<'PY'
-import json, subprocess, re
-out = subprocess.run(["ifconfig"], check=True, capture_output=True, text=True).stdout
-addrs, cur_iface = [], None
-for line in out.splitlines():
-    m = re.match(r"^([a-z][a-z0-9]+):", line)
-    if m: cur_iface = m.group(1); continue
-    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+) netmask 0x([0-9a-f]+)", line)
-    if not m: continue
-    ip, mask_hex = m.group(1), m.group(2)
-    if ip.startswith("127.") or ip.startswith("169.254.") or ip.startswith("10.88."): continue
-    mask = int(mask_hex, 16)
-    prefix = bin(mask).count("1")
-    addrs.append({"iface": cur_iface, "cidr": f"{ip}/{prefix}"})
-print(json.dumps(addrs))
-PY
-)
+# Skip loopback, link-local and our own mesh subnet — reporting 10.88.x back
+# as a LAN would confuse server-side site detection. The netmask arrives as
+# hex (0xffffff00), so the prefix length is a per-nibble popcount.
+LAN_ADDRS_JSON=$(ifconfig | LC_ALL=C awk '
+    BEGIN { split("0 1 1 2 1 2 2 3 1 2 2 3 2 3 3 4", pc); hex = "0123456789abcdef" }
+    /^[a-z][a-z0-9]*:/ { iface = substr($1, 1, length($1) - 1); next }
+    $1 == "inet" && $3 == "netmask" {
+        ip = $2; mask = $4
+        if (ip ~ /^127\./ || ip ~ /^169\.254\./ || ip ~ /^10\.88\./) next
+        sub(/^0[xX]/, "", mask)
+        bits = 0
+        for (k = 1; k <= length(mask); k++)
+            bits += pc[index(hex, tolower(substr(mask, k, 1)))]
+        out = out (out == "" ? "" : ",") \
+              "{\"iface\":\"" iface "\",\"cidr\":\"" ip "/" bits "\"}"
+    }
+    END { print "[" out "]" }')
 
 AGENT_VER=$(cat "$TMP/wg-mac/VERSION" 2>/dev/null || echo "unknown")
 
@@ -236,98 +261,108 @@ esac
 # ── 6. POST /v1/register ─────────────────────────────────────────────────────
 echo "==> registering with control plane $SERVER"
 
-REQ_JSON=$(TOKEN="$TOKEN" PUB="$PUB" HOSTNAME_REPORT="$HOSTNAME_REPORT" \
-    ARCH="$ARCH" AGENT_VER="$AGENT_VER" LAN="$LAN_ADDRS_JSON" \
-    WG_LISTEN="$WG_LISTEN" SITE_SLUG="$SITE_SLUG" HOST_ID="$HOST_ID" python3 <<'PY'
-import json, os
-body = {
-    "token":     os.environ["TOKEN"],
-    "pubkey":    os.environ["PUB"],
-    "hostname":  os.environ["HOSTNAME_REPORT"],
-    "os":        "darwin",
-    "arch":      os.environ["ARCH"],
-    "agent_ver": os.environ["AGENT_VER"],
-    "lan_addrs": json.loads(os.environ["LAN"]),
-    "wg_listen": int(os.environ["WG_LISTEN"]),
-    "site_slug": os.environ["SITE_SLUG"],
-}
-hid = os.environ.get("HOST_ID", "").strip()
-if hid:
-    body["host_id"] = hid  # cross-link to polar-hosts; server stamps wg_devices.host_id
-print(json.dumps(body))
-PY
-)
+# host_id cross-links to polar-hosts; the server stamps wg_devices.host_id.
+HOST_ID_FIELD=""
+if [[ -n "$HOST_ID" ]]; then
+    HOST_ID_FIELD=$(printf ',"host_id":"%s"' "$(json_esc "$HOST_ID")")
+fi
 
-RESP=$(curl -fsSL --retry 3 --connect-timeout 15 --max-time 60 \
+REQ_JSON=$(printf '{"token":"%s","pubkey":"%s","hostname":"%s","os":"darwin","arch":"%s","agent_ver":"%s","lan_addrs":%s,"wg_listen":%d,"site_slug":"%s"%s}' \
+    "$(json_esc "$TOKEN")" "$(json_esc "$PUB")" "$(json_esc "$HOSTNAME_REPORT")" \
+    "$(json_esc "$ARCH")" "$(json_esc "$AGENT_VER")" "$LAN_ADDRS_JSON" \
+    "$WG_LISTEN" "$(json_esc "$SITE_SLUG")" "$HOST_ID_FIELD")
+
+# Body to a file (plutil reads it below) and the status separately, so a
+# rejected token shows the server's reason instead of a bare curl exit code.
+RESP_FILE="$TMP/register.json"
+HTTP=$(curl -sS --retry 3 --connect-timeout 15 --max-time 60 \
     -X POST "$SERVER/v1/register" \
     -H 'Content-Type: application/json' \
-    -d "$REQ_JSON") || {
-    echo "register failed (curl exit $?); response:" >&2
-    echo "$RESP" >&2
+    -d "$REQ_JSON" -o "$RESP_FILE" -w '%{http_code}') || HTTP=000
+if [[ ! "$HTTP" =~ ^2[0-9][0-9]$ ]]; then
+    echo "✗ register failed (HTTP $HTTP)" >&2
+    head -c 500 "$RESP_FILE" 2>/dev/null >&2; echo >&2
     exit 1
-}
+fi
 
 # ── 7. render conf + per-iface state ──────────────────────────────────────────
 echo "==> rendering /etc/wireguard/$IFACE.conf and $STATE_FILE"
 
-PRIV="$PRIV" IFACE="$IFACE" LISTEN="$WG_LISTEN" RESP="$RESP" \
-SERVER="$SERVER" TOKEN="$TOKEN" python3 <<'PY'
-import json, os, tempfile
-
-resp   = json.loads(os.environ["RESP"])
-priv   = os.environ["PRIV"]
-iface  = os.environ["IFACE"]
-listen = os.environ["LISTEN"]
+DEVICE_IP=$(jget "$RESP_FILE" device_ip)
+DEVICE_ID=$(jget "$RESP_FILE" device_id)
+if [[ -z "$DEVICE_IP" || -z "$DEVICE_ID" ]]; then
+    echo "✗ register response missing device_ip/device_id:" >&2
+    head -c 500 "$RESP_FILE" >&2; echo >&2
+    exit 1
+fi
+MESH_CIDR=$(jget "$RESP_FILE" mesh_cidr)
+[[ -n "$MESH_CIDR" ]] || MESH_CIDR="10.88.0.0/24"
+MESH_PREFIX="${MESH_CIDR##*/}"          # Address needs the mesh prefix, not /32
+KEEPALIVE=$(jget "$RESP_FILE" keepalive_sec)
+[[ -n "$KEEPALIVE" ]] || KEEPALIVE=25
 
 # <iface>.conf — Address carries the mesh prefix (not /32) so wg_core installs
 # the kernel route (see src/wg_core.c utun_apply_inet4). Default /24.
-conf_path = f"/etc/wireguard/{iface}.conf"
-mesh_prefix = (resp.get("mesh_cidr") or "10.88.0.0/24").split("/")[-1]
-lines = [
-    "[Interface]",
-    f"PrivateKey = {priv}",
-    f"Address    = {resp['device_ip']}/{mesh_prefix}",
-    f"ListenPort = {listen}",
-    "",
-]
-for p in resp["peers"]:
-    extras = p.get("allowed_extra", []) or []
-    aips = ([p["wg_ip"] if "/" in p["wg_ip"] else p["wg_ip"] + "/32"] if p.get("wg_ip") else []) + extras
-    lines += [
-        "[Peer]",
-        f"PublicKey  = {p['pubkey']}",
-        f"Endpoint   = {p['endpoint']}",
-        f"AllowedIPs = {', '.join(aips)}",
-        f"PersistentKeepalive = {resp.get('keepalive_sec', 25)}",
-        "",
-    ]
-with tempfile.NamedTemporaryFile("w", dir="/etc/wireguard",
-                                  delete=False, prefix=f".{iface}.conf.") as f:
-    f.write("\n".join(lines))
-    tmp = f.name
-os.chmod(tmp, 0o600)
-os.replace(tmp, conf_path)
+CONF_TMP=$(mktemp "/etc/wireguard/.$IFACE.conf.XXXXXX")
+{
+    echo "[Interface]"
+    echo "PrivateKey = $PRIV"
+    echo "Address    = $DEVICE_IP/$MESH_PREFIX"
+    echo "ListenPort = $WG_LISTEN"
+    NPEERS=$(jcount "$RESP_FILE" peers)
+    p=0
+    while [[ $p -lt $NPEERS ]]; do
+        PUBKEY=$(jget "$RESP_FILE" "peers.$p.pubkey")
+        if [[ -z "$PUBKEY" ]]; then p=$((p + 1)); continue; fi
+        WGIP=$(jget "$RESP_FILE" "peers.$p.wg_ip")
+        AIPS=""
+        if [[ -n "$WGIP" ]]; then
+            case "$WGIP" in */*) AIPS="$WGIP";; *) AIPS="$WGIP/32";; esac
+        fi
+        NEXTRA=$(jcount "$RESP_FILE" "peers.$p.allowed_extra")
+        e=0
+        while [[ $e -lt $NEXTRA ]]; do
+            EXTRA=$(jget "$RESP_FILE" "peers.$p.allowed_extra.$e")
+            if [[ -n "$EXTRA" ]]; then AIPS="${AIPS:+$AIPS, }$EXTRA"; fi
+            e=$((e + 1))
+        done
+        # A peer with no AllowedIPs would be a no-op route; skip it rather than
+        # emit a half-formed stanza. Same rules as wgctl-agent's re-render —
+        # if the two disagree the agent rewrites this conf and kickstarts the
+        # tunnel on every tick.
+        if [[ -z "$AIPS" ]]; then p=$((p + 1)); continue; fi
+        echo ""
+        echo "[Peer]"
+        echo "PublicKey  = $PUBKEY"
+        ENDPOINT=$(jget "$RESP_FILE" "peers.$p.endpoint")
+        if [[ -n "$ENDPOINT" ]]; then echo "Endpoint   = $ENDPOINT"; fi
+        echo "AllowedIPs = $AIPS"
+        if [[ "$KEEPALIVE" != "0" ]]; then echo "PersistentKeepalive = $KEEPALIVE"; fi
+        p=$((p + 1))
+    done
+} > "$CONF_TMP"
+chmod 0600 "$CONF_TMP"
+mv -f "$CONF_TMP" "/etc/wireguard/$IFACE.conf"
 
 # /etc/wgctl/<iface>.json — per-iface state (one file per membership).
-state = {
-    "server":        os.environ["SERVER"],
-    "device_id":     resp["device_id"],
-    "token":         os.environ["TOKEN"],
-    "wg_ip":         resp["device_ip"],
-    "site_id":       resp.get("site_id"),
-    "iface":         iface,
-    "wg_listen":     int(listen),
-    "role":          resp.get("role", "device"),
-    "token_expires": resp.get("token_expires"),
+ROLE=$(jget "$RESP_FILE" role)
+[[ -n "$ROLE" ]] || ROLE=device
+STATE_TMP=$(mktemp /etc/wgctl/.state.XXXXXX)
+cat > "$STATE_TMP" <<EOF
+{
+  "server": "$(json_esc "$SERVER")",
+  "device_id": "$(json_esc "$DEVICE_ID")",
+  "token": "$(json_esc "$TOKEN")",
+  "wg_ip": "$(json_esc "$DEVICE_IP")",
+  "site_id": $(json_str_or_null "$(jget "$RESP_FILE" site_id)"),
+  "iface": "$(json_esc "$IFACE")",
+  "wg_listen": $WG_LISTEN,
+  "role": "$(json_esc "$ROLE")",
+  "token_expires": $(json_str_or_null "$(jget "$RESP_FILE" token_expires)")
 }
-state_path = f"/etc/wgctl/{iface}.json"
-with tempfile.NamedTemporaryFile("w", dir="/etc/wgctl",
-                                  delete=False, prefix=".state.") as f:
-    json.dump(state, f, indent=2)
-    tmp = f.name
-os.chmod(tmp, 0o600)
-os.replace(tmp, state_path)
-PY
+EOF
+chmod 0600 "$STATE_TMP"
+mv -f "$STATE_TMP" "$STATE_FILE"
 
 # ── 8. bootstrap ONLY this iface's launchd daemon ─────────────────────────────
 # Fresh iface → bootstrap is additive (other live tunnels untouched).
@@ -349,7 +384,7 @@ fi
 
 # ── 9. summary ────────────────────────────────────────────────────────────────
 sleep 1
-WG_IP=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['wg_ip'])")
+WG_IP=$(jget "$STATE_FILE" wg_ip)
 cat <<DONE
 
   ✓ joined mesh

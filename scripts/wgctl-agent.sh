@@ -19,6 +19,11 @@
 # wg_core keeps running with the last good peer list. Only an explicit
 # auth-rejected response triggers eviction.
 #
+# Base system only — no python3. /usr/bin/python3 is a Command Line Tools
+# *stub* that fails on a Mac without Xcode CLT, which used to leave such a
+# host joined but never reconciling. JSON is read with plutil(1), written
+# with printf, and `wgctl show` is parsed with awk.
+#
 # Run: /usr/local/sbin/wgctl-agent
 # Logs: /var/log/wgctl-agent.log
 
@@ -50,6 +55,49 @@ die() {
 }
 
 [[ $EUID -eq 0 ]] || die "must run as root"
+
+# ── JSON helpers (plutil + printf; no python) ────────────────────────────────
+# plutil parses JSON natively and ships in the macOS base system. Keep these
+# byte-identical to the copies in scripts/join.sh — the two render the same
+# conf, and any drift makes the agent rewrite (and restart) a tunnel that
+# join.sh just wrote.
+#   jget   FILE KEYPATH → scalar at KEYPATH; "" when absent or JSON null
+#   jcount FILE KEYPATH → element count of an array/dict; 0 when absent
+#   json_esc STR        → STR escaped for use inside a JSON string literal
+# Gate on plutil's exit status, never on its output: macOS 14's plutil prints
+# "Could not extract value ..." to *stdout* (macOS 26+ uses stderr), so a
+# missing key would otherwise be substituted into the conf as if it were data.
+jget() {
+    local v
+    v=$(plutil -extract "$2" raw -o - -- "$1" 2>/dev/null) || return 0
+    printf '%s' "$v"
+}
+jcount() {
+    local v
+    v=$(plutil -extract "$2" raw -o - -- "$1" 2>/dev/null) || { printf 0; return 0; }
+    case "$v" in ""|*[!0-9]*) printf 0;; *) printf '%s' "$v";; esac
+}
+json_esc() { printf '%s' "$1" | tr -d '[:cntrl:]' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+# lan_addrs — skip loopback, link-local and our own mesh subnet (reporting
+# 10.88.x back as a LAN would confuse server-side site detection). The netmask
+# arrives as hex (0xffffff00), so the prefix length is a per-nibble popcount.
+lan_addrs_json() {
+    /sbin/ifconfig | LC_ALL=C awk '
+        BEGIN { split("0 1 1 2 1 2 2 3 1 2 2 3 2 3 3 4", pc); hex = "0123456789abcdef" }
+        /^[a-z][a-z0-9]*:/ { iface = substr($1, 1, length($1) - 1); next }
+        $1 == "inet" && $3 == "netmask" {
+            ip = $2; mask = $4
+            if (ip ~ /^127\./ || ip ~ /^169\.254\./ || ip ~ /^10\.88\./) next
+            sub(/^0[xX]/, "", mask)
+            bits = 0
+            for (k = 1; k <= length(mask); k++)
+                bits += pc[index(hex, tolower(substr(mask, k, 1)))]
+            out = out (out == "" ? "" : ",") \
+                  "{\"iface\":\"" iface "\",\"cidr\":\"" ip "/" bits "\"}"
+        }
+        END { print "[" out "]" }'
+}
 
 # ── public egress IP ─────────────────────────────────────────────────
 # wg_endpoint is documented as the "public observed peer" (JOIN_PROTOCOL
@@ -115,13 +163,8 @@ AGENT_VER=$(cat /usr/local/libexec/wg-mac/VERSION /usr/local/share/wg-mac/VERSIO
 # Migration: old single-file layout /etc/wgctl/config.json gets
 # renamed to /etc/wgctl/<iface>.json (iface from inside, default wgc0).
 if [[ -f "$STATE_DIR/config.json" ]]; then
-    legacy_iface=$(python3 -c "
-import json,sys
-try:
-    print(json.load(open('$STATE_DIR/config.json')).get('iface','wgc0'))
-except Exception:
-    print('wgc0')
-")
+    legacy_iface=$(jget "$STATE_DIR/config.json" iface)
+    [[ -n "$legacy_iface" ]] || legacy_iface=wgc0
     if [[ ! -f "$STATE_DIR/$legacy_iface.json" ]]; then
         mv "$STATE_DIR/config.json" "$STATE_DIR/$legacy_iface.json"
         log "migrated config.json -> $legacy_iface.json"
@@ -190,61 +233,68 @@ peer_refresh_once() {
     # Long-poll "nothing changed" sentinel: server held the request until the
     # wait elapsed without a peer-set change. This is also how we know the
     # server supports long-poll at all.
-    if grep -q '"not_modified"[[:space:]]*:[[:space:]]*true' "$resp"; then
-        PR_NEWREV=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("rev","") or "")' "$resp" 2>/dev/null)
+    if [[ "$(jget "$resp" not_modified)" == "true" ]]; then
+        PR_NEWREV=$(jget "$resp" rev)
         rm -f "$resp"; PR_OUTCOME=notmod; return
     fi
 
     # Full list. Capture the server rev (empty against a server that doesn't
     # send one yet — that keeps us in single-fetch mode, i.e. today's behavior).
-    PR_NEWREV=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("rev","") or "")' "$resp" 2>/dev/null)
+    PR_NEWREV=$(jget "$resp" rev)
 
     local NEW_CONF CUR_CONF="/etc/wireguard/$IFACE.conf"
     NEW_CONF=$(mktemp)
-    python3 - <<PY "$NEW_CONF" "$resp" "$CUR_CONF" "$ROLE"
-import json, sys
-out_path, resp_path, conf_path, role = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-priv = addr = listen = ""
-try:
-    for line in open(conf_path):
-        line = line.strip()
-        if line.startswith("PrivateKey"): priv = line.split("=",1)[1].strip()
-        elif line.startswith("Address"):  addr = line.split("=",1)[1].strip()
-        elif line.startswith("ListenPort"): listen = line.split("=",1)[1].strip()
-except FileNotFoundError:
-    sys.exit("conf not found")
-if not priv:
-    sys.exit("priv key missing from existing conf")
-resp = json.load(open(resp_path))
 
-lines = [
-    "[Interface]",
-    f"PrivateKey = {priv}",
-    f"Address    = {addr or resp.get('device_ip','') + '/24'}",
-    f"ListenPort = {listen or '1632'}",
-    "",
-]
-keepalive = resp.get("keepalive_sec", 25)
-for p in resp.get("peers", []):
-    pub = p.get("pubkey", "")
-    if not pub: continue
-    aips = []
-    if p.get("wg_ip"):
-        wgip = p["wg_ip"]
-        aips.append(wgip if "/" in wgip else wgip + "/32")
-    for e in (p.get("allowed_extra") or []):
-        aips.append(e)
-    if not aips: continue
-    lines.append("[Peer]")
-    lines.append(f"PublicKey  = {pub}")
-    if p.get("endpoint"):
-        lines.append(f"Endpoint   = {p['endpoint']}")
-    lines.append(f"AllowedIPs = {', '.join(aips)}")
-    if keepalive:
-        lines.append(f"PersistentKeepalive = {keepalive}")
-    lines.append("")
-open(out_path, "w").write("\n".join(lines))
-PY
+    # Carry the identity forward from the live conf; only the peer set is
+    # server-supplied. A conf with no PrivateKey means something else has
+    # already broken it — leave it alone rather than installing a keyless one.
+    local C_PRIV C_ADDR C_LISTEN
+    C_PRIV=$(sed -n 's/^[[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*//p' "$CUR_CONF" 2>/dev/null | head -1 | tr -d '[:space:]')
+    C_ADDR=$(sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*//p'    "$CUR_CONF" 2>/dev/null | head -1 | tr -d '[:space:]')
+    C_LISTEN=$(sed -n 's/^[[:space:]]*ListenPort[[:space:]]*=[[:space:]]*//p' "$CUR_CONF" 2>/dev/null | head -1 | tr -d '[:space:]')
+    if [[ -z "$C_PRIV" ]]; then
+        log "[$IFACE] no PrivateKey in $CUR_CONF; leaving conf alone"
+        rm -f "$NEW_CONF" "$resp"; PR_OUTCOME=error; return
+    fi
+    [[ -n "$C_ADDR" ]]   || C_ADDR="$(jget "$resp" device_ip)/24"
+    [[ -n "$C_LISTEN" ]] || C_LISTEN=1632
+
+    local KEEPALIVE NPEERS p PUBKEY WGIP AIPS NEXTRA e EXTRA ENDPOINT
+    KEEPALIVE=$(jget "$resp" keepalive_sec)
+    [[ -n "$KEEPALIVE" ]] || KEEPALIVE=25
+    {
+        echo "[Interface]"
+        echo "PrivateKey = $C_PRIV"
+        echo "Address    = $C_ADDR"
+        echo "ListenPort = $C_LISTEN"
+        NPEERS=$(jcount "$resp" peers)
+        p=0
+        while [[ $p -lt $NPEERS ]]; do
+            PUBKEY=$(jget "$resp" "peers.$p.pubkey")
+            if [[ -z "$PUBKEY" ]]; then p=$((p + 1)); continue; fi
+            WGIP=$(jget "$resp" "peers.$p.wg_ip")
+            AIPS=""
+            if [[ -n "$WGIP" ]]; then
+                case "$WGIP" in */*) AIPS="$WGIP";; *) AIPS="$WGIP/32";; esac
+            fi
+            NEXTRA=$(jcount "$resp" "peers.$p.allowed_extra")
+            e=0
+            while [[ $e -lt $NEXTRA ]]; do
+                EXTRA=$(jget "$resp" "peers.$p.allowed_extra.$e")
+                [[ -n "$EXTRA" ]] && AIPS="${AIPS:+$AIPS, }$EXTRA"
+                e=$((e + 1))
+            done
+            if [[ -z "$AIPS" ]]; then p=$((p + 1)); continue; fi
+            echo ""
+            echo "[Peer]"
+            echo "PublicKey  = $PUBKEY"
+            ENDPOINT=$(jget "$resp" "peers.$p.endpoint")
+            [[ -n "$ENDPOINT" ]] && echo "Endpoint   = $ENDPOINT"
+            echo "AllowedIPs = $AIPS"
+            [[ "$KEEPALIVE" != "0" ]] && echo "PersistentKeepalive = $KEEPALIVE"
+            p=$((p + 1))
+        done
+    } > "$NEW_CONF"
 
     if [[ -f "$CUR_CONF" ]] && cmp -s "$NEW_CONF" "$CUR_CONF"; then
         PR_OUTCOME=unchanged
@@ -346,16 +396,11 @@ process_iface() {
     local IFACE
     IFACE=$(basename "$STATE" .json)
 
-    read -r SERVER DEVICE_ID TOKEN ROLE WG_LISTEN <<< "$(python3 - <<PY "$STATE"
-import json, sys
-c = json.load(open(sys.argv[1]))
-print(c.get("server","").rstrip("/"),
-      c.get("device_id",""),
-      c.get("token",""),
-      c.get("role","device"),
-      c.get("wg_listen", 1632))
-PY
-)"
+    SERVER=$(jget "$STATE" server); SERVER="${SERVER%/}"
+    DEVICE_ID=$(jget "$STATE" device_id)
+    TOKEN=$(jget "$STATE" token)
+    ROLE=$(jget "$STATE" role);           [[ -n "$ROLE" ]]      || ROLE=device
+    WG_LISTEN=$(jget "$STATE" wg_listen); [[ -n "$WG_LISTEN" ]] || WG_LISTEN=1632
 
     if [[ -z "$SERVER" || -z "$DEVICE_ID" || -z "$TOKEN" ]]; then
         log "[$IFACE] state missing server/device_id/token; skipping"
@@ -366,72 +411,106 @@ PY
     # One pass over `wgctl show <iface>` builds both the legacy aggregate
     # `stats` and the v2 `status` block (per-peer roster). For a hub this
     # roster is the authoritative "who's online" view of the whole mesh.
-    local SHOW STATUS_JSON
+    local SHOW
     SHOW=""
     [[ -x /usr/local/bin/wgctl ]] && SHOW=$(/usr/local/bin/wgctl show "$IFACE" 2>/dev/null)
-    STATUS_JSON=$(SHOW="$SHOW" ROLE="$ROLE" IFACE="$IFACE" WG_LISTEN="$WG_LISTEN" \
-                  HOST_OS="$HOST_OS" HOST_ARCH="$HOST_ARCH" \
-                  HOST_UPTIME="$HOST_UPTIME" AGENT_VER="$AGENT_VER" \
-                  python3 - <<'PY'
-import os, re, json
-show = os.environ.get("SHOW", "")
-UNIT = {'B':1, 'KiB':1024, 'MiB':1024**2, 'GiB':1024**3, 'TiB':1024**4}
-def toB(n, u): return int(float(n) * UNIT.get(u, 1))
+    # Two lines out of awk: the legacy aggregate `stats`, then the v2 `status`
+    # block. wg_core prints "peer #0: <pub>", upstream wg prints "peer: <pub>";
+    # both are accepted (matching only the latter once left every counter at 0).
+    local COMBO
+    COMBO=$(printf '%s\n' "$SHOW" | LC_ALL=C awk \
+        -v role="$ROLE" -v iface="$IFACE" -v listen="$WG_LISTEN" \
+        -v host_os="$HOST_OS" -v host_arch="$HOST_ARCH" \
+        -v uptime="$HOST_UPTIME" -v agent_ver="$AGENT_VER" '
+    function jesc(v) { gsub(/\\/, "\\\\", v); gsub(/"/, "\\\"", v); return v }
+    function jstr(v) { return (v == "" ? "null" : "\"" jesc(v) "\"") }
+    function tob(num, unit) { return int((num + 0) * (unit in UNIT ? UNIT[unit] : 1)) }
+    function hsecs(t,   sec, part, q, u, rest) {
+        sec = 0; rest = t
+        while (match(rest, /[0-9]+[ \t]+(day|hour|minute|second)/)) {
+            part = substr(rest, RSTART, RLENGTH)
+            split(part, q, /[ \t]+/)
+            u = q[2]
+            sec += (q[1] + 0) * (u == "day" ? 86400 : \
+                                (u == "hour" ? 3600 : (u == "minute" ? 60 : 1)))
+            rest = substr(rest, RSTART + RLENGTH)
+        }
+        return sec
+    }
+    BEGIN {
+        UNIT["B"] = 1; UNIT["KiB"] = 1024; UNIT["MiB"] = 1048576
+        UNIT["GiB"] = 1073741824; UNIT["TiB"] = 1099511627776
+        np = 0; cur = 0; seen = 0
+    }
+    {
+        s = $0
+        sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s)
+        if (s == "") next
+        seen = 1
+        if (s ~ /^peer([ \t]+#[0-9]+)?:[ \t]+[^ \t]/) {
+            nf = split(s, f, /[ \t]+/)
+            np++; cur = np
+            pub[cur] = f[nf]; rx[cur] = 0; tx[cur] = 0; hsset[cur] = 0
+            next
+        }
+        if (cur == 0) next
+        if (s ~ /^endpoint:[ \t]/) {
+            nf = split(s, f, /[ \t]+/); ep[cur] = f[nf]; next
+        }
+        if (s ~ /^allowed ips:[ \t]/) {
+            t = s; sub(/^allowed ips:[ \t]*/, "", t)
+            split(t, c, ",")
+            v = c[1]; sub(/^[ \t]+/, "", v); sub(/[ \t]+$/, "", v)
+            split(v, g, "/"); wgip[cur] = g[1]; next
+        }
+        if (s ~ /^latest handshake:[ \t]/ && s ~ /[ \t]ago$/) {
+            t = s; sub(/^latest handshake:[ \t]*/, "", t); sub(/[ \t]+ago$/, "", t)
+            hs[cur] = hsecs(t); hsset[cur] = 1; next
+        }
+        if (s ~ /^transfer:[ \t]/) {
+            nf = split(s, f, /[ \t]+/)
+            if (nf >= 7 && f[4] ~ /^received/ && f[7] ~ /^sent/) {
+                rx[cur] = tob(f[2], f[3]); tx[cur] = tob(f[5], f[6])
+            }
+            next
+        }
+    }
+    END {
+        online = 0; minh = -1; rxs = 0; txs = 0; plist = ""
+        for (k = 1; k <= np; k++) {
+            rxs += rx[k]; txs += tx[k]
+            up = (hsset[k] && hs[k] < 180)
+            if (up) online++
+            if (hsset[k] && (minh < 0 || hs[k] < minh)) minh = hs[k]
+            plist = plist (k > 1 ? "," : "") \
+                "{\"pubkey\":" jstr(pub[k]) \
+                ",\"wg_ip\":" jstr(wgip[k]) \
+                ",\"endpoint\":" jstr(ep[k]) \
+                ",\"last_handshake_sec\":" (hsset[k] ? hs[k] "" : "null") \
+                ",\"rx_bytes\":" rx[k] + 0 \
+                ",\"tx_bytes\":" tx[k] + 0 \
+                ",\"online\":" (up ? "true" : "false") "}"
+        }
+        if (minh < 0) minh = 0
+        printf "{\"rx_bytes\":%d,\"tx_bytes\":%d,\"last_handshake_sec\":%d}\n",
+               rxs, txs, minh
+        printf "{\"schema\":1,\"role\":\"%s\",\"os\":\"%s\",\"arch\":\"%s\"", \
+               jesc(role), jesc(host_os), jesc(host_arch)
+        printf ",\"agent_ver\":\"%s\",\"iface\":\"%s\",\"iface_up\":%s", \
+               jesc(agent_ver == "" ? "unknown" : agent_ver), jesc(iface), \
+               (seen ? "true" : "false")
+        printf ",\"uptime_sec\":%s,\"wg_listen\":%d", \
+               (uptime ~ /^[0-9]+$/ ? uptime "" : "null"), \
+               (listen == "" ? 1632 : listen)
+        printf ",\"peer_count\":%d,\"peers_online\":%d,\"peers\":[%s]}\n", \
+               np, online, plist
+    }')
+    local STATS_JSON STATUS_JSON
+    STATS_JSON=$(printf '%s\n' "$COMBO" | sed -n 1p)
+    STATUS_JSON=$(printf '%s\n' "$COMBO" | sed -n 2p)
+    [[ -n "$STATS_JSON"  ]] || STATS_JSON='{}'
+    [[ -n "$STATUS_JSON" ]] || STATUS_JSON='{}'
 
-peers, cur = [], None
-for raw in show.splitlines():
-    s = raw.strip()
-    # wg_core prints "peer #0: <pub>"; upstream wg prints "peer: <pub>".
-    # Matching only the latter left `cur` unset forever, so every following
-    # field was skipped and stats went up as all-zero.
-    m = re.match(r'peer(?:\s+#\d+)?:\s+(\S+)', s)
-    if m:
-        cur = {"pubkey": m.group(1), "wg_ip": None, "endpoint": None,
-               "last_handshake_sec": None, "rx_bytes": 0, "tx_bytes": 0,
-               "online": False}
-        peers.append(cur); continue
-    if cur is None:
-        continue
-    m = re.match(r'endpoint:\s+(\S+)', s)
-    if m: cur["endpoint"] = m.group(1); continue
-    m = re.match(r'allowed ips:\s+(.+)', s)
-    if m: cur["wg_ip"] = m.group(1).split(',')[0].strip().split('/')[0]; continue
-    m = re.match(r'latest handshake:\s+(.+) ago', s)
-    if m:
-        sec = 0
-        for val, unit in re.findall(r'(\d+)\s+(day|hour|minute|second)', m.group(1)):
-            sec += {'day':86400,'hour':3600,'minute':60,'second':1}[unit] * int(val)
-        cur["last_handshake_sec"] = sec; continue
-    m = re.match(r'transfer:\s+([0-9.]+)\s+(\w+)\s+received,\s+([0-9.]+)\s+(\w+)\s+sent', s)
-    if m:
-        cur["rx_bytes"] = toB(m.group(1), m.group(2))
-        cur["tx_bytes"] = toB(m.group(3), m.group(4)); continue
-
-for p in peers:
-    h = p["last_handshake_sec"]
-    p["online"] = h is not None and h < 180
-
-ages = [p["last_handshake_sec"] for p in peers if p["last_handshake_sec"] is not None]
-stats = {"rx_bytes": sum(p["rx_bytes"] for p in peers),
-         "tx_bytes": sum(p["tx_bytes"] for p in peers),
-         "last_handshake_sec": min(ages) if ages else 0}
-up = os.environ.get("HOST_UPTIME", "")
-status = {"schema": 1,
-          "role": os.environ.get("ROLE", "device"),
-          "os": os.environ.get("HOST_OS", ""),
-          "arch": os.environ.get("HOST_ARCH", ""),
-          "agent_ver": os.environ.get("AGENT_VER", "unknown"),
-          "iface": os.environ.get("IFACE", ""),
-          "iface_up": bool(show.strip()),
-          "uptime_sec": int(up) if up.isdigit() else None,
-          "wg_listen": int(os.environ.get("WG_LISTEN") or 1632),
-          "peer_count": len(peers),
-          "peers_online": sum(1 for p in peers if p["online"]),
-          "peers": peers}
-print(json.dumps({"stats": stats, "status": status}))
-PY
-)
-    [[ -n "$STATUS_JSON" ]] || STATUS_JSON='{"stats":{},"status":{}}'
 
     # ----- public egress IP (external echo service, cached) -----
     local PUB_IP WG_ENDPOINT
@@ -443,40 +522,12 @@ PY
     [[ -n "$PUB_IP" ]] && WG_ENDPOINT="$PUB_IP:$WG_LISTEN"
 
     local LAN_JSON
-    LAN_JSON=$(python3 - <<'PY'
-import json, subprocess, re
-out = subprocess.check_output(["/sbin/ifconfig"], text=True)
-addrs, iface = [], ""
-for line in out.splitlines():
-    m = re.match(r"^([a-z0-9]+):", line)
-    if m: iface = m.group(1); continue
-    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)\s+netmask\s+0x([0-9a-fA-F]+)", line)
-    if not m: continue
-    ip, hexmask = m.group(1), m.group(2)
-    # Skip loopback, link-local, and our own wg subnet (10.88.x is the
-    # mesh; reporting it back as a LAN would confuse site detection).
-    if ip.startswith("127.") or ip.startswith("169.254.") or ip.startswith("10.88."):
-        continue
-    bits = bin(int(hexmask, 16)).count("1")
-    addrs.append({"iface": iface, "cidr": f"{ip}/{bits}"})
-print(json.dumps(addrs))
-PY
-)
+    LAN_JSON=$(lan_addrs_json)
 
     # ----- 1. heartbeat -----
     local HB_BODY HB_STATUS HB_RESP
-    HB_BODY=$(STATUS_JSON="$STATUS_JSON" LAN_JSON="$LAN_JSON" WG_ENDPOINT="$WG_ENDPOINT" \
-              python3 - <<'PY'
-import os, json
-combo = json.loads(os.environ["STATUS_JSON"])
-print(json.dumps({
-  "lan_addrs":   json.loads(os.environ["LAN_JSON"]),
-  "wg_endpoint": os.environ["WG_ENDPOINT"],
-  "stats":       combo.get("stats", {}),
-  "status":      combo.get("status", {}),
-}))
-PY
-)
+    HB_BODY=$(printf '{"lan_addrs":%s,"wg_endpoint":"%s","stats":%s,"status":%s}' \
+        "$LAN_JSON" "$(json_esc "$WG_ENDPOINT")" "$STATS_JSON" "$STATUS_JSON")
     HB_RESP=$(mktemp)
     HB_STATUS=$(curl -sS -o "$HB_RESP" -w '%{http_code}' --max-time 10 \
         -X POST "$SERVER/v1/heartbeat" \
