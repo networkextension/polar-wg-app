@@ -26,6 +26,14 @@
 #   ./scripts/release-testflight.sh --skip-upload  # archive + export only
 #   ./scripts/release-testflight.sh --yes          # no confirmation prompt
 #   ./scripts/release-testflight.sh --label rc1    # custom suffix
+#   ./scripts/release-testflight.sh --group Beta   # external group to add build to (default: PB)
+#   ./scripts/release-testflight.sh --no-group     # upload only, skip TestFlight group/review
+#   ./scripts/release-testflight.sh --whats-new "text"  # "What to Test" (default: git subject)
+#
+# After upload the script polls ASC until the build is processed, adds it to
+# the external beta group, sets "What to Test", and submits it for Beta App
+# Review (auto-approved when the marketing version already has an approved
+# build). Pure python3 + openssl — no pyjwt needed.
 #
 
 set -euo pipefail
@@ -56,11 +64,16 @@ SCHEME="WireGuardSampleApp-iOS"
 SKIP_UPLOAD=0
 AUTO_YES=0
 LABEL=""
+BETA_GROUP="${BETA_GROUP:-PB}"
+WHATS_NEW=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-upload) SKIP_UPLOAD=1; shift ;;
         --yes|-y)      AUTO_YES=1; shift ;;
         --label)       LABEL="$2"; shift 2 ;;
+        --group)       BETA_GROUP="$2"; shift 2 ;;
+        --no-group)    BETA_GROUP=""; shift ;;
+        --whats-new)   WHATS_NEW="$2"; shift 2 ;;
         -h|--help)
             sed -n '3,30p' "${BASH_SOURCE[0]}"
             exit 0
@@ -76,6 +89,7 @@ done
 VERSION="$(awk '/MARKETING_VERSION:/ {gsub(/"/,"",$2); print $2; exit}' "$PROJECT_YML" || echo 0.1.0)"
 BUILD="$(awk '/CURRENT_PROJECT_VERSION:/ {gsub(/"/,"",$2); print $2; exit}' "$PROJECT_YML" || echo 1)"
 SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo nogit)"
+[[ -n "$WHATS_NEW" ]] || WHATS_NEW="Build $BUILD ($SHA): $(git -C "$REPO_ROOT" log -1 --pretty=%s 2>/dev/null || echo 'new build')"
 LABEL="${LABEL:+$LABEL-}$VERSION-b$BUILD-$SHA"
 
 # BUILD_DIR on /tmp not the source tree — Xcode 26's distribution
@@ -266,15 +280,98 @@ xcrun altool --upload-app \
     --apiKey "$ASC_KEY_ID" \
     --apiIssuer "$ASC_ISSUER_ID" 2>&1 | tail -15
 
+# ── 7. TestFlight: wait for processing → add to group → submit review ──
+if [[ -n "$BETA_GROUP" ]]; then
+    banner "TestFlight: add build $BUILD to group '$BETA_GROUP'"
+    ASC_KEY_PATH="$ASC_KEY_PATH" ASC_KEY_ID="$ASC_KEY_ID" ASC_ISSUER_ID="$ASC_ISSUER_ID" \
+    python3 - "com.change.wg" "$VERSION" "$BUILD" "$BETA_GROUP" "$WHATS_NEW" <<'PY'
+import base64, json, os, subprocess, sys, time, urllib.request, urllib.error
+
+bundle_id, version, build, group_name, whats_new = sys.argv[1:6]
+kid, iss, key = os.environ['ASC_KEY_ID'], os.environ['ASC_ISSUER_ID'], os.environ['ASC_KEY_PATH']
+BASE = 'https://api.appstoreconnect.apple.com/v1/'
+
+def b64(b): return base64.urlsafe_b64encode(b).rstrip(b'=').decode()
+def token():
+    now = int(time.time())
+    hdr = b64(json.dumps({'alg': 'ES256', 'kid': kid, 'typ': 'JWT'}).encode())
+    pl  = b64(json.dumps({'iss': iss, 'iat': now, 'exp': now + 600, 'aud': 'appstoreconnect-v1'}).encode())
+    der = subprocess.run(['openssl', 'dgst', '-sha256', '-sign', key],
+                         input=f'{hdr}.{pl}'.encode(), capture_output=True, check=True).stdout
+    i = 2; l = der[i+1]; r = der[i+2:i+2+l]; i += 2 + l; l2 = der[i+1]; s = der[i+2:i+2+l2]
+    sig = r[-32:].rjust(32, b'\0') + s[-32:].rjust(32, b'\0')
+    return f'{hdr}.{pl}.{b64(sig)}'
+
+def req(method, path, body=None):
+    rq = urllib.request.Request(BASE + path, method=method,
+        headers={'Authorization': 'Bearer ' + token(), 'Content-Type': 'application/json'},
+        data=json.dumps(body).encode() if body else None)
+    try:
+        d = urllib.request.urlopen(rq).read()
+        return json.loads(d) if d else {}
+    except urllib.error.HTTPError as e:
+        sys.exit(f'ASC {method} {path} → HTTP {e.code}: {e.read().decode()[:400]}')
+
+app = req('GET', f'apps?filter[bundleId]={bundle_id}')['data'][0]['id']
+
+# Wait for processing (new build row appears after a few minutes; VALID when done)
+deadline = time.time() + 40 * 60
+while True:
+    rows = [b for b in req('GET', f'builds?filter[app]={app}&filter[version]={build}&limit=5')['data']
+            if b['attributes']['processingState'] != 'INVALID']
+    if rows and rows[0]['attributes']['processingState'] == 'VALID':
+        bid = rows[0]['id']; break
+    state = rows[0]['attributes']['processingState'] if rows else 'not visible yet'
+    if time.time() > deadline: sys.exit(f'timed out waiting for build {build} ({state})')
+    print(f'  build {build}: {state}, waiting…'); time.sleep(30)
+print(f'  build {build} processed: {bid}')
+
+groups = [g for g in req('GET', f'betaGroups?filter[app]={app}')['data'] if g['attributes']['name'] == group_name]
+if not groups: sys.exit(f'beta group {group_name!r} not found')
+gid = groups[0]['id']; gattr = groups[0]['attributes']
+if bid in [b['id'] for b in req('GET', f'betaGroups/{gid}/builds?limit=200')['data']]:
+    print(f'  already in group {group_name}')
+else:
+    req('POST', f'betaGroups/{gid}/relationships/builds', {'data': [{'type': 'builds', 'id': bid}]})
+    print(f'  added to group {group_name}')
+
+locs = req('GET', f'builds/{bid}/betaBuildLocalizations')['data']
+if locs:
+    req('PATCH', f'betaBuildLocalizations/{locs[0]["id"]}',
+        {'data': {'type': 'betaBuildLocalizations', 'id': locs[0]['id'], 'attributes': {'whatsNew': whats_new}}})
+else:
+    req('POST', 'betaBuildLocalizations', {'data': {'type': 'betaBuildLocalizations',
+        'attributes': {'locale': 'en-US', 'whatsNew': whats_new},
+        'relationships': {'build': {'data': {'type': 'builds', 'id': bid}}}}})
+print(f'  what to test: {whats_new}')
+
+if not gattr['isInternalGroup']:
+    det = req('GET', f'builds/{bid}?include=buildBetaDetail,betaAppReviewSubmission')
+    inc = {i['type']: i['attributes'] for i in det.get('included', [])}
+    if 'betaAppReviewSubmissions' not in inc:
+        req('POST', 'betaAppReviewSubmissions', {'data': {'type': 'betaAppReviewSubmissions',
+            'relationships': {'build': {'data': {'type': 'builds', 'id': bid}}}}})
+        det = req('GET', f'builds/{bid}?include=buildBetaDetail,betaAppReviewSubmission')
+        inc = {i['type']: i['attributes'] for i in det.get('included', [])}
+    print(f"  beta review: {inc.get('betaAppReviewSubmissions', {}).get('betaReviewState')}"
+          f" · external state: {inc.get('buildBetaDetails', {}).get('externalBuildState')}")
+    if gattr.get('publicLinkEnabled'): print(f"  public link: {gattr.get('publicLink')}")
+PY
+fi
+
 banner "Done"
 cat <<NEXT
 ✓ Uploaded WireGuard $VERSION ($BUILD) · sha $SHA
+NEXT
+if [[ -z "$BETA_GROUP" ]]; then cat <<NEXT
 
-Next steps in App Store Connect:
-  1. Wait for "Processing" → TestFlight build list shows the new row
-     (10-30 min for first upload of a marketing version).
+Next steps in App Store Connect (--no-group was set):
+  1. Wait for "Processing" → TestFlight build list shows the new row.
   2. Fill Test Information (what to test, contact email, review notes).
   3. External Testing → add to a group with a Public Link enabled.
+NEXT
+fi
+cat <<NEXT
 
 Artifacts kept at:
   archive  $ARCHIVE_PATH
