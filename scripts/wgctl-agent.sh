@@ -14,6 +14,8 @@
 #   4. If conf changed, launchctl kickstart -k to pick up new peers
 #   5. If server returns 401 invalid_device_token: self-evict THIS iface
 #      (bootout + delete conf + delete state; don't touch siblings)
+#   6. Data-plane watchdog: hub handshake fresh but hub unpingable for
+#      DP_FAIL_MAX ticks in a row → kickstart wg-mac.<iface> (issue #42)
 #
 # Fail-soft: a bad server response leaves the existing conf alone;
 # wg_core keeps running with the last good peer list. Only an explicit
@@ -188,6 +190,95 @@ reconcile_routes() {
         [[ -x "$hook" ]] || continue
         "$hook" "$iface" "$conf" >>"$LOG" 2>&1 || true
     done
+}
+
+# ── data-plane watchdog (issue #42) ──────────────────────────────────────────
+# Seen after a host reboot: wg_core comes up, the hub keeps handshaking with
+# us, but our data never gets an answer — tx grows, rx doesn't, and only a
+# restart of wg_core recovers it (same NAT ip:port before and after). A fresh
+# handshake alone therefore isn't proof of life; ping the hub's wg IP.
+#
+# Only the hub peer is probed (the one whose AllowedIPs carry a prefix wider
+# than /32, i.e. the mesh route) — device peers may drop ICMP. No fresh
+# handshake → no probe: that is a different failure and not this watchdog's.
+# Fail counter / last-kick stamp live in $RUNDIR, so a reboot resets them.
+DP_FAIL_MAX=${WGCTL_DP_FAIL_MAX:-3}
+DP_COOLDOWN=${WGCTL_DP_COOLDOWN:-600}
+
+# hub_probe_target — first /32 of the hub peer, if its handshake is <180s old.
+hub_probe_target() {
+    LC_ALL=C awk '
+    function hsecs(t,   sec, part, q, u, rest) {
+        sec = 0; rest = t
+        while (match(rest, /[0-9]+[ \t]+(day|hour|minute|second)/)) {
+            part = substr(rest, RSTART, RLENGTH)
+            split(part, q, /[ \t]+/)
+            u = q[2]
+            sec += (q[1] + 0) * (u == "day" ? 86400 : \
+                                (u == "hour" ? 3600 : (u == "minute" ? 60 : 1)))
+            rest = substr(rest, RSTART + RLENGTH)
+        }
+        return sec
+    }
+    function flush() {
+        if (ishub && fresh && host != "" && out == "") out = host
+        ishub = 0; fresh = 0; host = ""
+    }
+    {
+        s = $0
+        sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s)
+        if (s ~ /^peer([ \t]+#[0-9]+)?:[ \t]+[^ \t]/) { flush(); next }
+        if (s ~ /^allowed ips:[ \t]/) {
+            t = s; sub(/^allowed ips:[ \t]*/, "", t)
+            n = split(t, c, ",")
+            for (k = 1; k <= n; k++) {
+                v = c[k]; gsub(/[ \t]/, "", v)
+                split(v, g, "/")
+                if (g[2] == "32" && host == "") host = g[1]
+                else if (g[2] != "" && g[2] + 0 < 32) ishub = 1
+            }
+            next
+        }
+        if (s ~ /^latest handshake:[ \t]/ && s ~ /[ \t]ago$/) {
+            t = s; sub(/^latest handshake:[ \t]*/, "", t); sub(/[ \t]+ago$/, "", t)
+            fresh = (hsecs(t) < 180); next
+        }
+    }
+    END { flush(); print out }'
+}
+
+dataplane_check() {  # iface, role, `wgctl show <iface>` output
+    local IFACE="$1" ROLE="$2" SHOW="$3"
+    [[ "$ROLE" == hub ]] && return 0
+    local failf="$RUNDIR/$IFACE.dpfail" kickf="$RUNDIR/$IFACE.dpkick"
+    local target
+    target=$(printf '%s\n' "$SHOW" | hub_probe_target)
+    if [[ -z "$target" ]]; then rm -f "$failf"; return 0; fi
+
+    # macOS ping: -t is the overall deadline; exit 0 if any reply came back.
+    if /sbin/ping -q -c 3 -i 1 -t 5 "$target" >/dev/null 2>&1; then
+        [[ -f "$failf" ]] && log "[$IFACE] dataplane: hub $target reachable again"
+        rm -f "$failf"; return 0
+    fi
+
+    local n; n=$(cat "$failf" 2>/dev/null)
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$failf"
+    log "[$IFACE] dataplane: hub $target unpingable despite fresh handshake ($n/$DP_FAIL_MAX)"
+    [[ $n -ge $DP_FAIL_MAX ]] || return 0
+
+    local now last
+    now=$(date +%s); last=$(cat "$kickf" 2>/dev/null)
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    if (( now - last < DP_COOLDOWN )); then
+        log "[$IFACE] dataplane: last kickstart $((now - last))s ago; cooling down"
+        return 0
+    fi
+    log "[$IFACE] dataplane: kickstart wg-mac.$IFACE (host uptime ${HOST_UPTIME:-?}s)"
+    printf '%s\n' "$now" > "$kickf"
+    rm -f "$failf"
+    launchctl kickstart -k "system/com.wireguard.wg-mac.$IFACE" 2>>"$LOG" || true
 }
 
 # ── peer refresh: one fetch ──────────────────────────────────────────────────
@@ -414,6 +505,7 @@ process_iface() {
     local SHOW
     SHOW=""
     [[ -x /usr/local/bin/wgctl ]] && SHOW=$(/usr/local/bin/wgctl show "$IFACE" 2>/dev/null)
+    dataplane_check "$IFACE" "$ROLE" "$SHOW"
     # Two lines out of awk: the legacy aggregate `stats`, then the v2 `status`
     # block. wg_core prints "peer #0: <pub>", upstream wg prints "peer: <pub>";
     # both are accepted (matching only the latter once left every counter at 0).
